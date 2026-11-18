@@ -1,0 +1,11 @@
+# GME life regions, written by gme_genesis env --scout (docs/biosphere-spec.md 2.2)
+# planet 319a5581e7884e3a seed 59 sea_level -37
+# window 16384 m = 1024 x 1024 cells of 16 m; centres on a 2048 m lattice within +-128000 m, >= 20000 m apart
+# vent_q10 1024
+# islands 0-4: rig GPUs, 5: PC lab. Data lines: k x0 z0 (world corner of cell 0,0)
+0 106496 63488   # score 53667 ocean 14.8% shelf 9721 coast 34065 vents 20
+1 73728 -14336   # score 55709 ocean 14.2% shelf 9307 coast 37007 vents 11
+2 -65536 -26624   # score 55636 ocean 14.8% shelf 9681 coast 36218 vents 7
+3 -34816 -2048   # score 55433 ocean 13.2% shelf 8625 coast 38095 vents 11
+4 16384 83968   # score 55052 ocean 13.5% shelf 8875 coast 37230 vents 9
+5 -98304 -110592   # score 54794 ocean 13.1% shelf 8563 coast 37636 vents 4
