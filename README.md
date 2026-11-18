@@ -13,11 +13,11 @@ The heavy stages run headless on a small GPU cluster over SSH. The rigs need onl
 |---|---|
 | ![formation](docs/images/planet59_formation.png) | ![life](docs/images/alife_test_island_10y.png) |
 
-| Smooth density terrain (render upgrade M1, in progress) | Vegetation kinds and pigment colours (test pattern) |
+| Smooth density terrain (render upgrade M1, before / after) | Vegetation kinds and pigment colours (test pattern) |
 |---|---|
-| ![render](docs/images/m1_progress_coast.png) | ![vegetation](docs/images/vegetation_test_pattern.png) |
+| ![render](docs/images/m1_before_after.png) | ![vegetation](docs/images/vegetation_test_pattern.png) |
 
-**Status:** research prototype, Windows-first. Star system formation, chemistry and the integer life simulation work end to end, and life is evolving on cluster GPUs. The renderer is being upgraded to smooth density surfaces and spectral light transport (milestones M1–M5 in [docs/render-upgrade-spec.md](docs/render-upgrade-spec.md)). Animals (predation), creature rendering and a walkable player are not built yet.
+**Status:** research prototype, Windows-first. Star system formation, chemistry and the integer life simulation work end to end, and life is evolving on cluster GPUs. The renderer is being upgraded to smooth density surfaces and spectral light transport (milestones M1–M5 in [docs/render-upgrade-spec.md](docs/render-upgrade-spec.md)): **M1 smooth terrain is done** (`--quality classic` keeps the old renderer); M2–M5 are in progress. Animals (predation), creature rendering and a walkable player are not built yet.
 
 ## Requirements
 
