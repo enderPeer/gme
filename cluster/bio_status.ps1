@@ -2,15 +2,18 @@
 # with the star search's seeds per hour as a coexistence check.
 #   pwsh cluster/bio_status.ps1 [-Fetch] [-Islands 0,1,2,3,4] [-LabRun runs/bio_<hash>/island_5]
 #     -Fetch  export each island's newest checkpoint on its rig (gme_genesis bioexport on the
-#             CPU, so the running island keeps its GPU), copy the part, metrics, census,
-#             stages.log and the newest maps into life/islands/<k>/, export the PC lab island
-#             too when its run folder exists, and merge all parts into life/home.biomap
+#             CPU, so the running island keeps its GPU), copy the part, its creatures
+#             (fauna_<k>.bin), metrics, census, stages.log and the newest maps into
+#             life/islands/<k>/, export the PC lab island too when its run folder exists, and
+#             merge all parts into life/home.biomap and life/home.fauna
 param(
     [switch]$Fetch,
-    [int[]]$Islands = @(0, 1),   # focus: rig A only (two large GPUs); islands 2-4 (rig B) are off
+    [object[]]$Islands = @(0, 1),   # focus: rig A only (two large GPUs); islands 2-4 (rig B) are off
     [string]$LabRun = ''
 )
 $ErrorActionPreference = 'Stop'
+# "-Islands 0,1" arrives as the one string "0,1" when the script is started as pwsh <script> (file mode)
+$Islands = @($Islands | ForEach-Object { "$_" -split '[,\s]+' } | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
 . (Join-Path $PSScriptRoot 'hosts.ps1')   # $GmeUser, $GmeRigA, $GmeRigB
 Set-Location (Split-Path $PSScriptRoot)
 
@@ -45,6 +48,7 @@ ck=$(ls ckpt_*.bin 2>/dev/null | sort | tail -n 1)
 rb=$(grep -c 'INTERVENTION rollback' stages.log 2>/dev/null)
 echo "  island @K@: newest checkpoint ${ck:-none}, ${rb:-0} rollbacks"
 [ -f metrics.csv ] && awk -F, 'END { if (NR > 1) printf "    year %.2f  live %s  sessile photo %s  C marine %.3g land %.3g mol  O2aq %.3g uM  %s steps/s  gate mask %s\n", $3, $6, $8, $11 / 1000, $13 / 1000, $37, $5, $NF }' metrics.csv
+[ -f metrics.csv ] && awk -F, 'NR == 1 { for (i = 1; i <= NF; i++) c[$i] = i } END { if (NR > 1 && c["consumers"]) printf "    animals: %s living on prey (trophic level %s), %s land animals, %s kills and %s bites per day; %s sexual, %s births/day with two parents\n", $c["consumers"], $c["mean_troph"], $c["land_animals"], $c["kills"], $c["bites"], $c["sexual"], $c["sexual_births"] }' metrics.csv
 [ -f stages.log ] && tail -n 3 stages.log | sed 's/^/    /'
 '@
 $exportCmd = @'
@@ -74,6 +78,7 @@ if ($Fetch) {
         $out | Where-Object { $_ -notmatch '^y\d+$' } | ForEach-Object { Write-Host "  island ${k}: $_" }
         if (-not ($out | Select-String 'bioexport: wrote')) { Write-Warning "island ${k}: export failed on $h"; continue }
         scp -q "${user}@${h}:gme/$run/biopart_$k.bin" "$dst/"
+        scp -q "${user}@${h}:gme/$run/fauna_$k.bin" "$dst/" 2>$null      # its motile organisms (none before animals)
         foreach ($f in 'metrics.csv', 'census.csv', 'stages.log', 'env.png') { scp -q "${user}@${h}:gme/$run/$f" "$dst/" 2>$null }
         $year = $out | Where-Object { $_ -match '^y\d+$' } | Select-Object -Last 1
         if ($year) {

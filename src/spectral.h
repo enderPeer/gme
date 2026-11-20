@@ -65,7 +65,13 @@ extern "C" {
  * e.g. the test pattern's palette 0) takes the default bin, chlorophyll-like */
 #define SPEC_NHUE        16
 #define SPEC_HUE_DEFAULT 8
-#define SPEC_PIG_REF     200.0  /* PIG until biomap v2 carries the mean pigment */
+#define SPEC_PIG_REF     200.0  /* PIG of a cell without morphology (a version 1 biomap) */
+/* version 2 (biomap morphology, spec 5.3): the cell's mean pigment amount in 15 levels (level L = 1..15
+ * is PIG 17 L; SPEC_PIG_LEVEL) and its Q band width bin w = 0..15 (sigma = 15 + 3 w nm; version 1: 25 nm) */
+#define SPEC_NPIG        15
+#define SPEC_NQW         16
+#define SPEC_PIG_LEVEL(pig) (((int)(pig) + 8) / 17 < 1 ? 1 : (((int)(pig) + 8) / 17 > SPEC_NPIG ? SPEC_NPIG : ((int)(pig) + 8) / 17))
+#define SPEC_QW_NM(w)    (25.0 + 35.0 * (double)(w) / 15.0)   /* bin 0 = the 25 nm band of the pigment table and of the simulation's gene 0 */
 /* crowns: leaf area index of an occupied slot (over the crown's footprint), G of
  * random leaves; LAD = LAI pi a^2 / V = 3 LAI / (4 b), sigma = G LAD (spec 4.6) */
 #define SPEC_CROWN_LAI   4.0f
@@ -164,6 +170,9 @@ typedef struct SpectralAtmo {
     float  leaf_tau[SPEC_NHUE][SPEC_NB];    /* leaf transmittance 0.42 (1 - A) */
     float  mat_tis[SPEC_NHUE][SPEC_NB];     /* microbial mat: 0.03 + rho_sand (1 - A)^2 */
     double pig_A_nir[SPEC_NHUE];            /* absorptance 740-900 nm (export, probe) */
+    /* version 2: the band-mean absorptance at pigment level L + 1 (PIG 17 (L + 1)) and Q band width bin w
+     * (leaf rho / tau and the mat follow from it as above) */
+    float  pig_A2[SPEC_NHUE][SPEC_NPIG][SPEC_NQW][SPEC_NB];
     void*  host;                            /* double-precision copies of the LUTs (spectral.c) */
     int    host_owned;
 } SpectralAtmo;
@@ -236,6 +245,8 @@ void spectral_rgb_of(const SpectralAtmo* a, const double* rho, double rgb[3]);
 /* pigment shape eps(lambda) of hue bin 1..15 (0 = SPEC_HUE_DEFAULT): Soret 435 nm, Q band at 383 + 34.13 i nm,
  * background below 690 nm (to 0 at 740) */
 double spectral_pigment_eps(double lam_nm, int bin);
+/* the same with a Q band of width (sigma) wq_nm (version 2: 15 .. 60 nm; 25 = the function above) */
+double spectral_pigment_eps_w(double lam_nm, int bin, double wq_nm);
 /* leaf colour of every hue bin under an equal-energy white, von Kries (XYZ) to D65, 8-bit sRGB: ref_rgb at 1 nm
  * (the --pigment-table reference), band_rgb from the renderer's 8 band means; de: Delta E2000 between them.
  * Returns the largest |ref_rgb - spec 5.1 table| over bins 1..15 (sRGB levels). */

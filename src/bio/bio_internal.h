@@ -12,7 +12,7 @@
 enum { BK_GLOBALS = 0, BK_ENV, BK_SUMMARY, BK_PRE, BK_SUPPLY, BK_METAB, BK_SCAN_A, BK_SCAN_B,
        BK_BIRTH, BK_FREE, BK_GATHER32, BK_GATHER64, BK_STATS,
        BK_SORT_COUNT, BK_CSCAN_A, BK_CSCAN_B, BK_CSCAN_C, BK_SORT_SCATTER, BK_SORT_FIX, BK_PERMUTE32, BK_PERMUTE64,
-       BK_THINK_LIST, BK_THINK, BK_N };
+       BK_THINK_LIST, BK_THINK, BK_FEED, BK_N };
 
 /* one agent as a plain record (seeding, migrants, checkpoints) */
 typedef struct BioAgentRec {
@@ -22,10 +22,12 @@ typedef struct BioAgentRec {
     uint32_t uid, lineage, parent, bstep;
     uint64_t hid, out, dW[BIO_OUT];
     BioGenome g;
+    uint32_t eco;                /* ecology word (BE_*); 0 before the features */
+    uint64_t expl;               /* exploration of the last think */
 } BioAgentRec;
 
 /* agent arrays that persist across steps (compacted together), in a fixed order */
-#define BIO_AGENT_ARRAYS 30      /* 20 x 4 B, hid, out, 8 dW rows */
+#define BIO_AGENT_ARRAYS 33      /* 20 x 4 B, hid, out, 8 dW rows, tr2, eco (4 B), expl (8 B) */
 
 struct BioSim {
     BioConfig  cfg;
@@ -57,6 +59,10 @@ struct BioSim {
     void*      scratch;          /* gather scratch, 8 B x slots */
     int64_t*   part_host;
     uint32_t   last_scan_tot[3];
+    BioSpectral* spectral;       /* host copy of the light tables (light in bands), else NULL */
+    uint64_t   g4_since;         /* gate G4: step since which >= 1000 land animals were counted */
+    uint64_t   hub_epoch;        /* last hub epoch (sim-year) whose migrants and atmosphere were applied */
+    uint32_t   feat_loaded;      /* bio_sim_load: the BIO_F_* the checkpoint carried, before BioConfig.enable */
 };
 
 /* bio_sim.c */
@@ -75,8 +81,26 @@ int    bio_fields_put(BioSim* s, const int64_t* src);
 void   bio_protocell(BioGenome* g, uint32_t salt);
 int64_t bio_stats_raw(BioSim* s, int64_t st[BIO_STAT_N]);                 /* fills stats partials */
 uint32_t bio_crc32(uint32_t crc, const void* p, size_t n);
+struct SpectrumFile;
+int    bio_set_spectrum(BioSim* s, const struct SpectrumFile* f);          /* tables -> sim memory; light in bands on */
+uint32_t bio_spectrum_crc(const struct SpectrumFile* f);                   /* crc32 of the GMESPEC1 payload */
+void   bio_features_init(BioSim* s);                                       /* fills the feature parameters still at zero */
+int    bio_guild(const uint8_t* body);                                     /* BIO_GUILD_* of a genome (bio_bank.c) */
+int    bio_sim_export_emigrants(BioSim* s, const char* path, int per_habitat);   /* the hub's migrant file (bio_bank.c) */
+int    bio_genome_near(const BioGenome* a, const BioGenome* b);            /* 1: within the species distance (bio_stats.c) */
+int    bio_is_creature(const BioAgentRec* a);                              /* 1: exported to the engine as a creature (bio_bank.c) */
+int    bio_habitat(const BioEnv* e, int64_t c);                            /* BIO_HAB_* of a cell */
+int    bio_mkdir_p(const char* path);                                      /* 0 ok (bio_hub.c) */
+int    bio_dir_copy(const char* from_dir, const char* to_dir, const char* prefix);   /* files copied */
+int    bio_dir_mirror(const char* from_dir, const char* to_dir, const char* prefix); /* same set of files; copied */
+void   bio_dir_clear(const char* dir);                                     /* removes its plain files, then the folder */
 uint64_t bio_fnv64(uint64_t h, const void* p, size_t n);
 #define BIO_FNV_INIT 0xCBF29CE484222325ull
+/* migrant file GMEMIG01, little-endian: 32-byte header (magic, u32 version 1,
+ * u32 count, u64 planet hash, u64 step), count records (u32 habitat, u32
+ * lineage, i64 living biomass, genome), u32 crc32 of everything before it */
+#define MIG_MAGIC "GMEMIG01"
+#define MIG_REC (4 + 4 + 8 + (int)sizeof(BioGenome))
 
 /* bio_cpu.c: CPU reference for each stage (same bio_core.h functions) */
 void   bio_cpu_stage(BioWorld* w, int stage, int arg);

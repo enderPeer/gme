@@ -8,8 +8,15 @@
  *  208  u32 fallback[64]          464  u8 palette[16][3]   512  u64 ncells
  *  520  u32 crc32 of the payload  524  u32 crc32 of bytes 0..523
  *  528  u32 cells[ncells]
- * biomap_load returns 0 ok, -1 cannot open / short read / out of memory,
- * -2 not a valid GMEBMAP1 header, -3 CRC mismatch (corrupt payload). */
+ * File GMEBMAP2 (written when the biomap carries morphology), 832-byte header:
+ *    0  char[8] "GMEBMAP2"          8  u32 version (2)       12  u32 header bytes (832)
+ *   16 .. 519 as version 1 (520 = crc32 of the cells)
+ *  524  u32 crc32 of the morph words
+ *  528  u32 fallback_morph[64]    784  i32 atm_ppm[7]      812  u32 flags (bit 0: atm_ppm known)
+ *  816  u32 reserved[3] (0)       828  u32 crc32 of bytes 0..827
+ *  832  u32 cells[ncells], then u32 morph[ncells]
+ * biomap_load reads both and returns 0 ok, -1 cannot open / short read / out
+ * of memory, -2 not a valid header, -3 CRC mismatch (corrupt payload). */
 #include "biomap.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,6 +24,8 @@
 
 #define BIOMAP_VERSION   1u
 #define BIOMAP_HDR       528u
+#define BIOMAP_VERSION2  2u
+#define BIOMAP_HDR2      832u
 #define BIOMAP_MAX_CELLS (1ull << 28)   /* sanity limit: 1 GiB of cells */
 #define IO_CELLS         65536u         /* cells per read/write block */
 
@@ -53,27 +62,57 @@ static int regions_ok(int32_t nreg, int32_t shift, const GmeBioRegion* reg, uint
     return 1;
 }
 
+/* crc32 of n words as little-endian bytes */
+static uint32_t crc_words(const uint32_t T[256], const uint32_t* w, uint64_t n, uint8_t* blk) {
+    uint32_t c = 0;
+    for (uint64_t i = 0; i < n; i += IO_CELLS) {
+        const size_t m = (size_t)(n - i < IO_CELLS ? n - i : IO_CELLS);
+        for (size_t k = 0; k < m; ++k) put32(blk + 4 * k, w[i + k]);
+        c = crc_update(T, c, blk, m * 4);
+    }
+    return c;
+}
+
+static int write_words(FILE* f, const uint32_t* w, uint64_t n, uint8_t* blk) {
+    for (uint64_t i = 0; i < n; i += IO_CELLS) {
+        const size_t m = (size_t)(n - i < IO_CELLS ? n - i : IO_CELLS);
+        for (size_t k = 0; k < m; ++k) put32(blk + 4 * k, w[i + k]);
+        if (fwrite(blk, 4, m, f) != m) return 0;
+    }
+    return 1;
+}
+
+/* reads n little-endian words and returns their crc32 in *crc; 1 ok */
+static int read_words(FILE* f, const uint32_t T[256], uint32_t* w, uint64_t n, uint8_t* blk, uint32_t* crc) {
+    uint32_t c = 0;
+    for (uint64_t i = 0; i < n; i += IO_CELLS) {
+        const size_t m = (size_t)(n - i < IO_CELLS ? n - i : IO_CELLS);
+        if (fread(blk, 4, m, f) != m) return 0;
+        c = crc_update(T, c, blk, m * 4);
+        for (size_t k = 0; k < m; ++k) w[i + k] = get32(blk + 4 * k);
+    }
+    *crc = c;
+    return 1;
+}
+
 int biomap_save(const char* path, const Biomap* b) {
     if (!path || !b) return -1;
     const uint64_t ncells = b->cells ? (uint64_t)b->ncells : 0;
     if (ncells > BIOMAP_MAX_CELLS || !regions_ok(b->nreg, b->shift, b->reg, ncells)) return -2;
+    const int v2 = b->morph != NULL;
     uint32_t T[256];
     crc_table(T);
 
     uint8_t* blk = (uint8_t*)malloc((size_t)IO_CELLS * 4);
     if (!blk) return -1;
-    uint32_t pcrc = 0;
-    for (uint64_t i = 0; i < ncells; i += IO_CELLS) {
-        const size_t n = (size_t)(ncells - i < IO_CELLS ? ncells - i : IO_CELLS);
-        for (size_t k = 0; k < n; ++k) put32(blk + 4 * k, b->cells[i + k]);
-        pcrc = crc_update(T, pcrc, blk, n * 4);
-    }
+    const uint32_t pcrc = crc_words(T, b->cells, ncells, blk);
 
-    uint8_t hd[BIOMAP_HDR];
+    uint8_t hd[BIOMAP_HDR2];
+    const size_t hlen = v2 ? BIOMAP_HDR2 : BIOMAP_HDR;
     memset(hd, 0, sizeof hd);
-    memcpy(hd, BIOMAP_MAGIC, 8);
-    put32(hd + 8, BIOMAP_VERSION);
-    put32(hd + 12, BIOMAP_HDR);
+    memcpy(hd, v2 ? BIOMAP_MAGIC2 : BIOMAP_MAGIC, 8);
+    put32(hd + 8, v2 ? BIOMAP_VERSION2 : BIOMAP_VERSION);
+    put32(hd + 12, (uint32_t)hlen);
     put64(hd + 16, b->planet_hash);
     put32(hd + 24, b->seed);
     put32(hd + 28, b->sim_year);
@@ -91,7 +130,15 @@ int biomap_save(const char* path, const Biomap* b) {
     memcpy(hd + 464, b->palette, BIOMAP_PALETTE * 3);
     put64(hd + 512, ncells);
     put32(hd + 520, pcrc);
-    put32(hd + 524, crc_update(T, 0, hd, 524));
+    if (v2) {
+        put32(hd + 524, crc_words(T, b->morph, ncells, blk));
+        for (int i = 0; i < BIOMAP_FALLBACK; ++i) put32(hd + 528 + 4 * i, b->fallback_morph[i]);
+        for (int i = 0; i < BIOMAP_ATM; ++i) put32(hd + 784 + 4 * i, (uint32_t)b->atm_ppm[i]);
+        put32(hd + 812, b->atm_known ? 1u : 0u);
+        put32(hd + 828, crc_update(T, 0, hd, 828));
+    } else {
+        put32(hd + 524, crc_update(T, 0, hd, 524));
+    }
 
     /* write a temporary file, then replace: readers never see a partial biomap */
     const size_t pl = strlen(path);
@@ -101,12 +148,9 @@ int biomap_save(const char* path, const Biomap* b) {
     memcpy(tmp + pl, ".tmp", 5);
     FILE* f = fopen(tmp, "wb");
     int ok = f != NULL;
-    if (ok) ok = fwrite(hd, 1, sizeof hd, f) == sizeof hd;
-    for (uint64_t i = 0; ok && i < ncells; i += IO_CELLS) {
-        const size_t n = (size_t)(ncells - i < IO_CELLS ? ncells - i : IO_CELLS);
-        for (size_t k = 0; k < n; ++k) put32(blk + 4 * k, b->cells[i + k]);
-        ok = fwrite(blk, 4, n, f) == n;
-    }
+    if (ok) ok = fwrite(hd, 1, hlen, f) == hlen;
+    if (ok) ok = write_words(f, b->cells, ncells, blk);
+    if (ok && v2) ok = write_words(f, b->morph, ncells, blk);
     if (f && fclose(f)) ok = 0;
     free(blk);
     if (ok) {
@@ -124,13 +168,22 @@ int biomap_load(const char* path, Biomap* b) {
     if (!f) return -1;
     uint32_t T[256];
     crc_table(T);
-    uint8_t hd[BIOMAP_HDR];
+    uint8_t hd[BIOMAP_HDR2];
     int rc = -2;
+    int v2 = 0;
     uint8_t* blk = NULL;
     uint32_t* cells = NULL;
-    if (fread(hd, 1, sizeof hd, f) != sizeof hd) goto fail;
-    if (memcmp(hd, BIOMAP_MAGIC, 8) || get32(hd + 8) != BIOMAP_VERSION || get32(hd + 12) != BIOMAP_HDR) goto fail;
-    if (get32(hd + 524) != crc_update(T, 0, hd, 524)) goto fail;
+    uint32_t* morph = NULL;
+    if (fread(hd, 1, BIOMAP_HDR, f) != BIOMAP_HDR) goto fail;
+    v2 = !memcmp(hd, BIOMAP_MAGIC2, 8);
+    if (v2) {
+        if (get32(hd + 8) != BIOMAP_VERSION2 || get32(hd + 12) != BIOMAP_HDR2) goto fail;
+        if (fread(hd + BIOMAP_HDR, 1, BIOMAP_HDR2 - BIOMAP_HDR, f) != BIOMAP_HDR2 - BIOMAP_HDR) goto fail;
+        if (get32(hd + 828) != crc_update(T, 0, hd, 828)) goto fail;
+    } else {
+        if (memcmp(hd, BIOMAP_MAGIC, 8) || get32(hd + 8) != BIOMAP_VERSION || get32(hd + 12) != BIOMAP_HDR) goto fail;
+        if (get32(hd + 524) != crc_update(T, 0, hd, 524)) goto fail;
+    }
 
     Biomap m;
     memset(&m, 0, sizeof m);
@@ -150,6 +203,11 @@ int biomap_load(const char* path, Biomap* b) {
     }
     for (int i = 0; i < BIOMAP_FALLBACK; ++i) m.fallback[i] = get32(hd + 208 + 4 * i);
     memcpy(m.palette, hd + 464, BIOMAP_PALETTE * 3);
+    if (v2) {
+        for (int i = 0; i < BIOMAP_FALLBACK; ++i) m.fallback_morph[i] = get32(hd + 528 + 4 * i);
+        for (int i = 0; i < BIOMAP_ATM; ++i) m.atm_ppm[i] = (int32_t)get32(hd + 784 + 4 * i);
+        m.atm_known = get32(hd + 812) & 1u;
+    }
     const uint64_t ncells = get64(hd + 512);
     if (ncells > BIOMAP_MAX_CELLS || !regions_ok(m.nreg, m.shift, m.reg, ncells)) goto fail;
 
@@ -157,21 +215,22 @@ int biomap_load(const char* path, Biomap* b) {
     cells = (uint32_t*)malloc((size_t)(ncells ? ncells : 1) * sizeof(uint32_t));
     blk = (uint8_t*)malloc((size_t)IO_CELLS * 4);
     if (!cells || !blk) goto fail;
-    uint32_t pcrc = 0;
-    for (uint64_t i = 0; i < ncells; i += IO_CELLS) {
-        const size_t n = (size_t)(ncells - i < IO_CELLS ? ncells - i : IO_CELLS);
-        if (fread(blk, 4, n, f) != n) goto fail;
-        pcrc = crc_update(T, pcrc, blk, n * 4);
-        for (size_t k = 0; k < n; ++k) cells[i + k] = get32(blk + 4 * k);
+    uint32_t pcrc = 0, mcrc = 0;
+    if (!read_words(f, T, cells, ncells, blk, &pcrc)) goto fail;
+    if (v2) {
+        morph = (uint32_t*)malloc((size_t)(ncells ? ncells : 1) * sizeof(uint32_t));
+        if (!morph || !read_words(f, T, morph, ncells, blk, &mcrc)) goto fail;
     }
     rc = -2;
     if (fgetc(f) != EOF) goto fail;              /* trailing bytes: not what we wrote */
     rc = -3;
     if (pcrc != get32(hd + 520)) goto fail;
+    if (v2 && mcrc != get32(hd + 524)) goto fail;
 
     fclose(f);
     free(blk);
     m.cells = cells;
+    m.morph = morph;
     m.ncells = (size_t)ncells;
     *b = m;
     return 0;
@@ -179,12 +238,14 @@ fail:
     fclose(f);
     free(blk);
     free(cells);
+    free(morph);
     return rc;
 }
 
 void biomap_free(Biomap* b) {
     if (!b) return;
     free(b->cells);
+    free(b->morph);
     memset(b, 0, sizeof *b);
 }
 
@@ -197,10 +258,12 @@ void biomap_view(const Biomap* b, GmeBioView* o) {
         o->nreg = b->nreg;
         o->shift = b->shift;
         memcpy(o->reg, b->reg, sizeof(GmeBioRegion) * (size_t)b->nreg);
+        o->morph = b->morph;                      /* NULL for a version 1 biomap: version 1 shapes */
     }
     o->seed = b->seed;
     o->fallback_on = b->fallback_on ? 1u : 0u;
     memcpy(o->fallback, b->fallback, sizeof o->fallback);
+    if (b->morph) memcpy(o->fallback_morph, b->fallback_morph, sizeof o->fallback_morph);
 }
 
 /* Integer HSV wheel: index i = 1..15 has hue (i - 1) * 24 degrees (1 red,
@@ -269,5 +332,31 @@ int biomap_make_test(Biomap* b, uint64_t planet_hash, uint32_t seed, int32_t cx,
     biomap_default_palette(b->palette);
     b->cells = cells;
     b->ncells = (size_t)n * n;
+    return 0;
+}
+
+/* The T11 pattern as version 2: every 32 m block also gets a morphology word.
+ * The crown class changes with each repeat of the six kinds along x and the
+ * aspect every three blocks along z, so a walk across the pattern shows all
+ * 5 x 8 shapes; leaf angle, porosity, pigment amount and Q band width vary on
+ * coarser grids. */
+int biomap_make_test2(Biomap* b, uint64_t planet_hash, uint32_t seed, int32_t cx, int32_t cz) {
+    if (biomap_make_test(b, planet_hash, seed, cx, cz)) return -1;
+    const int32_t n = b->reg[0].w;
+    uint32_t* morph = (uint32_t*)malloc(b->ncells * sizeof(uint32_t));
+    if (!morph) { biomap_free(b); return -1; }
+    for (int32_t j = 0; j < n; ++j) {
+        for (int32_t i = 0; i < n; ++i) {
+            const int32_t bi = i >> 1, bj = j >> 1;    /* the pattern's 32 m blocks */
+            const uint32_t crown = (uint32_t)(bi / 6) % (uint32_t)BIO_CROWN_N;
+            const uint32_t aspect = (uint32_t)(bj / 3) % 8u;
+            const uint32_t leafang = (uint32_t)(bi / 30 + bj / 24) % 4u;
+            const uint32_t porosity = (uint32_t)(bi / 12 + bj / 12) % 4u;
+            const uint32_t pig = 96u + 53u * ((uint32_t)(bi / 8 + bj / 8) % 4u);   /* 96 .. 255 */
+            const uint32_t qw = (uint32_t)(bi / 16 + 3 * (bj / 16)) % 16u;
+            morph[(size_t)j * n + i] = b->cells[(size_t)j * n + i] ? BIOMORPH(crown, aspect, leafang, porosity, pig, qw) : 0u;
+        }
+    }
+    b->morph = morph;
     return 0;
 }

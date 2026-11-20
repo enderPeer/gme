@@ -1,7 +1,7 @@
 # Render tests on the cluster's render node (rig B: headless Linux build of gme).
 #
 #   pwsh cluster/render_remote.ps1 -Sync
-#       copy this tree (src, CMakeLists.txt, genesis/home.planet, life/home.biomap) to
+#       copy this tree (src, CMakeLists.txt, genesis/home.planet, life/home.biomap, life/home.fauna) to
 #       ~/$Name on rig B and build gme there (skipped when nothing changed)
 #   pwsh cluster/render_remote.ps1 -Run "<gme args>" -Out <local folder> [-Gpu K] [-Root <tree> -Name <workspace>]
 #       sync if needed, run gme on a free GPU of rig B, copy the job's output folder back.
@@ -36,7 +36,7 @@ function Invoke-Rig([string]$script) { $script.Replace("`r", '') | ssh -o BatchM
 
 # ---- sync: stamp = hash of every input file; upload + build only when it changed ----
 $inputs = @(Get-ChildItem src -Recurse -File | Sort-Object FullName) + @(Get-Item CMakeLists.txt)
-foreach ($f in 'genesis/home.planet', 'life/home.biomap') { if (Test-Path $f) { $inputs += Get-Item $f } }
+foreach ($f in 'genesis/home.planet', 'life/home.biomap', 'life/home.fauna') { if (Test-Path $f) { $inputs += Get-Item $f } }
 $sha = [System.Security.Cryptography.SHA256]::Create()
 $all = ($inputs | ForEach-Object { "$($_.FullName.Substring((Get-Location).Path.Length)) $((Get-FileHash $_.FullName -Algorithm SHA256).Hash)" }) -join "`n"
 $stamp = -join ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($all)) | ForEach-Object { $_.ToString('x2') })
@@ -47,6 +47,7 @@ if ($remoteStamp.Trim() -ne $stamp) {
     scp -q -r src CMakeLists.txt "${dst}:$stage/"
     if (Test-Path genesis/home.planet) { scp -q genesis/home.planet "${dst}:$stage/genesis/" }
     if (Test-Path life/home.biomap) { scp -q life/home.biomap "${dst}:$stage/life/" }
+    if (Test-Path life/home.fauna) { scp -q life/home.fauna "${dst}:$stage/life/" }
     $build = @"
 set -e
 exec 7>/tmp/$Name.build.lock; flock 7
@@ -57,6 +58,7 @@ if [ "`$(cat ~/$Name/.stamp 2>/dev/null)" != "$stamp" ]; then
   mkdir -p ~/$Name/genesis ~/$Name/life
   [ -f $stage/genesis/home.planet ] && mv -f $stage/genesis/home.planet ~/$Name/genesis/
   [ -f $stage/life/home.biomap ] && mv -f $stage/life/home.biomap ~/$Name/life/
+  if [ -f $stage/life/home.fauna ]; then mv -f $stage/life/home.fauna ~/$Name/life/; else rm -f ~/$Name/life/home.fauna; fi
   T=~/gme/toolchain/nvidia/cu13
   cmake -S ~/$Name -B ~/$Name/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER=`$T/bin/nvcc -DCMAKE_CUDA_ARCHITECTURES=86 > ~/$Name/build.log 2>&1
   nice -n 10 cmake --build ~/$Name/build -j 12 --target gme >> ~/$Name/build.log 2>&1 || { echo "render: BUILD FAILED on rig B (tail of ~/$Name/build.log):"; grep -iE "error" ~/$Name/build.log | head -n 20; exit 2; }

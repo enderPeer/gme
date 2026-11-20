@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # One life-simulation island on one GPU of this rig, resumed forever
 # (docs/biosphere-spec.md 6.5). Started by cluster/bio_launch.ps1 in tmux bio-isl<island>.
-# usage: bio_island.sh <cuda_device> <island> <planet_hash> <duty> <cap>
+# usage: bio_island.sh <cuda_device> <island> <planet_hash> <duty> <cap> [enable]
 #   run folder ~/gme/runs/bio_<planet_hash>/island_<island>/ (env.bin is made by bio_launch.ps1)
+#   enable: features to switch on in the running world, e.g. animals,sex,learn,morph,hub,spectral
+#     (life --enable; logged once as an intervention, a no-op on every later restart). A run
+#     with light in bands needs ~/gme/life/spectrum.bin (bio_launch.ps1 -Deploy copies it).
 #   life exit 0 (Ctrl+C, SIGTERM, tmux kill: it checkpoints first) ends the loop;
 #   exit 3 (extinct): roll back to the newest checkpoint with a new salt, logged as
 #     "INTERVENTION rollback <n>" in stages.log (after 3 extinctions in a row from the
@@ -10,7 +13,7 @@
 #   any other exit: wait 30 s and resume.
 # The binary lives in ~/gme/build-bio, so rebuilding it never touches the star search.
 set -u
-DEV=$1; ISL=$2; HASH=$3; DUTY=$4; CAP=$5
+DEV=$1; ISL=$2; HASH=$3; DUTY=$4; CAP=$5; ENABLE=${6:-}
 cd "$HOME/gme"
 # NVRTC (the rigs need no CUDA toolkit): set GME_NVRTC_DIR to the folder holding
 # libnvrtc.so, e.g. from "pip install nvidia-cuda-nvrtc" in a venv; otherwise the
@@ -31,10 +34,10 @@ extra=""        # --salt S after an extinction, kept until a newer checkpoint ex
 salt_ck=""
 newest_ck() { ls "$RUN"/ckpt_*.bin 2>/dev/null | sort | tail -n 1; }
 while true; do
-  echo "$(date '+%F %T') start: life --device $DEV --island $ISL --duty $DUTY --cap $CAP $extra" >> "$LOG"
+  echo "$(date '+%F %T') start: life --device $DEV --island $ISL --duty $DUTY --cap $CAP ${ENABLE:+--enable $ENABLE} $extra" >> "$LOG"
   # one metrics row per 10 sim-days and maps every 20 sim-years keep the files at tens of MB per wall-day
   nice -n 5 $BIN life --device "$DEV" --island "$ISL" --run "$RUN" --resume --duty "$DUTY" --cap "$CAP" \
-      --checkpoint-min 30 --metrics-every 10 --maps-every 20 $extra >> "$LOG" 2>&1
+      --checkpoint-min 30 --metrics-every 10 --maps-every 20 ${ENABLE:+--enable "$ENABLE"} $extra >> "$LOG" 2>&1
   rc=$?
   if [ -n "$extra" ] && [ "$(newest_ck)" != "$salt_ck" ]; then extra=""; fi   # the new salt is in a checkpoint now
   case $rc in
@@ -52,7 +55,14 @@ while true; do
        fi
        echo "$(date '+%F %T') INTERVENTION rollback $rb salt $salt (extinct)" >> "$RUN/stages.log"
        extra="--salt $salt"; salt_ck=$(newest_ck) ;;
-    *) echo "$(date '+%F %T') life exited $rc, resuming in 30 s" >> "$LOG"
-       sleep 30 ;;
+    *) if [ "$rc" -eq 2 ] && [ -n "$ENABLE" ]; then
+         # a usage error cannot heal by itself: an old build or a misspelt feature must not keep the island down
+         echo "$(date '+%F %T') life refused --enable $ENABLE (exit 2): carrying on without it" >> "$LOG"
+         echo "$(date '+%F %T') NOTE --enable $ENABLE was refused by this build; the island runs on with its checkpoint's features" >> "$RUN/stages.log"
+         ENABLE=""
+       else
+         echo "$(date '+%F %T') life exited $rc, resuming in 30 s" >> "$LOG"
+         sleep 30
+       fi ;;
   esac
 done

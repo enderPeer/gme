@@ -10,14 +10,20 @@ static __device__ __forceinline__ long long bio_warp_sum(long long v) {
     for (int d = 16; d > 0; d >>= 1) v += __shfl_down_sync(0xFFFFFFFFu, v, d);
     return v;
 }
-/* accumulator indices written by k_env and by k_metab */
-static __device__ __forceinline__ int bio_env_acc(int k) {
+/* accumulator indices written by k_env and by k_metab (k < BACC_N: G->acc[k];
+ * BACC_N + j: G->acc2[j], written only while their feature is on) */
+static __device__ __forceinline__ int bio_env_acc(int k, unsigned feat) {
+    if (k >= BACC_N) return (feat & BIO_FEAT_HUB) && k < BACC_X(BACC2_XALL + BIO_ATMG);
     return k == BACC_SED_C || k == BACC_SED_S || k == BACC_SED_FE || (k >= BACC_VENT_C && k <= BACC_WEATH_P) ||
            (k >= BACC_ATMD && k < BACC_ATMD + BIO_ATMG);
 }
-static __device__ __forceinline__ int bio_metab_acc(int k) {
+static __device__ __forceinline__ int bio_metab_acc(int k, unsigned feat) {
+    if (k >= BACC_N) return (feat & BIO_FEAT_PRED) && (k == BACC_X(BACC2_KILLS) || k == BACC_X(BACC2_BITES) || k == BACC_X(BACC2_GUT_C));
     return k < BACC_PATH + BP_N || k == BACC_FIX || k == BACC_ASSIM || k == BACC_RESP || k == BACC_DEATH_C || k == BACC_SED_FE ||
            k == BACC_WANT;
+}
+static __device__ __forceinline__ long long* bio_acc_ptr(BioGlobals* G, int k) {
+    return k < BACC_N ? (long long*)&G->acc[k] : (long long*)&G->acc2[k - BACC_N];
 }
 
 extern "C" __global__ void k_globals(BIO_KW) {
@@ -26,23 +32,24 @@ extern "C" __global__ void k_globals(BIO_KW) {
 
 // cells: diffusion + chemistry; block sums of the ledgers go to G->acc
 extern "C" __global__ void __launch_bounds__(BIO_BLOCK) k_env(BIO_KW) {
-    __shared__ long long sacc[BACC_N];
-    for (int k = threadIdx.x; k < BACC_N; k += blockDim.x) sacc[k] = 0;
+    __shared__ long long sacc[BACC_TOT];
+    for (int k = threadIdx.x; k < BACC_TOT; k += blockDim.x) sacc[k] = 0;
     __syncthreads();
-    int64_t loc[BACC_N];
+    int64_t loc[BACC_TOT];
     BIO_UNROLL
-    for (int k = 0; k < BACC_N; ++k) loc[k] = 0;
+    for (int k = 0; k < BACC_TOT; ++k) loc[k] = 0;
     const int32_t c = BIO_TID;
+    const unsigned feat = (unsigned)w.P.feat;
     if (c < w.n_cells) bio_cell_env(&w, c, loc);
     BIO_UNROLL
-    for (int k = 0; k < BACC_N; ++k) {
-        if (!bio_env_acc(k)) continue;
+    for (int k = 0; k < BACC_TOT; ++k) {
+        if (!bio_env_acc(k, feat)) continue;
         const long long v = bio_warp_sum(loc[k]);
         if ((threadIdx.x & 31) == 0 && v) atomicAdd((unsigned long long*)&sacc[k], (unsigned long long)v);
     }
     __syncthreads();
-    for (int k = threadIdx.x; k < BACC_N; k += blockDim.x)
-        if (sacc[k]) atomicAdd((unsigned long long*)&w.G->acc[k], (unsigned long long)sacc[k]);
+    for (int k = threadIdx.x; k < BACC_TOT; k += blockDim.x)
+        if (sacc[k]) atomicAdd((unsigned long long*)bio_acc_ptr(w.G, k), (unsigned long long)sacc[k]);
 }
 
 extern "C" __global__ void __launch_bounds__(BIO_BLOCK) k_summary(BIO_KW) {
@@ -85,23 +92,34 @@ extern "C" __global__ void __launch_bounds__(BIO_BLOCK) k_supply(BIO_KW) {
 }
 
 extern "C" __global__ void __launch_bounds__(BIO_BLOCK) k_metab(BIO_KW) {
-    __shared__ long long sacc[BACC_N];
-    for (int k = threadIdx.x; k < BACC_N; k += blockDim.x) sacc[k] = 0;
+    __shared__ long long sacc[BACC_TOT];
+    for (int k = threadIdx.x; k < BACC_TOT; k += blockDim.x) sacc[k] = 0;
     __syncthreads();
-    int64_t loc[BACC_N];
+    int64_t loc[BACC_TOT];
     BIO_UNROLL
-    for (int k = 0; k < BACC_N; ++k) loc[k] = 0;
+    for (int k = 0; k < BACC_TOT; ++k) loc[k] = 0;
     const int32_t i = BIO_TID;
+    const unsigned feat = (unsigned)w.P.feat;
     if (i < (int32_t)w.n_slots) bio_agent_metab(&w, i, loc);
     BIO_UNROLL
-    for (int k = 0; k < BACC_N; ++k) {
-        if (!bio_metab_acc(k)) continue;
+    for (int k = 0; k < BACC_TOT; ++k) {
+        if (!bio_metab_acc(k, feat)) continue;
         const long long v = bio_warp_sum(loc[k]);
         if ((threadIdx.x & 31) == 0 && v) atomicAdd((unsigned long long*)&sacc[k], (unsigned long long)v);
     }
     __syncthreads();
-    for (int k = threadIdx.x; k < BACC_N; k += blockDim.x)
-        if (sacc[k]) atomicAdd((unsigned long long*)&w.G->acc[k], (unsigned long long)sacc[k]);
+    for (int k = threadIdx.x; k < BACC_TOT; k += blockDim.x)
+        if (sacc[k]) atomicAdd((unsigned long long*)bio_acc_ptr(w.G, k), (unsigned long long)sacc[k]);
+}
+
+// predation: attackers collect what their prey gave up in k_metab (BIO_FEAT_PRED only)
+extern "C" __global__ void __launch_bounds__(BIO_BLOCK) k_feed(BIO_KW) {
+    int64_t loc[BACC_TOT];
+    loc[BACC_X(BACC2_PRED_C)] = 0;
+    const int32_t i = BIO_TID;
+    if (i < (int32_t)w.n_slots) bio_agent_feed(&w, i, loc);
+    const long long v = bio_warp_sum(loc[BACC_X(BACC2_PRED_C)]);
+    if ((threadIdx.x & 31) == 0 && v) atomicAdd((unsigned long long*)&w.G->acc2[BACC2_PRED_C], (unsigned long long)v);
 }
 
 // block-local exclusive scan of 1024 items. mode 0: births | deaths << 16

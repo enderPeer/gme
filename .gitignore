@@ -10,6 +10,9 @@
 /life/islands/
 /life/islands_offline/
 /life/home.biomap
+/life/home.fauna
+/life/seedbank.bin
+/life/hub/
 /status/
 
 # local cluster configuration (see cluster/hosts.example.ps1)

@@ -27,7 +27,12 @@
  *               Soret + Q band; leaf reflectance / transmittance, mats, grass,
  *               kelp) and draws clumped crowns, kelp blades and grass tufts
  *               (shading); crowns are a leaf-area medium for their own light,
- *               and for every shadow ray in High. */
+ *               and for every shadow ray in High.
+ *               Version 2 biomaps (biomap.h morphology; spec 5.3) give shrubs
+ *               and trees one of five crown classes (flora.h), every cell its
+ *               own pigment amount and Q band width, and a crown's leaf medium
+ *               its porosity and leaf angle. Creatures (fauna_scene.h) are
+ *               spheres drawn over both paths (renderer_set_fauna). */
 #ifndef GME_RENDER_H
 #define GME_RENDER_H
 
@@ -35,6 +40,7 @@
 #include "worldgen.h"
 #include "biomap.h"
 #include "density.h"
+#include "fauna_scene.h"
 #include "spectral.h"
 
 #ifdef __cplusplus
@@ -84,7 +90,7 @@ typedef struct RenderScene {
 
 enum { RQ_CLASSIC = 0, RQ_LOW, RQ_MEDIUM, RQ_HIGH, RQ_REF, RQ_COUNT };
 /* hit kinds of the smooth path (renderer_read_linear, probe): trace.cuh's HK_* */
-enum { RK_NONE = 0, RK_TERRAIN, RK_CROWN, RK_TRUNK, RK_KELP, RK_VOXEL, RK_ICE, RK_LOD, RK_FAR, RK_DIST };
+enum { RK_NONE = 0, RK_TERRAIN, RK_CROWN, RK_TRUNK, RK_KELP, RK_VOXEL, RK_ICE, RK_LOD, RK_FAR, RK_DIST, RK_FAUNA };
 /* debug views: RD_BAND0 + b shows band b; RD_GI the indirect irradiance (M4; the
  * sky ambient's AO without GI), RD_AGE the TAA history age (red 1 frame, yellow 2,
  * green 3-7, blue >= 8; disoccluded pixels must be red / yellow), RD_VIS the
@@ -179,7 +185,8 @@ typedef struct RenderPerf {
  * band-mean spectral irradiance (W m^-2 nm^-1) on the hit surface. */
 typedef struct RenderProbe {
     int    valid;              /* 0: the crosshair sees the sky */
-    int    kind;               /* hit kind (RK_*): 1 terrain, 2 crown, 3 trunk, 4 kelp, 5 voxel, 6 ice, 7 LOD, 8 far field, 9 distant */
+    int    kind;               /* hit kind (RK_*): 1 terrain, 2 crown, 3 trunk, 4 kelp, 5 voxel, 6 ice, 7 LOD, 8 far field, 9 distant,
+                                * 10 a creature */
     int    material;           /* dominant MAT_* */
     float  pos[3];             /* absolute world position */
     float  normal[3];
@@ -195,6 +202,9 @@ typedef struct RenderProbe {
     int    pal;                /* biomap palette index = the pigment's hue bin (0 = the default bin) */
     float  cover;              /* the cell's cover 0..1 */
     float  tsun;               /* crowns: transmittance of the own crown toward the sun (in e_sun); else 1 */
+    /* version 2 (biomap morphology) */
+    int    pig_level;          /* pigment level of the cell, 1..15 = PIG 17 x level; 0 = no morphology (PIG 200, Q band 25 nm) */
+    int    qw_bin;             /* Q band width bin 0..15 (15 + 3 bin nm), with pig_level > 0 */
 } RenderProbe;
 
 typedef struct Renderer Renderer;
@@ -206,6 +216,17 @@ void      renderer_destroy(Renderer* r);
 /* Spectral light of the planet (spectral_build_atmo): uploads the LUTs and
  * tables. Without it the smooth path is not drawn (classic is). 0 ok. */
 int       renderer_set_atmo(Renderer* r, const SpectralAtmo* a);
+/* Creatures (fauna_scene.h): uploads the sphere records grouped by cell and
+ * the hash grid of a FaunaScene (its grid, ngrid, cells, ncells; copies;
+ * nsph == 0 removes them) and the palette of the classic tint (sRGB per
+ * palette index). Both paths draw them from the next frame on: the smooth
+ * one as spheres with a skin of the palette index's pigment (primary rays
+ * and the sun's shadow ray see them; GI and reflection rays do not), the
+ * classic one with a plain tint. Without creatures no kernel of theirs runs
+ * and no frame changes. Call it before world_create (36 + 16 B of VRAM per
+ * sphere, 24 B per grid slot). 0 ok. */
+int       renderer_set_fauna(Renderer* r, const FaunaSphere* sph, uint32_t nsph, const FaunaCell* cells, uint32_t ncells,
+                             const uint8_t palette[16][3]);
 /* Queues a w x h BGRA frame and returns (*pixels, host memory valid until the
  * next call) the frame queued by the call before it, which the GPU finished
  * while this one was queued (M4 asynchronous readback, 2 pinned frames). The
@@ -297,7 +318,7 @@ int       renderer_disocc(Renderer* r, RenderDisocc* out);
 #include <cuda_fp16.h>
 
 /* surface classes of the guides (disocclusion: a pixel whose class changed has no history) */
-enum { GC_SKY = 0, GC_TERRAIN, GC_FLORA, GC_KELP, GC_VOXEL, GC_ICE, GC_WATER, GC_UNDER, GC_DIST };
+enum { GC_SKY = 0, GC_TERRAIN, GC_FLORA, GC_KELP, GC_VOXEL, GC_ICE, GC_WATER, GC_UNDER, GC_DIST, GC_FAUNA };
 /* guide flags (bits 28..31 of the guide's second word) */
 #define GG_GI    0x10000000u   /* the point has GI (half-res guide) / uses GI (full-res guide) */
 #define GG_REFL  0x20000000u   /* the point has a traced reflection */

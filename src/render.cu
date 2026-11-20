@@ -329,9 +329,20 @@ __global__ void __launch_bounds__(128) k_render(KParams p) {
 // transmission tau / pi E); High's shadow rays see other crowns as that medium
 // too; kelp blades transmit (two-sided); grass tufts as a normal fuzz and a
 // sheen lobe; --debug palette keeps the old HSV tint
+// Version 2 biomaps (spec 5.3; biomap.h morphology): crowns by class (trace.cuh:
+// ellipsoid, cone, umbrella, column, dome), tissue from the cell's own pigment
+// amount and Q band width (ShadeTab.pig_A2; the G-buffer carries both), the
+// crown's porosity and leaf angle in its leaf-area medium.
+// Creatures (fauna_scene.h): spheres found through a hash grid of 32 m cells,
+// in passes that run only while some are near the camera: k_fauna_anim (their
+// positions of the frame), k_fauna_primary (after k_primary: a nearer sphere
+// replaces the hit record), k_fauna_sun (after k_sun: their shadows); k_surface
+// and k_compose shade them as skin of their palette index's pigment. Classic:
+// k_fauna_classic over k_render's frame (k_render itself is untouched).
 // ===========================================================================
 #include "trace.cuh"
-static_assert(HK_TERRAIN == RK_TERRAIN && HK_LOD == RK_LOD && HK_FAR == RK_FAR && HK_DIST == RK_DIST, "render.h RK_* = trace.cuh HK_*");
+static_assert(HK_TERRAIN == RK_TERRAIN && HK_LOD == RK_LOD && HK_FAR == RK_FAR && HK_DIST == RK_DIST && HK_FAUNA == RK_FAUNA,
+              "render.h RK_* = trace.cuh HK_*");
 
 #define WAVES   8
 #define WATER_N 1.333f
@@ -363,7 +374,15 @@ struct ShadeTab {
     float leaf_rho[SPEC_NHUE][SPEC_NB];
     float leaf_tau[SPEC_NHUE][SPEC_NB];
     float mat_tis[SPEC_NHUE][SPEC_NB];
+    // version 2 (biomap morphology, spec 5.3): the absorptance of a cell's own pigment amount (level - 1)
+    // and Q band width bin; leaf rho / tau and the mat follow as rho_L = 0.04 + 0.44 (1 - A) ...
+    float pig_A2[SPEC_NHUE][SPEC_NPIG][SPEC_NQW][SPEC_NB];
+    // creatures: the skin of each hue bin, a darker and less saturated leaf
+    float skin[SPEC_NHUE][SPEC_NB];
 };
+// a creature's skin in the material tables (the one id MAT_* leaves free)
+#define RMAT_SKIN 15
+static_assert(MAT_COUNT <= RMAT_SKIN && RMAT_SKIN < SPEC_NMAT, "RMAT_SKIN must be a free material id");
 
 // per-frame state on the device: white balance, exposure, light at the water level
 struct FrameState {
@@ -421,15 +440,33 @@ struct ProbeOut {
     float e_sun[SPEC_NB], e_sky[SPEC_NB], e_hor[SPEC_NB];
     int   pal, mat1;              // M5: hue bin (palette index) and the second material
     float cover, w1, tsun;        // ... the cell's cover, the second material's weight, a crown's own transmittance
+    int   pig, qw;                // version 2: pigment level (0 = none) and Q band width bin of the cell
 };
 
 enum { GF_HIT = 1u, GF_TERRAIN = 2u, GF_SHADOW = 4u, GF_UNDER = 8u };
+
+// Creatures (fauna_scene.h): the device arrays and the frame's camera chunk and time. n = 0: none near
+// the camera (their kernels are not launched).
+struct FaunaDev {
+    const FaunaSphere* sph;         // records grouped by cell
+    const float4*      pos;         // this frame (k_fauna_anim): each record's moving centre relative to the camera chunk, radius
+    const FaunaCell*   cells;
+    uint32_t mask;                  // slots - 1 of the hash grid
+    uint32_t n;                     // spheres
+    float    ylo, yhi;              // height range of all spheres (absolute metres)
+    int32_t  cx, cy, cz;            // camera chunk
+    float    time;                  // seconds (idle motion; 0 = still)
+    int      classic;               // rest heights of the classic view (on the voxel ground)
+};
+struct FaunaPal { float3 c[BIOMAP_PALETTE]; };   // classic tint per palette index (linear RGB)
 // water mode of a pixel's path: bits 24..26 of b.x (miss records) or b.y (G-buffer)
 enum { WM_NONE = 0, WM_STRAIGHT, WM_REFR, WM_UNDER, WM_UNDER_OUT, WM_UNDER_TIR };
 
+// (The column tracer's context of the frame, TCtx, is not a kernel parameter: it is uploaded to constant
+// memory (g_tc) and kept next to these in the Renderer. That keeps this block under 4 KB, the kernel
+// parameter limit of CUDA toolkits before 12.1, with the version 2 biomap view and the creatures added.)
 struct SParams {
     KParams k;                  // camera, classic sky, vegetation tint (shared with the classic kernel)
-    TCtx    t;                  // column tracer
     int     debug;              // RD_*
     unsigned long long* dbg;    // --metrics: NaN counter of the shaded colour (NULL = off)
     // M2
@@ -475,6 +512,8 @@ struct SParams {
     unsigned int* nan;              // NaN counter (FrameState.nan)
     // M5
     int     lad;                    // High: shadow rays (k_sun, k_sec_nee) treat crowns as a leaf-area medium
+    // creatures
+    FaunaDev fauna;
 };
 
 // ---- small helpers -------------------------------------------------------------
@@ -538,13 +577,22 @@ __device__ uint32_t bio_cell_at(const KParams& p, int32_t x, int32_t z) {
     return 0u;
 }
 // the biomap cell generation used for absolute column (x, z): its tile's slot (regions and the
-// fallback table alike), else the region lookup (tile not published)
-__device__ uint32_t sm_slot_cell(const KParams& p, int32_t x, int32_t z) {
+// fallback table alike), else the region lookup (tile not published); and the slot's shape word
+// (version 2: pigment amount, Q band width; 0 without a tile or without morphology)
+struct SlotLook { uint32_t cell; int32_t sw; };
+__device__ __forceinline__ SlotLook sm_slot_look(const KParams& p, int32_t x, int32_t z) {
+    SlotLook L;
     const GmeColTile* t = tr_tile((x >> 5) - g_tc.cx, (z >> 5) - g_tc.cz);
-    if (t) return __ldg(&t->slot[((z & 31) >> 3) * 4 + ((x & 31) >> 3)].cell);
-    return p.bio_cells ? bio_cell_at(p, x, z) : 0u;
+    if (t) {
+        const GmeSlot* s = &t->slot[((z & 31) >> 3) * 4 + ((x & 31) >> 3)];
+        L.cell = __ldg(&s->cell);
+        L.sw = __ldg(&s->theight);
+    } else {
+        L.cell = p.bio_cells ? bio_cell_at(p, x, z) : 0u;
+        L.sw = 0;
+    }
+    return L;
 }
-__device__ __forceinline__ int cell_pal(uint32_t c) { return (int)BIOCELL_PAL(c); }
 __device__ __forceinline__ float cell_cover(uint32_t c) { return (float)BIOCELL_COVER(c) * (1.f / 255.f); }
 
 // ---- water surface ---------------------------------------------------------------
@@ -621,6 +669,151 @@ __device__ __forceinline__ float3 path_pos(const SParams& sp, float3 d, float t,
     }
     *d2 = d;
     return sp.k.o + d * t;
+}
+
+// ---- creatures (fauna_scene.h, biosphere spec 7.5) --------------------------------------------
+// Spheres found through a hash grid of 32 m cells (= chunk columns). Nothing here touches the
+// classic kernel or the walk: k_fauna_anim, k_fauna_primary, k_fauna_sun and k_fauna_classic are
+// extra passes, launched only while creatures are near the camera.
+// k_fauna_anim: once per frame, the moving centre of every sphere (fauna_motion at the frame's time)
+// relative to the camera chunk, and its radius: the rays then test plain spheres
+__global__ void __launch_bounds__(256) k_fauna_anim(FaunaDev F, float4* out) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= F.n) return;
+    const FaunaSphere s = F.sph[i];
+    float ox, oy, oz;
+    fauna_motion(s.amp, s.attr, F.time, &ox, &oy, &oz);
+    out[i] = make_float4((float)((s.cx - F.cx) * 32) + s.lx + ox, (F.classic ? s.yv : s.y) - (float)(32 * F.cy) + oy,
+                         (float)((s.cz - F.cz) * 32) + s.lz + oz, s.r);
+}
+// The nearest creature along o + d t (d a unit vector), t in (t0, t1): its sphere (s; -1 none) and the
+// hit's t. The walk visits the cells the ray crosses; a cell lists every sphere that can touch it, so
+// the walk ends with the first cell that holds the nearest hit inside its own span. pix > 0 (primary
+// rays): radians per pixel and tpre the path length before o; a sphere under 0.6 pixels in radius is
+// drawn that large (small animals stay visible), one under 0.15 pixels not at all. any: the first hit
+// found ends the walk, and a ray that starts inside a sphere is blocked (shadow rays).
+struct FaunaHit { int s; float t; };
+__device__ __noinline__ FaunaHit fauna_trace(const FaunaDev F, float3 o, float3 d, float t0, float t1, float pix, float tpre, bool any) {
+    FaunaHit H;
+    H.s = -1;
+    H.t = t1;
+    const float tmin = t0, yo = (float)(32 * F.cy);
+    if (fabsf(d.y) > 1e-6f) {                           // the slab of heights that holds every sphere
+        const float iy = 1.f / d.y, s0 = (F.ylo - yo - o.y) * iy, s1 = (F.yhi - yo - o.y) * iy;
+        t0 = fmaxf(t0, fminf(s0, s1));
+        t1 = fminf(t1, fmaxf(s0, s1));
+    } else if (o.y < F.ylo - yo || o.y > F.yhi - yo) {
+        return H;
+    }
+    if (!(t1 > t0)) return H;
+    if (fabsf(d.x) < 1e-7f) d.x = copysignf(1e-7f, d.x);
+    if (fabsf(d.z) < 1e-7f) d.z = copysignf(1e-7f, d.z);
+    const float ix = 1.f / d.x, iz = 1.f / d.z;
+    const bool px = d.x > 0.f, pz = d.z > 0.f;
+    const float tn = t0 + 1e-3f;
+    int rcx = (int)floorf((o.x + d.x * tn) * (1.f / 32.f)), rcz = (int)floorf((o.z + d.z * tn) * (1.f / 32.f));
+    float t = t0, best = t1;
+    for (int step = 0; step < 96 && t < best; ++step) {
+        const float ex = ((float)((rcx + (px ? 1 : 0)) * 32) - o.x) * ix, ez = ((float)((rcz + (pz ? 1 : 0)) * 32) - o.z) * iz;
+        const float te = fminf(fminf(ex, ez), best);
+        const int32_t ci = fauna_cell_find(F.cells, F.mask, F.cx + rcx, F.cz + rcz);
+        if (ci >= 0) {
+            const FaunaCell c = F.cells[ci];
+            const float ya = o.y + d.y * t, yb = o.y + d.y * te;
+            if (fminf(ya, yb) <= c.yhi - yo && fmaxf(ya, yb) >= c.ylo - yo) {
+                for (uint32_t k = 0; k < c.count; ++k) {
+                    const uint32_t si = c.first + k;
+                    const float4 q = __ldg(F.pos + si);              // the sphere of this frame
+                    const float3 pc = f3(q.x - o.x, q.y - o.y, q.z - o.z);
+                    const float bq = dot3(pc, d);
+                    float r = q.w;
+                    if (pix > 0.f) {
+                        const float rp = pix * (tpre + fmaxf(bq, 0.f));   // one pixel at the sphere
+                        if (r < 0.15f * rp) continue;
+                        r = fmaxf(r, 0.6f * rp);
+                    }
+                    const float3 pp = pc - d * bq;
+                    const float disc = r * r - dot3(pp, pp);
+                    if (disc <= 0.f) continue;
+                    const float sq = sqrtf(disc);
+                    float ts = bq - sq;
+                    if (ts <= tmin) {
+                        if (!any || bq + sq <= tmin) continue;      // behind the origin (or the eye is inside it)
+                        ts = tmin;
+                    }
+                    if (ts >= best) continue;
+                    best = ts;
+                    H.s = (int)si;
+                    H.t = ts;
+                    if (any) return H;
+                }
+            }
+        }
+        if (best <= te) break;                          // the nearest hit lies in the cells visited so far
+        if (ex < ez) rcx += px ? 1 : -1; else rcz += pz ? 1 : -1;
+        t = te;
+    }
+    return H;
+}
+
+// Classic mode: creatures as plainly tinted spheres over k_render's frame (k_render itself is untouched;
+// this pass runs only while creatures are near the camera). A sphere nearer than the classic DDA's hit
+// along the pixel's ray gets the classic light (sun x shadow + ambient), fog and water tint; hunters
+// darker, a highlight on armour.
+__global__ void __launch_bounds__(128) k_fauna_classic(KParams p, FaunaDev F, FaunaPal P) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= p.w || y >= p.h) return;
+    const float u = (2.f * (x + 0.5f) / p.w - 1.f) * p.th * p.aspect;
+    const float v = (1.f - 2.f * (y + 0.5f) / p.h) * p.th;
+    const float3 d = norm3(p.fw + p.rt * u + p.up * v);
+    const FaunaHit fh = fauna_trace(F, p.o, d, 0.f, fminf(p.max_dist, FAUNA_FAR), 2.f * p.th / (float)p.h, 0.f, false);
+    if (fh.s < 0) return;
+    Hit h;
+    if (trace(p, p.o, d, fh.t, h)) return;             // the world is nearer
+    const FaunaSphere s = F.sph[fh.s];
+    const float4 q = F.pos[fh.s];
+    const float3 pos = p.o + d * fh.t;
+    const float3 n = norm3(pos - f3(q.x, q.y, q.z));
+    const uint32_t pi = FA_PAL(s.attr);
+    float3 base = pi ? mix3(f3(0.46f, 0.43f, 0.40f), P.c[pi], 0.6f) : f3(0.46f, 0.43f, 0.40f);
+    base = base * (((s.attr & FA_HUNTER) ? 0.6f : 1.f) * (0.88f + 0.12f * (float)FA_BRIGHT(s.attr) * (1.f / 63.f)));
+    const float ndl = sat(dot3(n, p.sun));
+    float shadow = 1.f;
+    if (p.shadows && ndl > 0.f) {
+        Hit hs;
+        if (trace(p, pos + n * 0.02f, p.sun, 512.f, hs)) shadow = 0.f;
+    }
+    const float amb = 0.30f + 0.14f * n.y + 0.04f * n.x;
+    const float3 skylight = mix3(f3(0.08f, 0.08f, 0.09f), v3(p.sky.zenith) * 0.9f + f3(0.22f, 0.22f, 0.20f), 0.9f);
+    float3 col = base * (v3(p.sky.sun_color) * (p.sky.sun_intensity * ndl * shadow * 1.15f) + skylight * amb);
+    if ((s.attr & FA_ARMORED) && ndl > 0.f)
+        col = col + v3(p.sky.sun_color) * (p.sky.sun_intensity * shadow * 0.35f * powf(sat(dot3(n, norm3(p.sun - d))), 48.f));
+    const float3 fog_c = sky(p, d, false);
+    const float fog_k = 1.f / (p.max_dist * 0.55f);
+    col = mix3(col, fog_c, sat(fmaxf(1.f - expf(-fh.t * fog_k * fh.t * fog_k), 0.f)));
+    if (h.water_t >= 0.f) {                            // in the water: k_render's absorption and surface
+        const float path = fh.t - h.water_t;
+        const float a = 1.f - expf(-path * 0.07f);
+        const float3 deep = f3(0.04f, 0.20f, 0.32f) * (0.55f + 0.45f * p.sun.y);
+        float3 under = mix3(col, deep, a);
+        if (h.water_t > 0.f) {
+            const float c = fabsf(d.y);
+            const float fres = 0.02f + 0.98f * powf(1.f - c, 5.f);
+            const float3 refl = sky(p, f3(d.x, fabsf(d.y), d.z), true);
+            under = mix3(under, refl, fres * 0.7f);
+            const float fog = 1.f - expf(-h.water_t * fog_k * h.water_t * fog_k);
+            under = mix3(under, fog_c, sat(fog));
+        }
+        col = under;
+    }
+    const int dx = x - p.w / 2, dy = y - p.h / 2;       // the crosshair stays on top
+    if ((dy == 0 && abs(dx) < 9 && abs(dx) > 2) || (dx == 0 && abs(dy) < 9 && abs(dy) > 2))
+        col = f3(1.f, 1.f, 1.f) - col;
+    const uint32_t r = (uint32_t)(sqrtf(sat(col.x)) * 255.f + 0.5f);
+    const uint32_t g = (uint32_t)(sqrtf(sat(col.y)) * 255.f + 0.5f);
+    const uint32_t b = (uint32_t)(sqrtf(sat(col.z)) * 255.f + 0.5f);
+    p.out[(size_t)y * p.w + x] = 0xFF000000u | (r << 16) | (g << 8) | b;
 }
 
 // ---- primary rays ---------------------------------------------------------------
@@ -846,6 +1039,38 @@ __global__ void __launch_bounds__(128, 8) k_primary(const __grid_constant__ SPar
     g.b[i] = b;
 }
 
+// k_fauna_primary: creatures on the primary paths (after k_primary; only while creatures are near the
+// camera). The pixel's path, straight or bent at the water plane as k_primary took it, against the
+// sphere grid up to the walk's hit (FAUNA_FAR at most); a nearer sphere replaces the hit record: kind
+// HK_FAUNA, b.y = the sphere. A sphere in front of the water plane takes the water off the path.
+__global__ void __launch_bounds__(128) k_fauna_primary(const __grid_constant__ SParams sp, GBuf g) {
+    const KParams& p = sp.k;
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= p.w || y >= p.h) return;
+    const size_t i = (size_t)y * p.w + x;
+    float4 a = g.a[i];
+    int wm = (int)((g.b[i].x >> 24) & 7u);
+    const float thit = a.x >= 0.f ? a.x : 3.0e38f, tw = a.y;
+    const bool split = path_split(wm) && tw >= 0.f;
+    const float3 d = sp_dir(sp, x, y);
+    FaunaHit fh = fauna_trace(sp.fauna, p.o, d, 0.f, fminf(fminf(thit, split ? tw : 3.0e38f), FAUNA_FAR), sp.pix, 0.f, false);
+    float tf = fh.t;
+    if (fh.s >= 0) {
+        if ((wm == WM_REFR || wm == WM_STRAIGHT) && (tw < 0.f || tf < tw)) { wm = WM_NONE; a.y = -1.f; }   // in front of the water
+        else if (wm == WM_UNDER_OUT || wm == WM_UNDER_TIR) { wm = WM_UNDER; a.y = 0.f; }                     // in the water, before the surface
+    } else if (split && thit > tw && tw < FAUNA_FAR) {  // the path beyond the water plane
+        fh = fauna_trace(sp.fauna, p.o + d * tw, path_dir2(sp, d, tw, wm), 0.f, fminf(thit, FAUNA_FAR) - tw, sp.pix, tw, false);
+        tf = tw + fh.t;
+    }
+    if (fh.s < 0) return;
+    a.x = tf;
+    a.z = 0.f;
+    a.w = 0.f;
+    g.a[i] = a;
+    g.b[i] = make_uint2((uint32_t)HK_FAUNA | ((uint32_t)wm << 24), (uint32_t)fh.s);
+}
+
 // ---- surfaces ----------------------------------------------------------------------
 struct SurfInfo {
     float3 n, ng;               // shading and geometric normal
@@ -855,6 +1080,11 @@ struct SurfInfo {
     float  cover;               // M5: the cell's cover 0..1 (grass: mix(soil, leaf, 0.8 cover))
     float  tsun;                // M5 crowns: the own crown's transmittance toward the sun, e^-(sigma chord); else 1
 };
+// SurfInfo.pal beyond its 4 palette bits (no extra registers in the kernels): version 2: bits 4-7 the cell's
+// pigment level (0 = the version 1 look), bits 8-11 its Q band width bin; creatures: bit 12 hunter, bit 13 armoured
+__device__ __forceinline__ int pal_look(uint32_t cell, int32_t sw) {
+    return (int)BIOCELL_PAL(cell) | (GME_SHAPE_IS_V2(sw) ? (SPEC_PIG_LEVEL(GME_SHAPE_PIG(sw)) << 4) | ((int)GME_SHAPE_QWIDTH(sw) << 8) : 0);
+}
 
 // heightfield AO (spec 4.6): horizon angles above the tangent plane from tile T
 // samples at 2 m (and 8 m) in 4 directions
@@ -948,9 +1178,9 @@ __device__ void sm_terrain_mat(const SParams& sp, const GmeColTile* t, int rcx, 
     si.pal = 0;
     si.cover = 0.f;
     if (is_tissue(si.m0) || is_tissue(si.m1)) {        // M5: the pigment's hue bin and the cover of the dominant corner's cell
-        const uint32_t c = sm_slot_cell(sp.k, ax0 + (dk & 1), az0 + (dk >> 1));
-        si.pal = cell_pal(c);
-        si.cover = cell_cover(c);
+        const SlotLook c = sm_slot_look(sp.k, ax0 + (dk & 1), az0 + (dk >> 1));
+        si.pal = pal_look(c.cell, c.sw);               // version 2: with its pigment amount and Q band width
+        si.cover = cell_cover(c.cell);
     }
     si.dev = dsum;
 }
@@ -1057,7 +1287,7 @@ __device__ void far_material(const SParams& sp, int l, float w1, float x, float 
     si.wb = f.beach;
     si.m1 = f.grass >= f.mat ? MAT_GRASS : MAT_MAT;
     si.w1 = fmaxf(f.grass, f.mat);
-    si.pal = f.pal;
+    si.pal = f.pal;                                    // the far samples carry the hue bin only
     si.cover = si.w1;                                  // M5: a grass voxel's cover ~ the coverage (expected leafiness 0.8 w1^2)
     si.bright = 0.94f;                                 // the mean of the classic per-voxel brightness
     si.dev = 0.f;
@@ -1110,7 +1340,7 @@ __device__ void sm_lod(const SParams& sp, const THit& h, float3 pos, int px, int
         if (h.t > flora_t(px, py) && trad > 0) {
             si.m1 = MAT_LEAF;
             si.w1 = fminf(1.f, 0.0490874f * (float)(trad * trad + trad));   // pi (r^2 + r) / 64 m^2
-            si.pal = (int)BIOCELL_PAL(__ldg(&sl->cell));
+            si.pal = pal_look(__ldg(&sl->cell), __ldg(&sl->theight));
         }
     }
     if (!want_ao) { si.ao = 1.f; return; }
@@ -1168,7 +1398,7 @@ __device__ void sm_other(const SParams& sp, const THit& h, float3 d, float3 pos,
         const int32_t ax = g_tc.cx * 32 + h.vx, ay = g_tc.cy * 32 + h.vy, az = g_tc.cz * 32 + h.vz;
         si.m0 = si.m1 = h.mat;
         si.bright = vox_bright(ax, ay, az);
-        if (is_tissue(h.mat)) { const uint32_t c = sm_slot_cell(p, ax, az); si.pal = cell_pal(c); si.cover = cell_cover(c); }
+        if (is_tissue(h.mat)) { const SlotLook c = sm_slot_look(p, ax, az); si.pal = pal_look(c.cell, c.sw); si.cover = cell_cover(c.cell); }
         return;
     }
     if (h.kind == HK_ICE) {
@@ -1202,7 +1432,7 @@ __device__ void sm_other(const SParams& sp, const THit& h, float3 d, float3 pos,
         si.ng = si.n;
         si.m0 = si.m1 = MAT_KELP;
         si.bright = vox_bright(x, 0, z) * (0.94f + 0.06f * (float)(gme_hash3(x, 0, z, 0x5EEDu) >> 24) / 255.f);
-        si.pal = cell_pal(cell);
+        si.pal = pal_look(cell, __ldg(&t->slot[b].theight));
         si.cover = cell_cover(cell);
         return;
     }
@@ -1219,14 +1449,14 @@ __device__ void sm_other(const SParams& sp, const THit& h, float3 d, float3 pos,
         CrownG c;
         tr_crown_of(t, h.i, h.rcx, h.rcz, c);
         const float3 q = pos - c.ce;
-        float3 n = norm3(f3(q.x * c.ia * c.ia, q.y * c.ib * c.ib, q.z * c.ia * c.ia));
+        float3 n = tr_crown_normal(c, q);              // the ellipsoid's gradient; version 2: of the class's solid
         if (tclump >= 0.f) {
-            const float amp = gme_clump_amp(trad) * tr_clump_fade(tclump, gme_clump_cell(trad));
+            const float amp = gme_clump_amp(trad) * tr_crown_ampk(c) * tr_clump_fade(tclump, gme_clump_cell(trad));
             if (amp > 0.f) {
                 float3 g;
                 const float del = tr_clump_delta(c, q, amp, tclump * g_tc.pix, &g);
                 n = norm3(n + g);
-                si.ao = __expf(-2.f * c.sigma * del);
+                si.ao = __expf(-2.f * tr_crown_sigma_mean(c) * del);
             }
             // leaf clusters: bumps of 2.5 cm on a 12 cm lattice and 1 cm on a 5 cm one, where they span several pixels
             // (TAA resolves them; finer, they would shimmer); the clumps' brightness varies a little
@@ -1245,10 +1475,10 @@ __device__ void sm_other(const SParams& sp, const THit& h, float3 d, float3 pos,
             si.bright = 0.88f + 0.12f * gme_clump_noise(q.x * ic + 5.7f, q.y * ic, q.z * ic, c.cs ^ 0xB71Eu, NULL);
         }
         si.n = n;
-        si.tsun = __expf(-c.sigma * tr_crown_exit(c, pos, sp.sun));
+        si.tsun = __expf(-tr_crown_sigma(c, sp.sun) * tr_crown_exit(c, pos, sp.sun));
         si.m0 = si.m1 = MAT_LEAF;
         const uint32_t cell = __ldg(&s->cell);
-        si.pal = cell_pal(cell);
+        si.pal = pal_look(cell, __ldg(&s->theight));
         si.cover = cell_cover(cell);
         (void)tvr;
     } else {
@@ -1256,6 +1486,26 @@ __device__ void sm_other(const SParams& sp, const THit& h, float3 d, float3 pos,
         si.m0 = si.m1 = MAT_WOOD;
     }
     si.ng = si.n;
+}
+
+// A creature's sphere: its normal, the skin of its palette index (the pigment's hue bin), its flags.
+// Out of line and by value: k_surface's other paths keep their code.
+__device__ __noinline__ SurfInfo sm_fauna(const FaunaSphere* sph, const float4* cen, uint32_t idx, float3 pos) {
+    SurfInfo si;
+    const FaunaSphere s = sph[idx];
+    const float4 q = cen[idx];
+    si.n = norm3(pos - f3(q.x, q.y, q.z));
+    si.ng = si.n;
+    si.m0 = si.m1 = RMAT_SKIN;
+    si.w1 = 0.f;
+    si.pal = (int)FA_PAL(s.attr) | ((s.attr & FA_HUNTER) ? 0x1000 : 0) | ((s.attr & FA_ARMORED) ? 0x2000 : 0);
+    si.bright = 0.88f + 0.12f * (float)FA_BRIGHT(s.attr) * (1.f / 63.f);
+    si.ao = 0.55f + 0.45f * sat(0.5f + 0.5f * si.n.y);   // the ground under it (the sky ambient of Low; GI finds it itself)
+    si.dev = 0.f;
+    si.cover = 0.f;
+    si.tsun = 1.f;
+    si.wb = 0.f;
+    return si;
 }
 
 // M4 full-res guide word of a pixel: the straight-ray distance of its visible
@@ -1271,13 +1521,16 @@ __device__ __forceinline__ int kind_class(int kind) {
     case HK_VOXEL: return GC_VOXEL;
     case HK_ICE: return GC_ICE;
     case HK_DIST: return GC_DIST;
+    case HK_FAUNA: return GC_FAUNA;
     default: return GC_SKY;
     }
 }
 #define GI_BIG_T 3.0e38f
 
-// k_surface: hit record -> G-buffer (normals, material ids, AO), in place; M4: the full-res guide
-__global__ void __launch_bounds__(128, 4) k_surface(const __grid_constant__ SParams sp, GBuf g) {
+// k_surface: hit record -> G-buffer (normals, material ids, AO), in place; M4: the full-res guide.
+// Launch bounds 128 x 5: the kernel must keep its 96 registers (5 blocks per SM on sm_86; 98, which the
+// version 2 branches of the analytic voxel fallback would cost it, leave room for 4 only: 12 % slower).
+__global__ void __launch_bounds__(128, 5) k_surface(const __grid_constant__ SParams sp, GBuf g) {
     const KParams& p = sp.k;
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -1312,6 +1565,7 @@ __global__ void __launch_bounds__(128, 4) k_surface(const __grid_constant__ SPar
         si.n = si.ng = f3(0.f, 1.f, 0.f);
         si.m0 = si.m1 = MAT_REGOLITH; si.w1 = 0.f; si.pal = 0; si.bright = 1.f; si.ao = 1.f; si.dev = 0.f;
     }
+    else if (h.kind == HK_FAUNA) si = sm_fauna(sp.fauna.sph, sp.fauna.pos, b.y, pos);   // a creature (k_fauna_primary): b.y = its sphere
     else sm_other(sp, h, d2, pos, si, (path_split(wm) && a.y >= 0.f && h.t >= a.y) ? h.t - a.y : h.t);
     // M5 grass (spec 3.5): tufts are shading, not geometry: a fuzz of the shading normal from two octaves of
     // value noise (0.25 / 0.125 m, world-anchored), by the grass share and cover, gone where tufts are sub-pixel
@@ -1334,11 +1588,14 @@ __global__ void __launch_bounds__(128, 4) k_surface(const __grid_constant__ SPar
     const int32_t dq = max(-128, min(127, __float2int_rn(si.dev * (float)GME_DEV_UNIT)));
     const bool terr = h.kind == HK_TERRAIN || h.kind == HK_LOD || h.kind == HK_FAR;
     // bits 8-15: the terrain's dev (debug view), for LOD / far hits the beach share of the far material, for
-    // crowns (M5) the own crown's transmittance toward the sun; bits 27-31 (M5): the cell's cover
+    // crowns (M5) the own crown's transmittance toward the sun, for creatures their flags; bits 27-31 (M5): the
+    // cell's cover; version 2: bits 4-7 the cell's pigment level (0 = none), bits 20-23 its Q band width bin
     const uint32_t b8 = (h.kind == HK_LOD || h.kind == HK_FAR) ? (uint32_t)min(255, __float2int_rn(sat(si.wb) * 255.f))
-                      : (h.kind == HK_CROWN ? (uint32_t)min(255, __float2int_rn(sat(si.tsun) * 255.f)) : ((uint32_t)dq & 255u));
+                      : (h.kind == HK_CROWN ? (uint32_t)min(255, __float2int_rn(sat(si.tsun) * 255.f))
+                      : (h.kind == HK_FAUNA ? ((uint32_t)si.pal >> 12) & 3u : ((uint32_t)dq & 255u)));
     b.y = GF_HIT | (terr ? GF_TERRAIN : 0u) | (under ? GF_UNDER : 0u) | (b8 << 8) |
-          ((uint32_t)wm << 24) | ((uint32_t)h.kind << 16) | ((uint32_t)min(31, __float2int_rn(sat(si.cover) * 31.f)) << 27);
+          ((uint32_t)wm << 24) | ((uint32_t)h.kind << 16) | ((uint32_t)min(31, __float2int_rn(sat(si.cover) * 31.f)) << 27) |
+          ((uint32_t)si.pal & 0xF0u) | (((uint32_t)si.pal & 0xF00u) << 12);
     g.a[i] = a;
     g.b[i] = b;
     if (sp.fg) {
@@ -1441,6 +1698,41 @@ __global__ void __launch_bounds__(128, 6) k_sun(const __grid_constant__ SParams 
     if (sp.sdist) sp.sdist[i] = shadow ? fmaxf(occ, 1e-3f) : -1.f;
 }
 
+// k_fauna_sun: creatures in the sun's way (after k_sun; only while creatures are near the camera). The
+// shadow ray of every pixel k_sun left lit, against the sphere grid over FAUNA_SHADOW_FAR m of the
+// path k_sun's ray takes (under water: the refracted direction up to the plane, then the true one).
+__global__ void __launch_bounds__(128) k_fauna_sun(const __grid_constant__ SParams sp, GBuf g) {
+    const KParams& p = sp.k;
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= p.w || y >= p.h) return;
+    const size_t i = (size_t)y * p.w + x;
+    const float4 a = g.a[i];
+    const uint32_t fl = g.b[i].y;
+    if (!(fl & GF_HIT) || (fl & GF_SHADOW) || sp.sun.y <= -0.01f || a.x > 2.f * FAUNA_FAR) return;
+    const int kind = (int)((fl >> 16) & 15u);
+    if (kind == HK_DIST || kind == HK_FAR) return;
+    const int wm = (int)((fl >> 24) & 7u);
+    const bool under = (fl & GF_UNDER) != 0;
+    const float3 l = sun_jitter(sp, sp.sun, x, y);      // the disc point k_sun took
+    const float3 ld = under ? sp.sun_r : l;
+    if (kind != HK_CROWN && dot3(oct_unpack(__float_as_uint(a.z)), ld) <= 0.f) return;
+    float3 d2;
+    const float3 pos = path_pos(sp, sp_dir(sp, x, y), a.x, a.y, wm, &d2);
+    const float3 hp = kind == HK_CROWN ? pos + ld * 0.05f : pos + oct_unpack(__float_as_uint(a.w)) * 0.03f;
+    FaunaHit fh;
+    if (under && ld.y > 0.f) {
+        const float ts = fmaxf((g_tc.yw - hp.y) / ld.y, 0.f);
+        fh = fauna_trace(sp.fauna, hp, ld, 0.f, fminf(ts, FAUNA_SHADOW_FAR), 0.f, 0.f, true);
+        if (fh.s < 0 && ts < FAUNA_SHADOW_FAR) fh = fauna_trace(sp.fauna, hp + ld * ts, l, 0.f, FAUNA_SHADOW_FAR - ts, 0.f, 0.f, true);
+    } else {
+        fh = fauna_trace(sp.fauna, hp, ld, 0.f, FAUNA_SHADOW_FAR, 0.f, 0.f, true);
+    }
+    if (fh.s < 0) return;
+    g.b[i].y = fl | GF_SHADOW;
+    if (sp.vsmp) sp.vsmp[i] = 0;
+}
+
 // ---- M4 secondary rays: GI and reflections (spec 3.1, 4.6) --------------------------------
 // GI rays: fine 1 m patches to 8 m, the 4 m lattice to 256 m (the far field where
 // tiles are missing or past the ring), crowns to 64 m, then the sky. Reflection
@@ -1493,7 +1785,8 @@ __device__ __forceinline__ void sec_put(SecBuf sb, int slot, float3 o, float tma
 // GI rays (cosine, IGN + R2 frame offset; reference: hash RNG) and one
 // reflection ray (water: mirror at the Gerstner normal; ice / wet ground: mirror
 // or GGX), the half-res guide. Reference: the paths' throughput and radiance.
-__global__ void __launch_bounds__(128) k_sec_gen(const __grid_constant__ SParams sp, GBuf g, SecBuf sb, SecGrid G) {
+// (launch bounds 128 x 8: 64 registers, as before the version 2 crown calls)
+__global__ void __launch_bounds__(128, 8) k_sec_gen(const __grid_constant__ SParams sp, GBuf g, SecBuf sb, SecGrid G) {
     const KParams& p = sp.k;
     const int gi = blockIdx.x * blockDim.x + threadIdx.x, gj = blockIdx.y * blockDim.y + threadIdx.y;
     if (gi >= G.gw || gj >= G.gh) return;
@@ -1778,12 +2071,23 @@ __device__ __forceinline__ int hue_bin(int pal) { return (pal & 15) ? (pal & 15)
 // spectral albedo of material m in band b. M5 pigmented tissue (spec 5.1) by its hue bin: leaves and kelp
 // rho_L, mats 0.03 + rho_sand (1 - A)^2, the grass ground voxel mix(soil, rho_L, 0.8 cover); grass and
 // mats on steep ground show the soil as before
+// version 2 (pal bits 4-7: the cell's pigment level 1..15, 0 = no morphology; bits 8-11: its Q band width bin): the
+// same tissue laws from the absorptance of that pigment amount and band width (ShadeTab.pig_A2)
 __device__ __forceinline__ float mat_rho(const SParams& sp, int m, int pal, float cover, float steep, int b) {
     const ShadeTab* T = sp.tab;
     float r;
     if (is_tissue(m)) {
         const int hb = hue_bin(pal);
-        if (m == MAT_MAT) r = __ldg(&T->mat_tis[hb][b]);
+        if (pal & 0xF0) {
+            const float t1 = 1.f - __ldg(&T->pig_A2[hb][((pal >> 4) & 15) - 1][(pal >> 8) & 15][b]);   // 1 - A
+            const float rl = 0.04f + 0.44f * t1;
+            if (m == MAT_MAT) r = 0.03f + __ldg(&T->rho[MAT_SAND][b]) * t1 * t1;
+            else if (m == MAT_GRASS) {
+                const float soil = __ldg(&T->rho[g_tc.planet.surface_mat & 15][b]);
+                r = soil + (rl - soil) * 0.8f * cover;
+            } else r = rl;
+        }
+        else if (m == MAT_MAT) r = __ldg(&T->mat_tis[hb][b]);
         else if (m == MAT_GRASS) {
             const float soil = __ldg(&T->rho[g_tc.planet.surface_mat & 15][b]);
             r = soil + (__ldg(&T->leaf_rho[hb][b]) - soil) * 0.8f * cover;
@@ -1793,6 +2097,10 @@ __device__ __forceinline__ float mat_rho(const SParams& sp, int m, int pal, floa
         r = __ldg(&T->rho[m & 15][b]);
     }
     return r;
+}
+// a creature's albedo in band b: the skin of its hue bin (pal), its brightness; one that hunts is darker
+__device__ __forceinline__ float skin_rho(const SParams& sp, int pal, float bright, bool hunter, int b) {
+    return __ldg(&sp.tab->skin[hue_bin(pal)][b]) * bright * (hunter ? 0.55f : 1.f);
 }
 // the classic colours and tint of the --debug palette view (linear RGB; a copy of the classic albedo(),
 // which stays untouched)
@@ -1838,7 +2146,8 @@ struct Lit {
     float  sheen;                // grass: the Charlie sheen lobe (D V) x weight
 };
 // GGX + energy-compensated diffuse terms of a lit point (spec 4.4)
-__device__ void lit_setup(const SParams& sp, Lit& L, float3 v, float3 l) {
+// (L.pal: bits 4-11 as SurfInfo.pal; alpha_k: roughness factor, 1 but for a creature's armour)
+__device__ void lit_setup(const SParams& sp, Lit& L, float3 v, float3 l, float alpha_k = 1.f) {
     L.sheen = 0.f;
     if (sp.furnace) {                                   // D4: Lambertian, no specular lobe
         L.nl = fmaxf(dot3(L.n, l), 0.f); L.vh = 1.f; L.dvis = 0.f; L.cond = 0; L.spec = 0.f; L.specw = 0.f;
@@ -1848,7 +2157,7 @@ __device__ void lit_setup(const SParams& sp, Lit& L, float3 v, float3 l) {
     const ShadeTab* T = sp.tab;
     const int mm = L.w1 > 0.5f ? L.m1 : L.m0;
     float alpha = __ldg(&T->alpha[L.m0 & 15]) * (1.f - L.w1) + __ldg(&T->alpha[L.m1 & 15]) * L.w1;
-    alpha = fmaxf(alpha, 0.02f);
+    alpha = fmaxf(alpha * alpha_k, 0.02f);
     const int ior = __ldg(&T->ior[mm & 15]);
     const float iorn = ior == SPEC_IOR_ROCK ? 1.55f : (ior == SPEC_IOR_LEAF ? 1.45f : (ior == SPEC_IOR_ICE ? 1.31f : WATER_N));
     const float nv = fmaxf(dot3(L.n, v), 1e-3f), nl = fmaxf(dot3(L.n, l), 0.f);
@@ -1943,7 +2252,7 @@ __device__ void sec_radiance(const SParams& sp, float4 o4, uint4 r, float4 h4, b
     M.steep = sat((0.9f - n.y) * 5.f);
     M.wet = 0.f;
     M.wb = (float)((r.y >> 16) & 255u) * (1.f / 255.f);
-    M.cover = (float)((r.y >> 24) & 31u) * (1.f / 31.f);
+    M.cover = (float)((r.y >> 24) & 31u) * (1.f / 31.f);   // (secondary hits: the hue bin's default pigment)
 #pragma unroll
     for (int b = 0; b < SPEC_NB; ++b) rho[b] = lit_rho(sp, M, b);
     float es[SPEC_NB];
@@ -2330,9 +2639,10 @@ __global__ void __launch_bounds__(128) k_compose(const __grid_constant__ SParams
                 L.bright = 0.88f + 0.12f * ((mp >> 18) & 63u) / 63.f; L.steep = sat((0.9f - n.y) * 5.f); L.wet = 0.f;
                 L.wb = (kind == HK_LOD || kind == HK_FAR) ? (float)((b.y >> 8) & 255u) * (1.f / 255.f) : 0.f;
                 L.cover = (float)((b.y >> 27) & 31u) * (1.f / 31.f);
+                L.pal |= (int)(b.y & 0xF0u) | (int)((b.y >> 12) & 0xF00u);   // version 2: pigment level, Q band width bin
                 float X = 0.f, Y = 0.f, Z = 0.f, W = 0.f;
                 for (int k = 0; k < SPEC_NB; ++k) {
-                    const float r = lit_rho(sp, L, k);
+                    const float r = kind == HK_FAUNA ? skin_rho(sp, L.pal, L.bright, (b.y & 0x100u) != 0, k) : lit_rho(sp, L, k);
                     X += r * __ldg(&T->cmf_band[k][0]); Y += r * __ldg(&T->cmf_band[k][1]); Z += r * __ldg(&T->cmf_band[k][2]);
                     W += __ldg(&T->cmf_band[k][1]);
                 }
@@ -2402,6 +2712,7 @@ __global__ void __launch_bounds__(128) k_compose(const __grid_constant__ SParams
             L.under = (b.y & GF_UNDER) != 0;
             L.wb = (kind == HK_LOD || kind == HK_FAR) ? (float)((b.y >> 8) & 255u) * (1.f / 255.f) : 0.f;
             L.cover = (float)((b.y >> 27) & 31u) * (1.f / 31.f);
+            L.pal |= (int)(b.y & 0xF0u) | (int)((b.y >> 12) & 0xF00u);   // version 2: the cell's pigment level, Q band width bin
             // M3: beyond the loaded radius the ground drops with the curvature and its vertical tilts by r / R_p
             float ya = pos.y, mus = sp.sun.y;
             if (g_tc.far_on) {
@@ -2443,7 +2754,8 @@ __global__ void __launch_bounds__(128) k_compose(const __grid_constant__ SParams
             }
             if (sp.caustics && L.under && sp.sun.y > 0.f && L.vis > 0.f)
                 L.caus = caustic(sp, pos, L.depth, a.x * sp.pix / fmaxf(fabsf(dot3(vdir, L.n)), 0.1f));
-            lit_setup(sp, L, f3(-vdir.x, -vdir.y, -vdir.z), L.under ? sp.sun_r : sp.sun);
+            // (a creature's armour, bit 9 of b.y: glossier)
+            lit_setup(sp, L, f3(-vdir.x, -vdir.y, -vdir.z), L.under ? sp.sun_r : sp.sun, (kind == HK_FAUNA && (b.y & 0x200u)) ? 0.4f : 1.f);
             const float3 v = f3(-vdir.x, -vdir.y, -vdir.z);
             float3 rx;
             const bool traced = (L.wet > 0.f || kind == HK_ICE) && refl_xyz(sp, x, y, kind_class(kind), rx);
@@ -2473,8 +2785,10 @@ __global__ void __launch_bounds__(128) k_compose(const __grid_constant__ SParams
         for (int bd = 0; bd < SPEC_NB; ++bd) {
             float rho = 0.f, tau = 0.f, twd = 1.f, twa = 1.f;
             if (hit) {
-                rho = lit_rho(sp, L, bd);
-                if (leaf_h >= 0) tau = __ldg(&T->leaf_tau[leaf_h][bd]) * L.bright;
+                rho = kind == HK_FAUNA ? skin_rho(sp, L.pal, L.bright, (b.y & 0x100u) != 0, bd) : lit_rho(sp, L, bd);
+                if (leaf_h >= 0)
+                    tau = ((L.pal & 0xF0) ? 0.42f * (1.f - __ldg(&T->pig_A2[leaf_h][((L.pal >> 4) & 15) - 1][(L.pal >> 8) & 15][bd]))
+                                          : __ldg(&T->leaf_tau[leaf_h][bd])) * L.bright;
                 if (L.under) {
                     const float bs = __ldg(&T->water_b[bd]), mur = fmaxf(sp.sun_r.y, 0.05f);
                     twd = water_T(T, bd, L.depth / mur) * __expf(-0.2f * bs * L.depth / mur);
@@ -2687,6 +3001,8 @@ __global__ void k_probe(const __grid_constant__ SParams sp, GBuf gb) {
     o->w1 = (float)((b.x >> 8) & 63u) / 63.f;
     o->pal = (int)((b.x >> 14) & 15u);
     o->cover = (float)((b.y >> 27) & 31u) / 31.f;
+    o->pig = (int)((b.y >> 4) & 15u);
+    o->qw = (int)((b.y >> 20) & 15u);
     o->tsun = o->kind == HK_CROWN ? (float)((b.y >> 8) & 255u) / 255.f : 1.f;   // M5: the sun through the own crown
     o->pos[0] = pos.x + 32.f * g_tc.cx; o->pos[1] = pos.y + 32.f * g_tc.cy; o->pos[2] = pos.z + 32.f * g_tc.cz;
     o->n[0] = n.x; o->n[1] = n.y; o->n[2] = n.z;
@@ -3023,6 +3339,7 @@ struct Renderer {
     float         last[RENDER_PERF_STAGES];
     // the last frame, for --metrics and the probe
     SParams       lastp;
+    TCtx          lastt;   // ... and its tracer context (g_tc)
     int           have_last;
     unsigned long long* d_acc;
     // spectral light (renderer_set_atmo)
@@ -3034,6 +3351,15 @@ struct Renderer {
     FrameState    h_fs;    // read back with every frame (exposure, NaN count)
     Waves         waves;   // directions, wave numbers, amplitudes; per-frame phases from w_omega / w_phi
     double        w_omega[WAVES], w_phi[WAVES];
+    // creatures (renderer_set_fauna): device copies of the spheres, cell lists and hash grid
+    FaunaSphere*  d_fsph;
+    float4*       d_fpos;                   // per frame: moving centres + radii (k_fauna_anim)
+    FaunaCell*    d_fcells;
+    uint32_t      fauna_n, fauna_mask;
+    float         fauna_ylo, fauna_yhi;
+    int32_t*      fauna_macro;              // host: the occupied 2 km macro cells (x, z pairs): the frame's early out
+    uint32_t      fauna_nmacro;
+    FaunaPal      fauna_pal;                // classic tint
 };
 
 static int rck(cudaError_t e, const char* what) {
@@ -3256,6 +3582,10 @@ extern "C" void renderer_destroy(Renderer* r) {
     cudaFree(r->d_fs);
     cudaFree(r->d_hist);
     cudaFree(r->d_probe);
+    cudaFree(r->d_fsph);
+    cudaFree(r->d_fpos);
+    cudaFree(r->d_fcells);
+    free(r->fauna_macro);
     atmo_destroy(r->atmo);
     if (r->stream) cudaStreamDestroy(r->stream);
     free(r->perf);
@@ -3316,6 +3646,16 @@ extern "C" int renderer_set_atmo(Renderer* r, const SpectralAtmo* a) {
     memcpy(t->leaf_rho, a->leaf_rho, sizeof t->leaf_rho);   // M5: pigmented tissue per hue bin
     memcpy(t->leaf_tau, a->leaf_tau, sizeof t->leaf_tau);
     memcpy(t->mat_tis, a->mat_tis, sizeof t->mat_tis);
+    memcpy(t->pig_A2, a->pig_A2, sizeof t->pig_A2);         // version 2: by pigment amount and Q band width
+    for (int h = 0; h < SPEC_NHUE; ++h) {                   // creatures: a skin is the hue bin's leaf, darker and less saturated
+        float m = 0.f;
+        for (int b = 0; b < SPEC_NB; ++b) m += a->leaf_rho[h][b];
+        m /= (float)SPEC_NB;
+        for (int b = 0; b < SPEC_NB; ++b) t->skin[h][b] = 0.8f * (0.6f * a->leaf_rho[h][b] + 0.4f * m);
+    }
+    for (int b = 0; b < SPEC_NB; ++b) t->rho[RMAT_SKIN][b] = t->skin[SPEC_HUE_DEFAULT][b];
+    t->alpha[RMAT_SKIN] = 0.6f;
+    t->ior[RMAT_SKIN] = SPEC_IOR_LEAF;
     {                                                   // M4: band luminance weights (GI variance and edge stopping)
         double s = 0;
         for (int b = 0; b < SPEC_NB; ++b) s += a->cmf[b][1];
@@ -3354,6 +3694,70 @@ extern "C" int renderer_set_atmo(Renderer* r, const SpectralAtmo* a) {
     r->waves.alpha0 = 0.1f;
     memset(&r->h_fs, 0, sizeof r->h_fs);
     return 0;
+}
+
+extern "C" int renderer_set_fauna(Renderer* r, const FaunaSphere* sph, uint32_t nsph, const FaunaCell* cells, uint32_t ncells,
+                                  const uint8_t palette[16][3]) {
+    if (r->stream) cudaStreamSynchronize(r->stream);
+    cudaFree(r->d_fsph); cudaFree(r->d_fpos); cudaFree(r->d_fcells);
+    free(r->fauna_macro);
+    r->d_fsph = NULL; r->d_fpos = NULL; r->d_fcells = NULL; r->fauna_macro = NULL;
+    r->fauna_n = 0; r->fauna_nmacro = 0;
+    for (int i = 0; i < BIOMAP_PALETTE; ++i) {              // sRGB -> linear, gamma 2 like the classic encoding
+        const float c[3] = { palette ? palette[i][0] / 255.f : 0.f, palette ? palette[i][1] / 255.f : 0.f, palette ? palette[i][2] / 255.f : 0.f };
+        r->fauna_pal.c[i] = make_float3(c[0] * c[0], c[1] * c[1], c[2] * c[2]);
+    }
+    if (!sph || !nsph || !cells || !ncells || (ncells & (ncells - 1u))) return 0;
+    // the occupied macro cells (2 km) for the frame's early out, the height range of all spheres
+    int32_t* macro = (int32_t*)malloc(sizeof(int32_t) * 2 * (size_t)ncells);
+    if (!macro) return -1;
+    uint32_t nm = 0;
+    float ylo = 3.0e38f, yhi = -3.0e38f;
+    for (uint32_t i = 0; i < ncells; ++i) {
+        if (!cells[i].count) continue;
+        ylo = fminf(ylo, cells[i].ylo);
+        yhi = fmaxf(yhi, cells[i].yhi);
+        const int32_t mx = cells[i].cx >> FAUNA_MACRO_SHIFT, mz = cells[i].cz >> FAUNA_MACRO_SHIFT;
+        uint32_t k = nm;
+        while (k > 0 && (macro[2 * (k - 1)] != mx || macro[2 * (k - 1) + 1] != mz)) --k;   // newest first: cells of a place lie together
+        if (!k) { macro[2 * nm] = mx; macro[2 * nm + 1] = mz; ++nm; }
+    }
+    if (rck(cudaMalloc(&r->d_fsph, sizeof(FaunaSphere) * (size_t)nsph), "alloc creatures") ||
+        rck(cudaMalloc(&r->d_fpos, sizeof(float4) * (size_t)nsph), "alloc creatures") ||
+        rck(cudaMalloc(&r->d_fcells, sizeof(FaunaCell) * (size_t)ncells), "alloc creatures") ||
+        rck(cudaMemcpy(r->d_fsph, sph, sizeof(FaunaSphere) * (size_t)nsph, cudaMemcpyHostToDevice), "upload creatures") ||
+        rck(cudaMemcpy(r->d_fcells, cells, sizeof(FaunaCell) * (size_t)ncells, cudaMemcpyHostToDevice), "upload creatures")) {
+        cudaFree(r->d_fsph); cudaFree(r->d_fpos); cudaFree(r->d_fcells);
+        r->d_fsph = NULL; r->d_fpos = NULL; r->d_fcells = NULL;
+        free(macro);
+        return -1;
+    }
+    r->fauna_macro = macro;
+    r->fauna_nmacro = nm;
+    r->fauna_n = nsph;
+    r->fauna_mask = ncells - 1u;
+    r->fauna_ylo = ylo;
+    r->fauna_yhi = yhi;
+    return 0;
+}
+// creatures of this frame: the device arrays if any creature's 2 km macro cell touches the camera's
+// neighbourhood (FAUNA_FAR < 2 km), else n = 0 (no creature kernel is launched)
+static FaunaDev fauna_frame(const Renderer* r, const RenderCamera* c, int classic) {
+    FaunaDev F;
+    memset(&F, 0, sizeof F);
+    if (!r->fauna_n) return F;
+    const int32_t mx = c->cx >> FAUNA_MACRO_SHIFT, mz = c->cz >> FAUNA_MACRO_SHIFT;
+    bool hit = false;
+    for (uint32_t k = 0; k < r->fauna_nmacro && !hit; ++k)
+        hit = abs(r->fauna_macro[2 * k] - mx) <= 1 && abs(r->fauna_macro[2 * k + 1] - mz) <= 1;
+    if (!hit) return F;
+    F.sph = r->d_fsph; F.pos = r->d_fpos; F.cells = r->d_fcells;
+    F.mask = r->fauna_mask; F.n = r->fauna_n;
+    F.ylo = r->fauna_ylo; F.yhi = r->fauna_yhi;
+    F.cx = c->cx; F.cy = c->cy; F.cz = c->cz;
+    F.time = c->anim;
+    F.classic = classic;
+    return F;
 }
 
 extern "C" float renderer_gpu_ms(const Renderer* r) { return r->ms; }
@@ -3622,7 +4026,7 @@ extern "C" int renderer_draw(Renderer* r, const RenderScene* s, const RenderCame
     if (!classic) {   // the column tracer's and the light's view of the same frame (also kept for --metrics / the probe)
         SParams& q = r->lastp;
         q.k = p;
-        TCtx& t = q.t;
+        TCtx& t = r->lastt;
         t.page = r->d_page; t.pool = s->pool; t.tiles = s->tiles; t.tile_tag = r->d_tile_tag;
         t.n = s->page_n; t.layers = s->layers; t.min_cy = s->min_cy;
         t.cx = c->cx; t.cy = c->cy; t.cz = c->cz;
@@ -3726,6 +4130,7 @@ extern "C" int renderer_draw(Renderer* r, const RenderScene* s, const RenderCame
         // M5: High's shadow rays see crowns as a leaf-area medium (spec 4.6); clumped crowns fade by the pixel size
         q.lad = c->quality >= RQ_HIGH && !c->furnace;
         t.pix = q.pix;
+        q.fauna = fauna_frame(r, c, 0);                // creatures near the camera (n = 0: none)
         r->have_last = 1;
     }
 
@@ -3741,12 +4146,20 @@ extern "C" int renderer_draw(Renderer* r, const RenderScene* s, const RenderCame
         r->far_rebuilt = 0;
         for (int k = RS_ATMO; k <= RS_SUN; ++k) cudaEventRecord(S.ev[k], r->stream);
         k_render<<<grid, block, 0, r->stream>>>(p);
+        {                                              // creatures over the classic frame (only while some are near)
+            const FaunaDev F = fauna_frame(r, c, 1);
+            if (F.n) {
+                k_fauna_anim<<<(F.n + 255) / 256, 256, 0, r->stream>>>(F, r->d_fpos);
+                k_fauna_classic<<<grid, block, 0, r->stream>>>(p, F, r->fauna_pal);
+            }
+        }
         for (int k = RS_GI; k <= RS_TAA; ++k) cudaEventRecord(S.ev[k], r->stream);
         r->hist_valid = 0;
     } else {
         SParams& q = r->lastp;
-        if (q.t.far_on && far_frame(r, s, c, q.t)) return -1;
-        if (!q.t.far_on) r->far_rebuilt = 0;
+        TCtx& qt = r->lastt;
+        if (qt.far_on && far_frame(r, s, c, qt)) return -1;
+        if (!qt.far_on) r->far_rebuilt = 0;
         if (c->reset || !r->cache_seed_ok || r->cache_seed != s->seed) {   // a new world or a reset: an empty radiance cache
             gi_cache_clear(r->gi, r->stream);
             r->cache_seed_ok = 1;
@@ -3756,7 +4169,7 @@ extern "C" int renderer_draw(Renderer* r, const RenderScene* s, const RenderCame
         const float sun3[3] = { q.sun.x, q.sun.y, q.sun.z };
         const float fw[3] = { p.fw.x, p.fw.y, p.fw.z }, rt[3] = { p.rt.x, p.rt.y, p.rt.z }, up[3] = { p.up.x, p.up.y, p.up.z };
         // aerial perspective out to the far field's edge (M3), else the loaded radius
-        const float ap_dist = q.t.far_on ? q.t.r2 + 1000.f : p.max_dist;
+        const float ap_dist = qt.far_on ? qt.r2 + 1000.f : p.max_dist;
         if (atmo_frame(r->atmo, sun3, q.cam_h, ap_dist, fw, rt, up, p.th, p.aspect, r->stream, 0) < 0) return -1;
         q.a = *atmo_params(r->atmo);
         if (c->furnace && r->d_fL) {                     // D4: a uniform sky
@@ -3766,16 +4179,21 @@ extern "C" int renderer_draw(Renderer* r, const RenderScene* s, const RenderCame
             q.a.sv_spec = r->d_fsky;
             q.a.sh = r->d_fsh;
         }
-        if (rck(cudaMemcpyToSymbolAsync(g_tc, &q.t, sizeof(TCtx), 0, cudaMemcpyHostToDevice, r->stream), "tracer context"))
+        if (rck(cudaMemcpyToSymbolAsync(g_tc, &qt, sizeof(TCtx), 0, cudaMemcpyHostToDevice, r->stream), "tracer context"))
             return -1;
         cudaEventRecord(S.ev[RS_PRIMARY], r->stream);
         k_primary<<<grid, block, 0, r->stream>>>(q, r->g);
+        if (q.fauna.n) {                                // creatures on the primary paths
+            k_fauna_anim<<<(q.fauna.n + 255) / 256, 256, 0, r->stream>>>(q.fauna, r->d_fpos);
+            k_fauna_primary<<<grid, block, 0, r->stream>>>(q, r->g);
+        }
         cudaEventRecord(S.ev[RS_SURFACE], r->stream);
         k_surface<<<grid, block, 0, r->stream>>>(q, r->g);
         cudaEventRecord(S.ev[RS_SUN], r->stream);
         if (p.shadows) {
             if (q.lad) k_sun<1><<<grid, block, 0, r->stream>>>(q, r->g);
             else k_sun<0><<<grid, block, 0, r->stream>>>(q, r->g);
+            if (q.fauna.n) k_fauna_sun<<<grid, block, 0, r->stream>>>(q, r->g);   // ... and in the sun's way
         }
         // ---- secondary rays: GI and reflections (spec 4.6) ----
         cudaEventRecord(S.ev[RS_GI], r->stream);
@@ -3950,7 +4368,7 @@ extern "C" int renderer_metrics(Renderer* r, RenderMetrics* out) {
     unsigned long long acc[MT_COUNT];
     const size_t px = (size_t)q.k.w * q.k.h;
     if (rck(cudaMemsetAsync(r->d_acc, 0, sizeof acc, r->stream), "metrics") ||
-        rck(cudaMemcpyToSymbolAsync(g_tc, &r->lastp.t, sizeof(TCtx), 0, cudaMemcpyHostToDevice, r->stream), "tracer context"))
+        rck(cudaMemcpyToSymbolAsync(g_tc, &r->lastt, sizeof(TCtx), 0, cudaMemcpyHostToDevice, r->stream), "tracer context"))
         return -1;
     if (!r->h_metrics && !(r->h_metrics = (uint32_t*)malloc(r->cap * sizeof(uint32_t)))) return -1;
     k_metrics<<<grid, block, 0, r->stream>>>(q, r->d_acc);
@@ -3963,8 +4381,12 @@ extern "C" int renderer_metrics(Renderer* r, RenderMetrics* out) {
     q.sdist = r->d_sdist;
     q.debug = RD_NONE;
     k_primary<<<grid, block, 0, r->stream>>>(q, r->g);
+    if (q.fauna.n) k_fauna_primary<<<grid, block, 0, r->stream>>>(q, r->g);
     k_surface<<<grid, block, 0, r->stream>>>(q, r->g);
-    if (q.k.shadows) { if (q.lad) k_sun<1><<<grid, block, 0, r->stream>>>(q, r->g); else k_sun<0><<<grid, block, 0, r->stream>>>(q, r->g); }
+    if (q.k.shadows) {
+        if (q.lad) k_sun<1><<<grid, block, 0, r->stream>>>(q, r->g); else k_sun<0><<<grid, block, 0, r->stream>>>(q, r->g);
+        if (q.fauna.n) k_fauna_sun<<<grid, block, 0, r->stream>>>(q, r->g);
+    }
     k_white<<<1, SPEC_NG, 0, r->stream>>>(q);
     k_compose<<<grid, block, 0, r->stream>>>(q, r->g);
     k_shadow_img<<<grid, block, 0, r->stream>>>(q, r->d_sdist, r->d_px);
@@ -4045,12 +4467,14 @@ extern "C" int renderer_far_selftest(Renderer* r, uint32_t seed, const GmePlanet
     for (int k = 0; k < 4; ++k) step_ms[k] = 0.f;
     if (!r->far_ok) return -1;
     uint32_t* d_cells = NULL;
+    uint32_t* d_morph = NULL;
     RenderScene s;
     memset(&s, 0, sizeof s);
     s.seed = seed;
     s.planet = *planet;
     s.bio = *hbio;
     s.bio.cells = NULL;
+    s.bio.morph = NULL;
     if (hbio->cells && ncells) {
         if (rck(cudaMalloc(&d_cells, ncells * sizeof(uint32_t)), "D6 cells") ||
             rck(cudaMemcpy(d_cells, hbio->cells, ncells * sizeof(uint32_t), cudaMemcpyHostToDevice), "D6 cells")) {
@@ -4058,6 +4482,15 @@ extern "C" int renderer_far_selftest(Renderer* r, uint32_t seed, const GmePlanet
             return -1;
         }
         s.bio.cells = d_cells;
+        if (hbio->morph) {                                // version 2: the morphology words (crown radii differ)
+            if (rck(cudaMalloc(&d_morph, ncells * sizeof(uint32_t)), "D6 morphology") ||
+                rck(cudaMemcpy(d_morph, hbio->morph, ncells * sizeof(uint32_t), cudaMemcpyHostToDevice), "D6 morphology")) {
+                cudaFree(d_cells);
+                cudaFree(d_morph);
+                return -1;
+            }
+            s.bio.morph = d_morph;
+        }
     }
     TCtx t;
     memset(&t, 0, sizeof t);
@@ -4142,6 +4575,7 @@ extern "C" int renderer_far_selftest(Renderer* r, uint32_t seed, const GmePlanet
     free(hs);
     free(ha);
     cudaFree(d_cells);
+    cudaFree(d_morph);
     for (int l = 0; l < GME_FAR_LEVELS; ++l) r->far_built[l] = 0;   // the next frame builds its own scene's far field
     return rc;
 }
@@ -4265,7 +4699,7 @@ extern "C" int renderer_disocc(Renderer* r, RenderDisocc* out) {
 extern "C" int renderer_probe(Renderer* r, RenderProbe* out) {
     memset(out, 0, sizeof *out);
     if (!r->have_last || !r->d_probe) return -1;
-    if (rck(cudaMemcpyToSymbolAsync(g_tc, &r->lastp.t, sizeof(TCtx), 0, cudaMemcpyHostToDevice, r->stream), "tracer context"))
+    if (rck(cudaMemcpyToSymbolAsync(g_tc, &r->lastt, sizeof(TCtx), 0, cudaMemcpyHostToDevice, r->stream), "tracer context"))
         return -1;
     k_probe<<<1, 32, 0, r->stream>>>(r->lastp, r->g);
     ProbeOut po;
@@ -4282,6 +4716,8 @@ extern "C" int renderer_probe(Renderer* r, RenderProbe* out) {
     out->pal = po.pal;
     out->cover = po.cover;
     out->tsun = po.tsun;
+    out->pig_level = po.pig;
+    out->qw_bin = po.qw;
     memcpy(out->pos, po.pos, sizeof out->pos);
     memcpy(out->normal, po.n, sizeof out->normal);
     out->depth = po.depth;
