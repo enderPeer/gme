@@ -10,8 +10,21 @@
 //                 plane at sea_level + 1 is one query per primary ray, in
 //                 render.cu's sm_trace; M1 keeps the classic see-through look.)
 //   trace_voxels  a copy of the classic DDA (render.cu `trace`, which stays
-//                 untouched) for caves, a camera below the surface and tiles
-//                 that have not streamed in yet.
+//                 untouched) for caves and a camera below the surface (and,
+//                 without the far field, tiles that have not streamed in).
+//   M3 distance   past a distance tl the walk uses each tile's 4 m lattice
+//                 (lod4, bilinear 4 m cells; flora to tf); near the loaded
+//                 radius ("ring") the lattice morphs into the far field. From
+//                 the ring on, and over tiles that have not streamed in, tr_far
+//                 marches the renderer's far-field clipmap (L1 16 m to 8 km,
+//                 L2 64 m to 32 km; min / max mips; exact patch hits including
+//                 the curvature drop c2 (r^2 - max_dist^2)).
+//   M5 life       flora modes of the walk (FM_*): primary rays see clumped
+//                 crowns (the ellipsoid displaced inward by billowed value
+//                 noise, sphere-traced in the shell; tr_clump), High's shadow
+//                 rays a leaf-area medium (e^-(sigma chord) per crown, FM_LAD),
+//                 the rest the plain ellipsoid. Kelp strands are a thin stipe
+//                 carrying flat blades (tr_kelp_strand), all inside the column.
 //
 // Coordinates are relative to the camera chunk, as in the classic renderer.
 // Included by render.cu after its float3 helpers; it does not touch the
@@ -22,9 +35,29 @@
 #include "density.h"
 
 #define TR_VOXEL_STEPS 1536   // voxel-mode steps per call (classic MAX_STEPS)
+#define TR_FAR_STEPS   2048   // far-field march steps per call
 
-enum { HK_NONE = 0, HK_TERRAIN, HK_CROWN, HK_TRUNK, HK_KELP, HK_VOXEL, HK_ICE };
+// hit kinds (4 bits in the hit record and the G-buffer). LOD: the 4 m lattice
+// of a published tile; FAR: the far-field clipmap; DIST: below the geometric
+// horizon beyond the far field (shaded with the sky-view LUT's ground).
+enum { HK_NONE = 0, HK_TERRAIN, HK_CROWN, HK_TRUNK, HK_KELP, HK_VOXEL, HK_ICE, HK_LOD, HK_FAR, HK_DIST };
 enum { VX_END = 0, VX_HIT = 1, VX_EXIT = 2 };
+
+// One far-field clipmap level (spec 3.8): GME_FAR_N^2 packed samples
+// (density.h gme_far_sample) in toroidal storage (absolute sample index & 1023),
+// min / max mips over 8 x 8 (A) and 64 x 64 (B) storage samples, each including
+// the next row and column, so a mip cell bounds every bilinear patch of its
+// samples. The tracer works in "frame" sample indices: frame (0, 0) is the
+// absolute sample F (a multiple of 64, so mip cells are frame-aligned), at
+// (ox, oz) metres relative to the camera chunk.
+struct FarLevel {
+    const uint32_t* s;          // samples, [z & 1023][x & 1023]
+    const short2*   mA;         // 128 x 128 cells: x = max, y = min (q4, absolute)
+    const short2*   mB;         // 16 x 16 cells
+    float   ox, oz;             // metres of frame sample (0, 0), relative to the camera chunk
+    int32_t bx, bz;             // storage index of frame sample (0, 0)
+    float   S, iS;              // spacing and its inverse
+};
 
 struct TCtx {
     const GmePageEntry* page;
@@ -42,6 +75,22 @@ struct TCtx {
     uint32_t seed;
     GmePlanet  planet;
     GmeBioView bio;                 // cells = device pointer or NULL
+    // M3: LOD and far field (spec 3.8). Distances are horizontal, from the camera.
+    int      far_on;                // the far field exists (else: M2 behaviour, missing tiles in voxel mode)
+    FarLevel far[GME_FAR_LEVELS];
+    const int* far_max;             // device: [0], [1] level max (q4, absolute); [2] near-walk ceiling (metres, absolute)
+    float    ybase_m;               // -32 cy: absolute metres -> relative
+    float    camx, camz;            // the camera, relative to its chunk
+    float    ring;                  // near (tiles) / far handover radius (max_dist; --far-ring overrides)
+    float    ring_m0, ring_iw;      // LOD -> L1 morph: weight (r - ring_m0) * ring_iw, 1 from ring - 6 m on
+    float    r1, r1_m0, r1_iw;      // L1 / L2 boundary and the L1 -> L2 morph, 1 from r1 - 23 m on
+    float    r2;                    // far field edge
+    float    c2;                    // curvature: drop c2 (r^2 - drop_r2), with c2 = 1 / (2 R_p)
+    float    drop_r2;               // max_dist^2: the drop is 0 inside the loaded radius
+    float    lod_fine;              // primary rays: fine surface up to this distance (dithered +-5 % per pixel)
+    float    flora_far;             // primary rays: analytic flora on LOD tiles up to this distance
+    float    dith;                  // M4: temporal offset of the per-pixel dithers (frac(0.618 frame); 0 = static)
+    float    pix;                   // M5: radians per pixel (clumped crowns fade out where clumps are sub-pixel)
 };
 
 // The tracer's context of the current frame, in constant memory (set per frame
@@ -58,7 +107,15 @@ struct THit {
     int   vx, vy, vz, axis, mat;    // voxel hits (relative voxel, face axis), material
     float water_t;                  // first entry into water, -1 = none
     float tice;                     // primary rays: the ice sheet's t (ends the walk), -1 = none
+    float tau;                      // M5 LAD shadow rays (FM_LAD): optical depth of the crowns crossed so far
 };
+
+// M5 flora modes of the walk: crowns as ellipsoids (shadow, GI, reflection
+// rays), clumped crowns (primary rays: the ellipsoid displaced inward by a 3D
+// value noise, sphere-traced in the shell), or a leaf-area medium (High's
+// shadow rays: crowns attenuate by e^-(sigma chord) instead of blocking)
+enum { FM_PLAIN = 0, FM_CLUMP = 1, FM_LAD = 2 };
+#define TR_LAD_OPAQUE 7.f           // optical depth from which a LAD ray counts as blocked (T < 1e-3)
 
 // ---- tiles ------------------------------------------------------------------
 __device__ __forceinline__ const GmeColTile* tr_tile(int rcx, int rcz) {
@@ -96,6 +153,164 @@ __device__ bool tr_surface(float x, float z, float& T) {
     if (!t) return false;
     T = tr_bilinear(t, x - (float)(rcx * 32), z - (float)(rcz * 32));
     return true;
+}
+
+// ---- far field and LOD (M3, spec 3.8) -----------------------------------------------
+// Surfaces by horizontal distance r from the camera:
+//   r < ring      published tiles: the fine 1 m surface (primary rays to lod_fine,
+//                 shadow rays to 32 m), then the 4 m lattice (lod4). In
+//                 [ring_m0, ring] the lattice corners move to the L1 surface, so
+//                 the near field meets the far field without a step.
+//   ring .. r1    L1 (16 m); in [r1_m0, r1] its corners move to L2.
+//   r1 .. r2      L2 (64 m).
+// Beyond the loaded radius the far field drops by the curvature
+// c2 (r^2 - max_dist^2): the drop and its slope are 0 at the loaded radius.
+struct FarCell { float h00, h10, h01, h11; };
+
+__device__ __forceinline__ float bil4(const FarCell& c, float a, float b) {
+    const float lo = c.h00 + (c.h10 - c.h00) * a, hi = c.h01 + (c.h11 - c.h01) * a;
+    return lo + (hi - lo) * b;
+}
+__device__ __forceinline__ uint32_t far_raw(const FarLevel& L, int fi, int fj) {   // frame sample (fi, fj)
+    const uint32_t ix = (uint32_t)(L.bx + fi) & (GME_FAR_N - 1u), iz = (uint32_t)(L.bz + fj) & (GME_FAR_N - 1u);
+    return __ldg(L.s + ((size_t)iz << 10) + ix);
+}
+__device__ __forceinline__ float far_hm(uint32_t v) { return (float)(int16_t)(v & 0xFFFFu) * (1.f / 16.f) + g_tc.ybase_m; }
+__device__ __forceinline__ float far_h(const FarLevel& L, int fi, int fj) { return far_hm(far_raw(L, fi, fj)); }
+__device__ __forceinline__ float far_r(float x, float z) {
+    const float dx = x - g_tc.camx, dz = z - g_tc.camz;
+    return sqrtf(dx * dx + dz * dz);
+}
+__device__ __forceinline__ float far_w1(float r) { return sat((r - g_tc.r1_m0) * g_tc.r1_iw); }    // L1 -> L2
+__device__ __forceinline__ float lod_w(float r) { return sat((r - g_tc.ring_m0) * g_tc.ring_iw); }  // LOD -> L1
+__device__ __forceinline__ float far_drop(float x, float z) {
+    const float dx = x - g_tc.camx, dz = z - g_tc.camz;
+    return g_tc.c2 * fmaxf(dx * dx + dz * dz - g_tc.drop_r2, 0.f);
+}
+
+// The 4 samples of level M's cell that contains the point (x0, z0) + 1/8 cell,
+// and the point's cell coordinates. Used for corners of finer cells nested in it.
+__device__ __forceinline__ void far_parent(const FarLevel& M, float x0, float z0, FarCell& m, float& a, float& b) {
+    const float u = (x0 - M.ox) * M.iS, v = (z0 - M.oz) * M.iS;
+    const int fi = (int)floorf(u + 0.125f), fj = (int)floorf(v + 0.125f);
+    a = u - (float)fi; b = v - (float)fj;
+    m.h00 = far_h(M, fi, fj); m.h10 = far_h(M, fi + 1, fj); m.h01 = far_h(M, fi, fj + 1); m.h11 = far_h(M, fi + 1, fj + 1);
+}
+
+// Corners (relative metres, no drop) of frame cell (fi, fj) of level l. L1
+// cells in the L1 -> L2 band morph each corner toward the L2 surface by its own
+// distance, so neighbouring cells share corners and the surface stays bilinear.
+__device__ __forceinline__ void far_cell(int l, int fi, int fj, FarCell& c) {
+    const FarLevel& L = g_tc.far[l];
+    c.h00 = far_h(L, fi, fj); c.h10 = far_h(L, fi + 1, fj); c.h01 = far_h(L, fi, fj + 1); c.h11 = far_h(L, fi + 1, fj + 1);
+    if (l != 0) return;
+    const float x0 = L.ox + (float)fi * L.S, z0 = L.oz + (float)fj * L.S;
+    if (far_r(x0 + 0.5f * L.S, z0 + 0.5f * L.S) + 0.71f * L.S <= g_tc.r1_m0) return;
+    FarCell m;
+    float a, b;
+    far_parent(g_tc.far[1], x0, z0, m, a, b);                   // an L1 cell is a quarter of an L2 cell
+    c.h00 += (bil4(m, a, b) - c.h00) * far_w1(far_r(x0, z0));
+    c.h10 += (bil4(m, a + 0.25f, b) - c.h10) * far_w1(far_r(x0 + L.S, z0));
+    c.h01 += (bil4(m, a, b + 0.25f) - c.h01) * far_w1(far_r(x0, z0 + L.S));
+    c.h11 += (bil4(m, a + 0.25f, b + 0.25f) - c.h11) * far_w1(far_r(x0 + L.S, z0 + L.S));
+}
+// far-field surface (no drop) at relative (x, z); the level by distance
+__device__ float far_surface(float x, float z) {
+    const int l = far_r(x, z) < g_tc.r1 ? 0 : 1;
+    const FarLevel& L = g_tc.far[l];
+    const float u = (x - L.ox) * L.iS, v = (z - L.oz) * L.iS;
+    const int fi = (int)floorf(u), fj = (int)floorf(v);
+    FarCell c;
+    far_cell(l, fi, fj, c);
+    return bil4(c, u - (float)fi, v - (float)fj);
+}
+
+// 4 m LOD cell (CX, CZ) of a tile (corners on the lod4 lattice), relative
+// metres. Near the ring the corners move to the L1 surface (an LOD cell is a
+// sixteenth of an L1 cell), reaching it 6 m before the ring.
+__device__ __forceinline__ void lod_cell(const GmeColTile* tile, int rcx, int rcz, int CX, int CZ, FarCell& c) {
+    const int k = CZ * GME_LOD_N + CX;
+    c.h00 = (float)__ldg(&tile->lod4[k]) * (1.f / 16.f) + g_tc.ybase_m;
+    c.h10 = (float)__ldg(&tile->lod4[k + 1]) * (1.f / 16.f) + g_tc.ybase_m;
+    c.h01 = (float)__ldg(&tile->lod4[k + GME_LOD_N]) * (1.f / 16.f) + g_tc.ybase_m;
+    c.h11 = (float)__ldg(&tile->lod4[k + GME_LOD_N + 1]) * (1.f / 16.f) + g_tc.ybase_m;
+    if (!g_tc.far_on) return;
+    const float x0 = (float)(rcx * 32 + 4 * CX), z0 = (float)(rcz * 32 + 4 * CZ);
+    if (far_r(x0 + 2.f, z0 + 2.f) + 2.9f <= g_tc.ring_m0) return;
+    FarCell m;
+    float a, b;
+    far_parent(g_tc.far[0], x0, z0, m, a, b);
+    c.h00 += (bil4(m, a, b) - c.h00) * lod_w(far_r(x0, z0));
+    c.h10 += (bil4(m, a + 0.25f, b) - c.h10) * lod_w(far_r(x0 + 4.f, z0));
+    c.h01 += (bil4(m, a, b + 0.25f) - c.h01) * lod_w(far_r(x0, z0 + 4.f));
+    c.h11 += (bil4(m, a + 0.25f, b + 0.25f) - c.h11) * lod_w(far_r(x0 + 4.f, z0 + 4.f));
+}
+// the LOD surface at relative (x, z); false if its tile is not published
+__device__ bool tr_surface_lod(float x, float z, float& T) {
+    const int rcx = (int)floorf(x * (1.f / 32.f)), rcz = (int)floorf(z * (1.f / 32.f));
+    const GmeColTile* t = tr_tile(rcx, rcz);
+    if (!t) return false;
+    const float lx = (x - (float)(rcx * 32)) * 0.25f, lz = (z - (float)(rcz * 32)) * 0.25f;
+    const int CX = min(max((int)floorf(lx), 0), 7), CZ = min(max((int)floorf(lz), 0), 7);
+    FarCell c;
+    lod_cell(t, rcx, rcz, CX, CZ, c);
+    T = bil4(c, sat(lx - (float)CX), sat(lz - (float)CZ));
+    return true;
+}
+// Highest L1 sample over the tile (rcx, rcz): bounds the morphed LOD surface
+__device__ __forceinline__ float lod_band_top(int rcx, int rcz) {
+    const FarLevel& L = g_tc.far[0];
+    const int fi = (int)floorf(((float)(rcx * 32) - L.ox) * L.iS + 0.03125f), fj = (int)floorf(((float)(rcz * 32) - L.oz) * L.iS + 0.03125f);
+    float m = -3e38f;
+#pragma unroll
+    for (int j = 0; j < 3; ++j)
+#pragma unroll
+        for (int i = 0; i < 3; ++i) m = fmaxf(m, far_h(L, fi + i, fj + j));
+    return m;
+}
+// The drawn ground (no drop) under relative (x, z): the fine surface (fine) or
+// the LOD surface of a published tile inside the ring, else the far field.
+// Without the far field: the fine surface only, as in M2. false: none.
+__device__ bool tr_ground(float x, float z, bool fine, float& T) {
+    if (!g_tc.far_on) return tr_surface(x, z, T);
+    const float r = far_r(x, z);
+    if (r < g_tc.ring && (fine ? tr_surface(x, z, T) : tr_surface_lod(x, z, T))) return true;
+    if (r >= g_tc.r2) return false;
+    T = far_surface(x, z);
+    return true;
+}
+
+// mip max of the cell of size 2^k samples (k = 3: 8 x 8, k = 6: 64 x 64) holding frame sample (fi, fj)
+__device__ __forceinline__ float far_mip_max(const FarLevel& L, int fi, int fj, int k) {
+    const int n = GME_FAR_N >> k;
+    const int ix = ((L.bx >> k) + (fi >> k)) & (n - 1), iz = ((L.bz >> k) + (fj >> k)) & (n - 1);
+    const short2 m = __ldg((k == 3 ? L.mA : L.mB) + iz * n + ix);
+    return (float)m.x * (1.f / 16.f) + g_tc.ybase_m;
+}
+// t at which the ray leaves the cell of size 2^k samples holding frame sample f (one axis)
+__device__ __forceinline__ float far_exit(int f, int k, float S, float off, float oo, float idd, bool pos) {
+    const int cb = ((f >> k) + (pos ? 1 : 0)) << k;
+    return ((float)cb * S + off - oo) * idd;
+}
+// t interval where the ray's horizontal distance from the camera is below R:
+// r(t)^2 = qq + 2 qd t + hl2 t^2. false if never.
+__device__ __forceinline__ bool disc_span(float qq, float qd, float hl2, float R, float& ta, float& tb) {
+    const float c = qq - R * R;
+    if (hl2 < 1e-12f) { ta = -3e38f; tb = 3e38f; return c < 0.f; }
+    const float disc = qd * qd - hl2 * c;
+    if (disc <= 0.f) return false;
+    const float qn = -(qd + copysignf(sqrtf(disc), qd));
+    const float r0 = qn / hl2, r1 = c / qn;
+    ta = fminf(r0, r1);
+    tb = fmaxf(r0, r1);
+    return true;
+}
+// lower bound of the ray's height plus the curvature drop over [ta, tb]
+// (the drop is convex in t: its minimum is at the closest approach)
+__device__ __forceinline__ float far_ylow(float oy, float dy, float qq, float qd, float hl2, float ta, float tb) {
+    const float yl = oy + dy * (dy >= 0.f ? ta : tb);
+    const float tc = hl2 > 1e-12f ? fminf(fmaxf(-qd / hl2, ta), tb) : ta;
+    return yl + g_tc.c2 * fmaxf(qq + (2.f * qd + hl2 * tc) * tc - g_tc.drop_r2, 0.f);
 }
 
 // ---- exact intersections ------------------------------------------------------
@@ -182,24 +397,163 @@ __device__ __forceinline__ float tr_hit_capsule(float3 ro, float3 rd, float3 pa,
     return t;
 }
 
-// kelp strand of tile column k (absolute x, z): capsule axis bottom/top (relative). false = none
+// kelp strand of tile column k (absolute x, z): the stipe's axis from its foot on the
+// smooth bed (pa) to its swaying tip (pb), relative to the camera chunk, and the
+// column hash of its blades (density.h gme_kelp_blade). false = none
 __device__ __forceinline__ bool tr_kelp(const GmeColTile* t, int k, int32_t x, int32_t z, uint32_t cell,
-                                        float3& pa, float3& pb) {
+                                        float3& pa, float3& pb, uint32_t& hb) {
     const int32_t h = gme_tile_h(t, k);
     const int32_t len = gme_kelp_len(x, z, h, cell, g_tc.seed, &g_tc.planet);
     if (len <= 0) return false;
     const float y0 = tr_T(t, k, tr_base(t));
-    const float y1 = (float)(h + len + 1 - 32 * g_tc.cy);
-    float a = y0 + GME_KELP_R, b = y1 - GME_KELP_R;
-    if (a > b) a = b = 0.5f * (y0 + y1);
+    const float y1 = fmaxf((float)(h + len + 1 - 32 * g_tc.cy), y0 + 0.3f);
     const float axx = (float)(x - 32 * g_tc.cx) + 0.5f, azz = (float)(z - 32 * g_tc.cz) + 0.5f;
-    // visual-only sway of the tip, < 0.3 m so the capsule stays inside its column
+    // visual-only sway of the tip (<= GME_KELP_SWAY: the blades stay inside the column)
     const uint32_t hs = gme_hash3(x, 7, z, g_tc.seed ^ 0x5EA7u);
     const float ph = (float)(hs & 1023u) * (6.2831853f / 1024.f);
-    const float sw = 0.22f * __sinf(g_tc.time * 0.9f + ph), sw2 = 0.12f * __cosf(g_tc.time * 0.7f + 1.7f * ph);
-    pa = f3(axx, a, azz);
-    pb = f3(axx + sw, b, azz + sw2);
+    const float sw = 0.11f * __sinf(g_tc.time * 0.9f + ph), sw2 = 0.08f * __cosf(g_tc.time * 0.7f + 1.7f * ph);
+    pa = f3(axx, y0, azz);
+    pb = f3(axx + sw, y1, azz + sw2);
+    hb = gme_hash3(x, 0, z, g_tc.seed ^ 0xF10Au);
     return true;
+}
+// blade i of a strand (pa, pb, hb) as drawn
+__device__ __forceinline__ void tr_kelp_blade(float3 pa, float3 pb, uint32_t hb, int i, GmeKelpBlade& bl) {
+    gme_kelp_blade(i, gme_kelp_nblades(pa.y, pb.y), pa.x, pa.y, pa.z, pb.x - pa.x, pb.y, pb.z - pa.z, hb, &bl);
+}
+__device__ __forceinline__ float3 tr_blade_normal(const GmeKelpBlade& bl) {   // u x w (w horizontal: w_y = 0)
+    return norm3(f3(bl.uy * bl.wz, bl.uz * bl.wx - bl.ux * bl.wz, -bl.uy * bl.wx));
+}
+// One kelp strand along the ray p0 + d t, t in [0, tmax]: the stipe (thin capsule)
+// and the blades whose height range the ray crosses there (at most 24, the
+// nearer end first). Nearest t, -1 none; part = the blade, -1 the stipe. Out
+// of line: the walk's registers stay untouched by its temporaries.
+__device__ __noinline__ float tr_kelp_strand(float3 p0, float3 d, float tmax, float3 pa, float3 pb, uint32_t hb, int& part) {
+    float best = tr_hit_capsule(p0, d, pa, f3(pb.x, pb.y - GME_KELP_STIPE_R, pb.z), GME_KELP_STIPE_R, tmax);
+    part = -1;
+    if (best < 0.f) best = 3.0e38f;
+    const float tm = fminf(best, tmax);
+    const float ylo = fminf(p0.y, p0.y + d.y * tm), yhi = fmaxf(p0.y, p0.y + d.y * tm);
+    const int n = gme_kelp_nblades(pa.y, pb.y);
+    const float fn = (float)n / fmaxf(pb.y - pa.y, 1e-3f);
+    // blade i spans y in [A_i, A_i + L sin 42deg], A_i = pa.y + (i + 0.5) (pb.y - pa.y) / n
+    int i0 = max((int)floorf((ylo - 0.29f - pa.y) * fn - 0.5f), 0), i1 = min((int)ceilf((yhi + 0.02f - pa.y) * fn - 0.5f), n - 1);
+    if (i1 - i0 > 23) { if (d.y < 0.f) i0 = i1 - 23; else i1 = i0 + 23; }
+    for (int i = i0; i <= i1; ++i) {
+        GmeKelpBlade bl;
+        tr_kelp_blade(pa, pb, hb, i, bl);
+        const float3 N = tr_blade_normal(bl);
+        const float dn = dot3(d, N);
+        if (fabsf(dn) < 1e-6f) continue;
+        const float3 c = f3(bl.cx, bl.cy, bl.cz);
+        const float t = dot3(c - p0, N) / dn;
+        if (!(t >= 0.f) || t >= best || t > tmax) continue;
+        const float3 q = p0 + d * t - c;
+        const float ua = (q.x * bl.ux + q.y * bl.uy + q.z * bl.uz) * (2.f / GME_KELP_BLADE_L);
+        const float wb = (q.x * bl.wx + q.z * bl.wz) * (2.f / GME_KELP_BLADE_W);
+        if (ua * ua + wb * wb <= 1.f) { best = t; part = i; }
+    }
+    return best < 3.0e37f ? best : -1.f;
+}
+
+// ---- M5 crowns: geometry of a slot's crown, the clumped surface, the leaf medium ----
+struct CrownG {
+    float3   ce;                    // centre (relative to the camera chunk), shifted onto T like the drawn tree
+    float    ia, ib;                // inverse radii: horizontal sqrt(trad^2 + trad), vertical sqrt(tvr^2 + tvr)
+    float    sigma;                 // leaf-area extinction G LAD = G 3 LAI / (4 b), 1/m
+    int32_t  trad;
+    uint32_t cs;                    // clump noise seed of the tree
+};
+__device__ __forceinline__ float crown_sigma(float ib) { return SPEC_LEAF_G * 0.75f * SPEC_CROWN_LAI * ib; }
+// the crown of block b of the tile (rcx, rcz); false = no shrub / tree there
+__device__ __forceinline__ bool tr_crown_of(const GmeColTile* t, int b, int rcx, int rcz, CrownG& c) {
+    const GmeSlot* s = &t->slot[b];
+    const int32_t trad = __ldg(&s->trad);
+    if (trad <= 0) return false;
+    const int32_t tx = __ldg(&s->tx), tz = __ldg(&s->tz), tcy = __ldg(&s->tcy), tvr = __ldg(&s->tvr);
+    const int32_t lx = tx - (g_tc.cx + rcx) * 32, lz = tz - (g_tc.cz + rcz) * 32;
+    const float dl = (float)((int32_t)((__ldg(&t->col[(lz + GME_TILE_APRON) * GME_TILE_N + lx + GME_TILE_APRON]) >> 8) ^ 0x80u) - 0x80) *
+                     (1.f / GME_DEV_UNIT);
+    c.ce = f3((float)(rcx * 32 + lx) + 0.5f, (float)(tcy - 32 * g_tc.cy) + 0.5f + dl, (float)(rcz * 32 + lz) + 0.5f);
+    c.ia = rsqrtf((float)(trad * trad + trad));
+    c.ib = rsqrtf((float)(tvr * tvr + tvr));
+    c.sigma = crown_sigma(c.ib);
+    c.trad = trad;
+    c.cs = gme_clump_seed(tx, tz, g_tc.seed);
+    return true;
+}
+// the crown of the slot holding relative point p (a crown lies inside its slot)
+__device__ __forceinline__ bool tr_crown_at(float3 p, CrownG& c) {
+    const int rcx = (int)floorf(p.x * (1.f / 32.f)), rcz = (int)floorf(p.z * (1.f / 32.f));
+    const GmeColTile* t = tr_tile(rcx, rcz);
+    if (!t) return false;
+    const int bx = min(max((int)floorf((p.x - (float)(rcx * 32)) * 0.125f), 0), 3), bz = min(max((int)floorf((p.z - (float)(rcz * 32)) * 0.125f), 0), 3);
+    return tr_crown_of(t, bz * 4 + bx, rcx, rcz, c);
+}
+// distance from p along unit d to where the ray leaves the crown ellipsoid (0 if it never is inside ahead)
+__device__ __forceinline__ float tr_crown_exit(const CrownG& c, float3 p, float3 d) {
+    const float px = (p.x - c.ce.x) * c.ia, py = (p.y - c.ce.y) * c.ib, pz = (p.z - c.ce.z) * c.ia;
+    const float qx = d.x * c.ia, qy = d.y * c.ib, qz = d.z * c.ia;
+    const float qq = qx * qx + qy * qy + qz * qz, pq = px * qx + py * qy + pz * qz, pp = px * px + py * py + pz * pz - 1.f;
+    const float disc = pq * pq - qq * pp;
+    if (disc <= 0.f) return 0.f;
+    return fmaxf((-pq + sqrtf(disc)) / qq, 0.f);
+}
+// clumps fade out where they are smaller than a few pixels (t: distance along the primary ray)
+__device__ __forceinline__ float tr_clump_fade(float t, float cell) { return sat(2.f - t * g_tc.pix / (0.25f * cell)); }
+// inward displacement (m) of the clumped surface at crown-local point q (m from the centre), and its gradient
+// (1/m): billows of two octaves of value noise, delta = amp (0.72 m1^2 + 0.28 m2^2), m = 1 - |2n - 1|:
+// rounded clumps at the crown's surface with smaller ones on them, narrow deep creases between (n = 0.5).
+// Band-limited by the pixel footprint fp (m): |s| becomes sqrt(s^2 + w^2) with w = 1.5 fp / the octave's
+// cell, so a crease is never narrower than about a pixel and an octave fades out (m -> 0) once its clumps
+// are smaller than a few pixels (no shimmering under the jittered TAA).
+#define CLUMP_O2 2.37f
+__device__ __forceinline__ float tr_clump_delta(const CrownG& c, float3 q, float amp, float fp, float3* grad) {
+    const float ic = 1.f / gme_clump_cell(c.trad), ic2 = ic * CLUMP_O2;
+    const float w1 = 1.5f * fp * ic, w2 = 1.5f * fp * ic2;
+    float g[3], g2[3];
+    const float n = gme_clump_noise(q.x * ic, q.y * ic, q.z * ic, c.cs, grad ? g : NULL);
+    const float s = 2.f * n - 1.f, r = sqrtf(s * s + w1 * w1), m = fmaxf(1.f - r, 0.f);
+    float m2 = 0.f, s2 = 0.f, r2 = 1.f;
+    if (w2 < 1.f) {                                     // the second octave while it is resolved
+        const float n2 = gme_clump_noise(q.x * ic2 + 17.3f, q.y * ic2, q.z * ic2, c.cs ^ 0x9E3779B9u, grad ? g2 : NULL);
+        s2 = 2.f * n2 - 1.f;
+        r2 = sqrtf(s2 * s2 + w2 * w2);
+        m2 = fmaxf(1.f - r2, 0.f);
+    }
+    if (grad) {                                         // d/dq of amp (0.72 m^2 + 0.28 m2^2), dm/ds = -s / r
+        const float k = -4.f * 0.72f * amp * m * (s / fmaxf(r, 1e-6f)) * ic;
+        const float k2 = -4.f * 0.28f * amp * m2 * (s2 / fmaxf(r2, 1e-6f)) * ic2;
+        *grad = f3(g[0] * k + (m2 > 0.f ? g2[0] * k2 : 0.f), g[1] * k + (m2 > 0.f ? g2[1] * k2 : 0.f), g[2] * k + (m2 > 0.f ? g2[2] * k2 : 0.f));
+    }
+    return amp * (0.72f * m * m + 0.28f * m2 * m2);
+}
+// signed distance estimate to the crown ellipsoid (I. Quilez's bound) at crown-local q
+__device__ __forceinline__ float tr_ellipsoid_de(const CrownG& c, float3 q) {
+    const float kx = q.x * c.ia, ky = q.y * c.ib, kz = q.z * c.ia;
+    const float k0 = sqrtf(kx * kx + ky * ky + kz * kz);
+    const float k1 = sqrtf(kx * kx * c.ia * c.ia + ky * ky * c.ib * c.ib + kz * kz * c.ia * c.ia);
+    return k0 * (k0 - 1.f) / fmaxf(k1, 1e-6f);
+}
+// Clumped crown along p0 + d t' entering the ellipsoid at tin: sphere tracing of
+// d_ellipsoid + delta = 0 inside the shell, at most 12 steps; -1 if the ray leaves
+// the ellipsoid through the gaps. tabs: distance of p0 along the primary ray (fade).
+__device__ __noinline__ float tr_clump(float3 p0, float3 d, const CrownG& c, float tin, float tabs) {
+    const float cell = gme_clump_cell(c.trad);
+    const float amp = gme_clump_amp(c.trad) * tr_clump_fade(tabs + tin, cell);
+    if (amp <= 0.f) return tin;
+    const float tout = tin + tr_crown_exit(c, p0 + d * tin, d);
+    const float lip = 1.f + 3.5f * amp / cell;           // |grad delta| <= ~14 amp / cell at worst; typical far less
+    const float fp = (tabs + tin) * g_tc.pix;            // pixel footprint at the crown (band limit of the billows)
+    float t = tin;
+    for (int i = 0; i < 12; ++i) {
+        const float3 q = p0 + d * t - c.ce;
+        const float F = tr_ellipsoid_de(c, q) + tr_clump_delta(c, q, amp, fp, NULL);
+        if (F < 2e-3f) return t;
+        t += F / lip;
+        if (t > tout) return -1.f;
+    }
+    return t;                                            // close to the surface: accept
 }
 
 // ---- voxel mode -------------------------------------------------------------------
@@ -311,9 +665,13 @@ __device__ __forceinline__ float tr_exit(int i, float S, float off, float oo, fl
 // Shrub / tree of block b over [tb, tend]: analytic crown + trunk, shifted onto
 // T by the trunk column's deviation, in tile-local coordinates (ox, oz = ray
 // origin - tile corner). Returns the nearer hit's kind and lowers tend to it;
-// HK_NONE if neither is hit.
+// HK_NONE if neither is hit. M5 kMode: FM_PLAIN the crown ellipsoid; FM_CLUMP
+// the clumped crown (primary rays; a ray may pass through its gaps); FM_LAD the
+// crown as a leaf-area medium: h.tau += sigma x chord, blocking only once the
+// optical depth passes TR_LAD_OPAQUE (High's shadow rays). Trunks are opaque.
+template <int kMode>
 __device__ __forceinline__ int tr_flora(const GmeColTile* tile, int b, int rcx, int rcz,
-                                        float ox, float oy, float oz, float3 d, float tb, float& tend) {
+                                        float ox, float oy, float oz, float3 d, float tb, float& tend, THit& h) {
     const GmeSlot* s = &tile->slot[b];
     const int32_t trad = __ldg(&s->trad), tcy = __ldg(&s->tcy), tvr = __ldg(&s->tvr);
     const int32_t lx = __ldg(&s->tx) - (g_tc.cx + rcx) * 32, lz = __ldg(&s->tz) - (g_tc.cz + rcz) * 32;   // 0..31
@@ -321,9 +679,31 @@ __device__ __forceinline__ int tr_flora(const GmeColTile* tile, int b, int rcx, 
                      (1.f / GME_DEV_UNIT);
     const float3 pb0 = f3(ox + d.x * tb, oy + d.y * tb, oz + d.z * tb);   // segment start: well-conditioned quadratics
     const float3 ce = f3((float)lx + 0.5f, (float)(tcy - 32 * g_tc.cy) + 0.5f + dl, (float)lz + 0.5f);
+    const float ia = rsqrtf((float)(trad * trad + trad)), ib = rsqrtf((float)(tvr * tvr + tvr));
     int fk = HK_NONE;
-    const float tf = tr_hit_ellipsoid(pb0, d, ce, rsqrtf((float)(trad * trad + trad)), rsqrtf((float)(tvr * tvr + tvr)), tend - tb);
-    if (tf >= 0.f) { tend = tb + tf; fk = HK_CROWN; }
+    if (kMode == FM_LAD) {                             // the chord through the crown, clipped to the segment
+        const float px = (pb0.x - ce.x) * ia, py = (pb0.y - ce.y) * ib, pz = (pb0.z - ce.z) * ia;
+        const float qx = d.x * ia, qy = d.y * ib, qz = d.z * ia;
+        const float qq = qx * qx + qy * qy + qz * qz, pq = px * qx + py * qy + pz * qz, pp = px * px + py * py + pz * pz - 1.f;
+        const float disc = pq * pq - qq * pp;
+        if (disc > 0.f) {
+            const float sq = sqrtf(disc);
+            const float tin = fmaxf((-pq - sq) / qq, 0.f), tout = fminf((-pq + sq) / qq, tend - tb);
+            if (tout > tin) {
+                h.tau += crown_sigma(ib) * (tout - tin);
+                if (h.tau > TR_LAD_OPAQUE) { tend = tb + tin; fk = HK_CROWN; }
+            }
+        }
+    } else {
+        float tf = tr_hit_ellipsoid(pb0, d, ce, ia, ib, tend - tb);
+        if (kMode == FM_CLUMP && tf >= 0.f) {
+            CrownG c;
+            c.ce = ce; c.ia = ia; c.ib = ib; c.sigma = 0.f; c.trad = trad;
+            c.cs = gme_clump_seed(__ldg(&s->tx), __ldg(&s->tz), g_tc.seed);
+            tf = tr_clump(pb0, d, c, tf, tb);
+        }
+        if (tf >= 0.f) { tend = tb + tf; fk = HK_CROWN; }
+    }
     const float y0 = (float)(__ldg(&s->tbase) + 1 - 32 * g_tc.cy) + dl, y1 = (float)(tcy + 1 - 32 * g_tc.cy) + dl;
     const float tt = tr_hit_cylinder(pb0, d, ce.x, ce.z, gme_trunk_radius(trad), y0, y1, tend - tb);
     if (tt >= 0.f) { tend = tb + tt; fk = HK_TRUNK; }
@@ -331,11 +711,11 @@ __device__ __forceinline__ int tr_flora(const GmeColTile* tile, int b, int rcx, 
 }
 
 // Kelp of block b over [tb, tend] (tile-local origin ox, oy, oz): a walk over
-// the block's columns along the ray; each column's strand is a capsule inside
-// its own 1 m footprint, so the first capsule hit in walk order is the nearest.
-// Lowers tend and returns true (h.i, h.j = the strand's column) on a hit.
-// A pass of its own, before the dual cells, so its temporaries never share
-// registers with the terrain walk.
+// the block's columns along the ray; each column's strand (stipe + blades, M5)
+// lies inside its own 1 m footprint, so the first hit in walk order is the
+// nearest. Lowers tend and returns true (h.i, h.j = the strand's column, h.u =
+// its blade, -1 the stipe) on a hit. A pass of its own, before the dual cells,
+// so its temporaries never share registers with the terrain walk.
 __device__ __forceinline__ bool tr_kelp_block(const GmeColTile* tile, int b, int rcx, int rcz, float ox, float oy, float oz,
                                               float3 d, float ix, float iz, float tb, float& tend, THit& h) {
     const bool px = d.x > 0.f, pz = d.z > 0.f;
@@ -348,14 +728,17 @@ __device__ __forceinline__ bool tr_kelp_block(const GmeColTile* tile, int b, int
         const float s1 = fminf(fminf(ex, ez), tend);
         if (s1 > s0 && fminf(oy + d.y * s0, oy + d.y * s1) < g_tc.yw) {
             float3 pa, pb;
+            uint32_t hb;
             if (tr_kelp(tile, (lz + GME_TILE_APRON) * GME_TILE_N + lx + GME_TILE_APRON, (g_tc.cx + rcx) * 32 + lx,
-                        (g_tc.cz + rcz) * 32 + lz, cell, pa, pb)) {
+                        (g_tc.cz + rcz) * 32 + lz, cell, pa, pb, hb)) {
                 // tr_kelp works relative to the camera chunk: shift the segment start there
                 const float3 p0 = f3(ox + (float)(rcx * 32) + d.x * s0, oy + d.y * s0, oz + (float)(rcz * 32) + d.z * s0);
-                const float tk = tr_hit_capsule(p0, d, pa, pb, GME_KELP_R, tend - s0);
+                int part;
+                const float tk = tr_kelp_strand(p0, d, tend - s0, pa, pb, hb, part);
                 if (tk >= 0.f) {
                     tend = s0 + tk;
                     h.i = lx + GME_TILE_APRON; h.j = lz + GME_TILE_APRON;
+                    h.u = (float)part;
                     return true;
                 }
             }
@@ -371,12 +754,13 @@ __device__ __forceinline__ bool tr_kelp_block(const GmeColTile* tile, int b, int
 // One 8 m block (index b) of a tile over the ray segment [tb, tbe]: flora of
 // its slot, its kelp, then its dual cells. Tile-local origin (ox, oy, oz).
 // true = hit (h filled). (The water plane is one query per ray: sm_trace.)
+template <int kMode>
 __device__ __forceinline__ bool tr_block(const GmeColTile* tile, int b, int rcx, int rcz,
                                          float ox, float oy, float oz, float3 d, float ix, float iz,
                                          float tb, float tbe, THit& h) {
     const bool px = d.x > 0.f, pz = d.z > 0.f;
     float tend = tbe;
-    int fk = __ldg(&tile->slot[b].trad) > 0 ? tr_flora(tile, b, rcx, rcz, ox, oy, oz, d, tb, tend) : HK_NONE;
+    int fk = __ldg(&tile->slot[b].trad) > 0 ? tr_flora<kMode>(tile, b, rcx, rcz, ox, oy, oz, d, tb, tend, h) : HK_NONE;
     if (BIOCELL_KIND(__ldg(&tile->slot[b].cell)) == BIO_KIND_KELP && fminf(oy + d.y * tb, oy + d.y * tend) < g_tc.yw &&
         tr_kelp_block(tile, b, rcx, rcz, ox, oy, oz, d, ix, iz, tb, tend, h))
         fk = HK_KELP;
@@ -423,34 +807,102 @@ __device__ __forceinline__ bool tr_block(const GmeColTile* tile, int b, int rcx,
     return false;
 }
 
+// One 8 m block in LOD mode over [tb, tbe]: the slot's shrub / tree while
+// tb < tf, then the 2 x 2 bilinear 4 m cells of the lod4 lattice (morphed
+// toward L1 near the ring). true = hit (h filled).
+template <int kMode>
+__device__ __forceinline__ bool tr_block_lod(const GmeColTile* tile, int b, int rcx, int rcz, float ox, float oy, float oz,
+                                             float3 d, float ix, float iz, float tb, float tbe, float tf, THit& h) {
+    const bool px = d.x > 0.f, pz = d.z > 0.f;
+    float tend = tbe;
+    const int fk = (tb < tf && __ldg(&tile->slot[b].trad) > 0) ? tr_flora<kMode>(tile, b, rcx, rcz, ox, oy, oz, d, tb, tend, h) : HK_NONE;
+    const int bx2 = (b & 3) * 2, bz2 = (b >> 2) * 2;
+    int CX = min(max((int)floorf((ox + d.x * tb) * 0.25f), bx2), bx2 + 1);
+    int CZ = min(max((int)floorf((oz + d.z * tb) * 0.25f), bz2), bz2 + 1);
+    float s0 = tb;
+    for (;;) {
+        const float ex = tr_exit(CX, 4.f, 0.f, ox, ix, px), ez = tr_exit(CZ, 4.f, 0.f, oz, iz, pz);
+        const float s1 = fminf(fminf(ex, ez), tend);
+        if (s1 > s0) {
+            FarCell c;
+            lod_cell(tile, rcx, rcz, CX, CZ, c);
+            const float ya = oy + d.y * s0;
+            if (fminf(ya, oy + d.y * s1) <= fmaxf(fmaxf(c.h00, c.h10), fmaxf(c.h01, c.h11))) {
+                const float bb = c.h10 - c.h00, cc = c.h01 - c.h00, kk = c.h00 - c.h10 - c.h01 + c.h11;
+                const float u0 = (ox + d.x * s0) * 0.25f - (float)CX, v0 = (oz + d.z * s0) * 0.25f - (float)CZ;
+                const float du = d.x * 0.25f, dv = d.z * 0.25f;
+                const float A = -kk * du * dv;
+                const float B = d.y - bb * du - cc * dv - kk * (u0 * dv + v0 * du);
+                const float C = ya - (c.h00 + bb * u0 + cc * v0 + kk * u0 * v0);
+                const float r = tr_patch_root(A, B, C, s1 - s0);
+                if (r >= 0.f) {
+                    h.t = s0 + r; h.kind = HK_LOD; h.rcx = rcx; h.rcz = rcz; h.i = CX; h.j = CZ;
+                    h.u = sat(u0 + du * r); h.v = sat(v0 + dv * r);
+                    return true;
+                }
+            }
+        }
+        if (s1 >= tend) break;
+        if (ex < ez) CX += px ? 1 : -1; else CZ += pz ? 1 : -1;
+        s0 = s1;
+        if ((unsigned)(CX - bx2) > 1u || (unsigned)(CZ - bz2) > 1u) break;
+    }
+    if (fk != HK_NONE) {
+        h.t = tend; h.kind = fk; h.rcx = rcx; h.rcz = rcz; h.i = b;
+        return true;
+    }
+    return false;
+}
+
 enum { TS_MISS = 0, TS_HIT = 1, TS_VOXEL = 2 };
 
-// Column-mode walk over [t, tmax]: tiles -> blocks -> dual cells. Returns
-// TS_HIT (h filled), TS_MISS, or TS_VOXEL with [t, te] = a tile that is not
-// published, which the caller crosses in voxel mode (no call inside this loop,
-// which keeps the walk's registers low).
-__device__ __forceinline__ int tr_columns(float3 o, float3 d, float& t, float& te, float tmax, THit& h) {
+// Column-mode walk over [t, tmax]: tiles -> blocks -> dual cells (before tl)
+// or 4 m LOD cells (from tl on; flora while t < tf). Returns TS_HIT (h
+// filled), TS_MISS, or TS_VOXEL with [t, te] = a tile that is not published,
+// which the caller crosses in the far field (M3) or in voxel mode (no call
+// inside this loop, which keeps the walk's registers low).
+template <int kMode>
+__device__ __forceinline__ int tr_columns(float3 o, float3 d, float& t, float& te, float tmax, float tl, float tf, THit& h) {
     const float ix = 1.f / d.x, iz = 1.f / d.z;
     const bool px = d.x > 0.f, pz = d.z > 0.f;
     const float tn = t + 1e-3f + t * 1e-6f;            // start tile: a point just past t, never the one behind
     int rcx = (int)floorf((o.x + d.x * tn) * (1.f / 32.f)), rcz = (int)floorf((o.z + d.z * tn) * (1.f / 32.f));
     float ox = o.x - (float)(rcx * 32), oz = o.z - (float)(rcz * 32);   // origin, tile-local
+    // ceiling of the near field: published tiles (and the far field's L1 inside the ring)
+    const float ytop = g_tc.far_on ? fminf(g_tc.ytop, (float)__ldg(g_tc.far_max + 2) + g_tc.ybase_m) : g_tc.ytop;
     while (t < tmax) {                                 // te > t every step but at a corner: always ends
         te = fminf(fminf(tr_exit(0, 32.f, 0.f, ox, ix, px), tr_exit(0, 32.f, 0.f, oz, iz, pz)), tmax);
         const float y0 = o.y + d.y * t;
-        if (d.y >= 0.f && y0 > g_tc.ytop) return TS_MISS;            // above everything, climbing
+        if (d.y >= 0.f && y0 > ytop) return TS_MISS;                 // above everything, climbing
         if (te > t) {
             const GmeColTile* tile = tr_tile(rcx, rcz);
-            if (!tile) return TS_VOXEL;                               // not streamed in yet: voxels, as today
-            if (fminf(y0, o.y + d.y * te) <= (float)(__ldg(&tile->top) - 32 * g_tc.cy)) {
+            if (!tile) return TS_VOXEL;                               // not streamed in yet: far field (M3) / voxels
+            float top = (float)(__ldg(&tile->top) - 32 * g_tc.cy), band = -3e38f;
+            const bool lod = te > tl;
+            if (lod) {
+                top = fmaxf(top, (float)(__ldg(&tile->lod_top) - 32 * g_tc.cy));
+                if (g_tc.far_on && far_r((float)(rcx * 32 + 16), (float)(rcz * 32 + 16)) + 23.f > g_tc.ring_m0) {
+                    band = lod_band_top(rcx, rcz);
+                    top = fmaxf(top, band);
+                }
+            }
+            if (fminf(y0, o.y + d.y * te) <= top) {
                 int b = min(max((int)floorf((oz + d.z * t) * 0.125f), 0), 3) * 4 +
                         min(max((int)floorf((ox + d.x * t) * 0.125f), 0), 3);
                 float tb = t;
                 for (;;) {
                     const float tbe = fminf(fminf(tr_exit(b & 3, 8.f, 0.f, ox, ix, px), tr_exit(b >> 2, 8.f, 0.f, oz, iz, pz)), te);
-                    if (tbe > tb && fminf(o.y + d.y * tb, o.y + d.y * tbe) <= (float)(__ldg(&tile->blk_top[b]) - 32 * g_tc.cy) &&
-                        tr_block(tile, b, rcx, rcz, ox, o.y, oz, d, ix, iz, tb, tbe, h))
-                        return TS_HIT;
+                    if (tbe > tb) {
+                        const float ylo = fminf(o.y + d.y * tb, o.y + d.y * tbe);
+                        if (tb >= tl) {                                      // LOD block
+                            const float btop = fmaxf(fmaxf((float)(__ldg(&tile->blk_top[b]) - 32 * g_tc.cy),
+                                                           (float)(__ldg(&tile->lod_btop[b]) - 32 * g_tc.cy)), band);
+                            if (ylo <= btop && tr_block_lod<kMode>(tile, b, rcx, rcz, ox, o.y, oz, d, ix, iz, tb, tbe, tf, h)) return TS_HIT;
+                        } else if (ylo <= (float)(__ldg(&tile->blk_top[b]) - 32 * g_tc.cy) &&
+                                   tr_block<kMode>(tile, b, rcx, rcz, ox, o.y, oz, d, ix, iz, tb, tbe, h)) {
+                            return TS_HIT;
+                        }
+                    }
                     if (tbe >= te) break;
                     const bool sx = tr_exit(b & 3, 8.f, 0.f, ox, ix, px) < tr_exit(b >> 2, 8.f, 0.f, oz, iz, pz);
                     const int nb = sx ? (b & 3) + (px ? 1 : -1) : (b >> 2) + (pz ? 1 : -1);
@@ -467,28 +919,122 @@ __device__ __forceinline__ int tr_columns(float3 o, float3 d, float& t, float& t
     return TS_MISS;
 }
 
-// The column tracer over [t0, tmax], tiles that have not streamed in crossed in
-// voxel mode (where WATER voxels set h.water_t). Returns the nearest hit, so it
-// serves sun rays (any-hit) as well. true = hit (h filled).
-template <bool kInlineVoxels>
-__device__ __forceinline__ bool trace_smooth_t(float3 o, float3 d, float t0, float tmax, THit& h) {
+// ---- far-field march (M3) ------------------------------------------------------------
+// The ray over [t0, t1] against the far field: L1 while the ray is within r1 of
+// the camera, else L2, ending at r2. The ray's height plus the curvature drop
+// is compared with the clipmap; 64 x 64 and 8 x 8 mip cells are skipped while
+// that sum stays above their maximum, and each remaining sample cell is solved
+// exactly (bilinear patch + the drop's quadratic in t is still a quadratic).
+// true = hit (h.kind = HK_FAR, h.t).
+__device__ __noinline__ bool tr_far(float3 o, float3 d, float t0, float t1, THit& h) {
     if (fabsf(d.x) < 1e-7f) d.x = copysignf(1e-7f, d.x);
     if (fabsf(d.z) < 1e-7f) d.z = copysignf(1e-7f, d.z);
-    for (int k = 0; k < 256 && t0 < tmax; ++k) {
-        float te = tmax;
-        const int r = tr_columns(o, d, t0, te, tmax, h);
-        if (r != TS_VOXEL) return r == TS_HIT;
-        float tx;
-        if ((kInlineVoxels ? trace_voxels(o, d, t0, te, true, false, h, tx)
-                           : trace_voxels_call(o, d, t0, te, true, false, h, tx)) == VX_HIT) return true;
-        t0 = te;
+    const float qx = o.x - g_tc.camx, qz = o.z - g_tc.camz;
+    const float hl2 = d.x * d.x + d.z * d.z, qd = qx * d.x + qz * d.z, qq = qx * qx + qz * qz;
+    float a1, b1, a2, b2;
+    if (!disc_span(qq, qd, hl2, g_tc.r2, a2, b2)) return false;
+    t0 = fmaxf(t0, a2);
+    t1 = fminf(t1, b2);
+    if (!(t1 > t0)) return false;
+    if (!disc_span(qq, qd, hl2, g_tc.r1, a1, b1)) a1 = b1 = -3e38f;
+    const float ix = 1.f / d.x, iz = 1.f / d.z;
+    const bool px = d.x > 0.f, pz = d.z > 0.f;
+    const float m1 = (float)__ldg(g_tc.far_max + 1) * (1.f / 16.f) + g_tc.ybase_m;
+    const float m0 = fmaxf((float)__ldg(g_tc.far_max) * (1.f / 16.f) + g_tc.ybase_m, m1);   // L1 morphs toward L2
+    const float rm2 = g_tc.r1_m0 * g_tc.r1_m0;
+    float t = t0;
+    for (int it = 0; it < TR_FAR_STEPS && t < t1; ++it) {
+        const int l = (t >= a1 && t < b1) ? 0 : 1;
+        const float tseg = fminf(t1, l == 0 ? b1 : (t < a1 ? a1 : t1));   // where this level's part of the ray ends
+        if (far_ylow(o.y, d.y, qq, qd, hl2, t, tseg) > (l == 0 ? m0 : m1)) { t = tseg; continue; }   // above it all
+        const FarLevel& L = g_tc.far[l];
+        const float tn = t + 1e-3f + t * 1e-6f;
+        const int fi = (int)floorf((o.x + d.x * tn - L.ox) * L.iS), fj = (int)floorf((o.z + d.z * tn - L.oz) * L.iS);
+        if ((unsigned)fi >= (unsigned)(GME_FAR_N + 62) || (unsigned)fj >= (unsigned)(GME_FAR_N + 62)) return false;
+        // L1 cells that may reach the L1 -> L2 band are bounded by L2's mips as well
+        const bool band = l == 0 && fmaxf(qq + (2.f * qd + hl2 * t) * t, qq + (2.f * qd + hl2 * tseg) * tseg) > rm2;
+        bool skip = false;
+        for (int k = 6; k >= 3; k -= 3) {                              // 64 x 64, then 8 x 8 samples
+            const float te = fminf(fminf(far_exit(fi, k, L.S, L.ox, o.x, ix, px), far_exit(fj, k, L.S, L.oz, o.z, iz, pz)), tseg);
+            float mx = far_mip_max(L, fi, fj, k);
+            if (band) {
+                const FarLevel& M = g_tc.far[1];
+                const float cx = L.ox + ((float)((fi >> k) << k) + 0.5f * (float)(1 << k)) * L.S;
+                const float cz = L.oz + ((float)((fj >> k) << k) + 0.5f * (float)(1 << k)) * L.S;
+                mx = fmaxf(mx, far_mip_max(M, (int)floorf((cx - M.ox) * M.iS), (int)floorf((cz - M.oz) * M.iS), k));
+            }
+            if (far_ylow(o.y, d.y, qq, qd, hl2, t, te) > mx) { t = fmaxf(te, tn); skip = true; break; }
+        }
+        if (skip) continue;
+        // one sample cell: exact ray / bilinear patch with the drop
+        const float te = fminf(fminf(far_exit(fi, 0, L.S, L.ox, o.x, ix, px), far_exit(fj, 0, L.S, L.oz, o.z, iz, pz)), tseg);
+        FarCell c;
+        far_cell(l, fi, fj, c);
+        if (far_ylow(o.y, d.y, qq, qd, hl2, t, te) <= fmaxf(fmaxf(c.h00, c.h10), fmaxf(c.h01, c.h11))) {
+            const float S = te - t;
+            const float u0 = (o.x + d.x * t - L.ox) * L.iS - (float)fi, v0 = (o.z + d.z * t - L.oz) * L.iS - (float)fj;
+            const float du = d.x * L.iS, dv = d.z * L.iS;
+            const float bb = c.h10 - c.h00, cc = c.h01 - c.h00, kk = c.h00 - c.h10 - c.h01 + c.h11;
+            const float ra2 = qq + (2.f * qd + hl2 * t) * t, rb = qd + hl2 * t;
+            const float cd = (ra2 + (2.f * rb + hl2 * S) * S > g_tc.drop_r2) ? g_tc.c2 : 0.f;   // beyond the loaded radius
+            const float A = -kk * du * dv + cd * hl2;
+            const float B = d.y - bb * du - cc * dv - kk * (u0 * dv + v0 * du) + 2.f * cd * rb;
+            const float C = (o.y + d.y * t) - (c.h00 + bb * u0 + cc * v0 + kk * u0 * v0) + cd * (ra2 - g_tc.drop_r2);
+            const float r = tr_patch_root(A, B, C, S);
+            if (r >= 0.f) {
+                h.t = t + r;
+                h.kind = HK_FAR;
+                return true;
+            }
+        }
+        t = fmaxf(te, tn);
     }
     return false;
 }
 
-// sun rays: everything inline (k_sun keeps its hit record in registers)
-__device__ __forceinline__ bool trace_smooth(float3 o, float3 d, float t0, float tmax, THit& h) {
-    return trace_smooth_t<true>(o, d, t0, tmax, h);
+// The smooth-surface walk over [t0, tmax] (tl: the LOD starts at this t, tf:
+// flora up to this t). Inside the ring the column tracer walks the published
+// tiles; tiles that have not streamed in are crossed in the far field (M3; voxel
+// mode without it, where WATER voxels set h.water_t). From the ring on, or for
+// a ray that starts outside it, the far field. Returns the nearest hit, so it
+// serves sun rays (any-hit) as well. true = hit (h filled).
+template <bool kInlineVoxels, int kMode = FM_PLAIN>
+__device__ __forceinline__ bool trace_smooth_t(float3 o, float3 d, float t0, float tmax, float tl, float tf, THit& h) {
+    if (fabsf(d.x) < 1e-7f) d.x = copysignf(1e-7f, d.x);
+    if (fabsf(d.z) < 1e-7f) d.z = copysignf(1e-7f, d.z);
+    float tn = tmax;                                   // end of the near part
+    if (g_tc.far_on) {
+        const float qx = o.x - g_tc.camx, qz = o.z - g_tc.camz;
+        float a, b;
+        tn = (disc_span(qx * qx + qz * qz, qx * d.x + qz * d.z, d.x * d.x + d.z * d.z, g_tc.ring, a, b) && a <= t0 && t0 < b)
+                 ? fminf(b, tmax) : t0;                // outside the ring: far field only
+    }
+    const float tf0 = t0;
+    for (int k = 0; k < 256 && t0 < tn; ++k) {
+        float te = tn;
+        const int r = tr_columns<kMode>(o, d, t0, te, tn, tl, tf, h);
+        if (r == TS_HIT) return true;
+        if (r == TS_MISS) break;
+        if (g_tc.far_on) {
+            if (tr_far(o, d, t0, te, h)) return true;
+        } else {
+            float tx;
+            if ((kInlineVoxels ? trace_voxels(o, d, t0, te, true, false, h, tx)
+                               : trace_voxels_call(o, d, t0, te, true, false, h, tx)) == VX_HIT) return true;
+        }
+        t0 = te;
+    }
+    if (!g_tc.far_on || !(tmax > tn)) return false;
+    return tr_far(o, d, fmaxf(tn, tf0), tmax, h);
+}
+
+// sun rays: the walk inline (k_sun keeps its hit record in registers); voxel
+// mode, now only used without the far field, out of line. kMode FM_LAD: crowns
+// are a leaf-area medium (h.tau must start at 0; the ray's transmittance is
+// e^-tau when it reaches the sun)
+template <int kMode = FM_PLAIN>
+__device__ __forceinline__ bool trace_smooth(float3 o, float3 d, float t0, float tmax, float tl, float tf, THit& h) {
+    return trace_smooth_t<false, kMode>(o, d, t0, tmax, tl, tf, h);
 }
 
 #endif

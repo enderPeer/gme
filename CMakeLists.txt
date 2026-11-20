@@ -97,6 +97,9 @@ if(GME_BUILD_ENGINE AND CMAKE_CUDA_COMPILER)
     src/image.c
     src/gpu.cu
     src/render.cu
+    src/atmo.cu
+    src/gi.cu
+    src/spectral.c
     src/window_win32.c
   )
   target_include_directories(gme PRIVATE src)

@@ -22,3 +22,6 @@
 .vscode/
 Thumbs.db
 .DS_Store
+
+# perf captures written by gme --perf
+/perf_*.csv

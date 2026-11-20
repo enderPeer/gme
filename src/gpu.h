@@ -56,6 +56,9 @@ GmeTileJob*   gpu_staging_tiles(GpuWorld* g, int buf);   /* max_batch tile jobs 
 int gpu_submit(GpuWorld* g, int buf, uint32_t count, uint32_t ntiles, uint32_t seed, const GmePlanet* planet,
                const GmeBioView* bio);
 int gpu_poll(GpuWorld* g, int buf);   /* 1 done, 0 running, -1 error */
+/* M4: a cudaEvent_t that every later batch waits for on the GPU before it writes
+ * the pool or the tile table (the renderer's frame in flight); NULL = none */
+void gpu_world_set_fence(GpuWorld* g, void* ev);
 int gpu_wait(GpuWorld* g, int buf);   /* 0 ok */
 
 /* Synchronous copy of one device slot (validation / debugging). */

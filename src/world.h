@@ -86,8 +86,13 @@ int     world_update(World* w, const WorldPos* viewer); /* 0 ok, -1 fatal */
 int     world_flush(World* w);                          /* wait for in-flight batches */
 void    world_get_stats(const World* w, WorldStats* out);
 
-/* Lookup table + pool for the renderer. Clears the dirty flag. */
+/* Lookup table + pool for the renderer. Clears the dirty flags and hands over
+ * the scatter lists of the entries changed since the last call (M4; valid
+ * until the next world_update). */
 void    world_get_scene(World* w, RenderScene* out);
+/* M4: the renderer's last queued frame (renderer_fence, a cudaEvent_t): the
+ * generation streams wait for it before writing chunk slots or tile records. */
+void    world_set_render_fence(World* w, void* ev);
 
 /* CPU-side voxel query on the host mirror. *loaded = 0 if not resident. */
 uint8_t world_get_voxel(const World* w, int32_t x, int32_t y, int32_t z, int* loaded);

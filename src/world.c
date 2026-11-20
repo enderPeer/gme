@@ -23,6 +23,15 @@
  *   busy, so at most one job is in flight per cell); finish_batch publishes it
  *   when the column is still within radius + 1, and eviction unpublishes it.
  *   The renderer reads only published tiles, exactly like page entries.
+ *
+ * Renderer upload (M4, spec 6.1)
+ *   Every page entry and tile tag that changes is also appended to a scatter
+ *   list (capacity 1/8 of its table); world_get_scene hands the lists to the
+ *   renderer, which scatters only those entries. An overflowing list (or a new
+ *   table) makes the renderer upload the whole table once. The generation
+ *   streams wait for the renderer's last queued frame (world_set_render_fence)
+ *   before writing chunk slots or tile records, which that frame may still be
+ *   reading now that the readback is asynchronous.
  */
 #include "world.h"
 #include "jobs.h"
@@ -98,6 +107,12 @@ struct World {
     GmePageEntry* page;     /* renderer lookup table (toroidal) */
     uint32_t      page_n;
     int           page_dirty;
+    uint32_t*     pdirty;        /* M4 scatter list: page entries changed since world_get_scene */
+    uint32_t      pdirty_n, pdirty_cap;
+    int           pdirty_full;   /* the list overflowed (or the table is new): upload all of it */
+    uint32_t*     tdirty;        /* ... tile tags */
+    uint32_t      tdirty_n, tdirty_cap;
+    int           tdirty_full;
 
     /* column tiles, GPU mode only (toroidal page_n^2, like page) */
     uint32_t*     tile_tag;      /* published tile per cell: gme_tile_key, 0 = none */
@@ -192,6 +207,20 @@ static int any_inflight(const World* w) {
 
 static int fully_loaded(const World* w) {
     return w->have_viewer && w->cursor >= col_count(w, w->radius) && !any_inflight(w);
+}
+
+/* M4 scatter lists: an entry of the page table / tile tags changed */
+static inline void page_changed(World* w, uint32_t idx) {
+    w->page_dirty = 1;
+    if (w->pdirty_full) return;
+    if (w->pdirty_n < w->pdirty_cap) w->pdirty[w->pdirty_n++] = idx;
+    else w->pdirty_full = 1;
+}
+static inline void tile_changed(World* w, uint32_t idx) {
+    w->tile_dirty = 1;
+    if (w->tdirty_full) return;
+    if (w->tdirty_n < w->tdirty_cap) w->tdirty[w->tdirty_n++] = idx;
+    else w->tdirty_full = 1;
 }
 
 static void slot_release(World* w, uint32_t s) {
@@ -363,8 +392,13 @@ World* world_create(const WorldConfig* cfg, const SysInfo* si, const GpuInfo* gi
     /* table wider than the resident diameter so live chunks never collide */
     w->page_n     = (uint32_t)(2 * w->radius_max + 8);
     w->page       = (GmePageEntry*)malloc(sizeof(GmePageEntry) * (size_t)w->page_n * w->page_n * w->layers);
+    w->pdirty_cap = (uint32_t)((size_t)w->page_n * w->page_n * w->layers / 8 + 1);
+    w->pdirty     = (uint32_t*)malloc(sizeof(uint32_t) * w->pdirty_cap);
+    w->tdirty_cap = (uint32_t)((size_t)w->page_n * w->page_n / 8 + 1);
+    w->tdirty     = (uint32_t*)malloc(sizeof(uint32_t) * w->tdirty_cap);
+    w->pdirty_full = w->tdirty_full = 1;          /* the first upload is the whole table */
     if (!w->hkeys || !w->hvals || !w->host_pool || !w->slot_free || !w->recs ||
-        !w->rec_free || !w->missing || !w->evict_mark || !w->page) {
+        !w->rec_free || !w->missing || !w->evict_mark || !w->page || !w->pdirty || !w->tdirty) {
         fprintf(stderr, "world: out of host memory\n");
         goto fail;
     }
@@ -428,6 +462,7 @@ void world_destroy(World* w) {
     free(w->cols); free(w->hkeys); free(w->hvals); free(w->slot_free);
     free(w->recs); free(w->rec_free); free(w->missing); free(w->evict_mark);
     free(w->page);
+    free(w->pdirty); free(w->tdirty);
     free(w->tile_tag); free(w->tile_job_tag); free(w->tile_missing);
     free(w);
 }
@@ -463,10 +498,11 @@ static void finish_batch(World* w, Batch* B, const GmeChunkMeta* meta, const uin
         } else {
             r->uniform = UNIFORM_NONE;
         }
-        GmePageEntry* pe = &w->page[gme_page_index(r->cx, r->cy - w->cfg.min_cy, r->cz, w->page_n, w->layers)];
+        const uint32_t pi = gme_page_index(r->cx, r->cy - w->cfg.min_cy, r->cz, w->page_n, w->layers);
+        GmePageEntry* pe = &w->page[pi];
         pe->tag = gme_page_tag(r->cx, r->cz);
         pe->val = r->slot != NONE ? (int32_t)r->slot : -2 - (int32_t)r->uniform;
-        w->page_dirty = 1;
+        page_changed(w, pi);
         w->n_pending--;
         w->n_ready++;
         w->generated++;
@@ -481,7 +517,7 @@ static void finish_batch(World* w, Batch* B, const GmeChunkMeta* meta, const uin
         if (dx * dx + dz * dz <= r1 * r1) {
             if (w->tile_tag[tj.index] != key) w->tiles_ready += w->tile_tag[tj.index] == 0;
             w->tile_tag[tj.index] = key;
-            w->tile_dirty = 1;
+            tile_changed(w, tj.index);
         }
         w->tiles_built++;
     }
@@ -516,11 +552,12 @@ static void evict(World* w) {
         if (m == 2) { deferred = 1; continue; } /* still generating: retry later */
         ChunkRec* r = &w->recs[i];
         h_remove(w, chunk_key(r->cx, r->cy, r->cz));
-        GmePageEntry* pe = &w->page[gme_page_index(r->cx, r->cy - w->cfg.min_cy, r->cz, w->page_n, w->layers)];
-        if (pe->tag == gme_page_tag(r->cx, r->cz)) { pe->val = GME_PAGE_UNLOADED; w->page_dirty = 1; }
+        const uint32_t pi = gme_page_index(r->cx, r->cy - w->cfg.min_cy, r->cz, w->page_n, w->layers);
+        GmePageEntry* pe = &w->page[pi];
+        if (pe->tag == gme_page_tag(r->cx, r->cz)) { pe->val = GME_PAGE_UNLOADED; page_changed(w, pi); }
         if (w->tile_tag) {   /* the column leaves the view: unpublish its tile */
             const uint32_t ti = gme_page_index(r->cx, 0, r->cz, w->page_n, 1);
-            if (w->tile_tag[ti] == gme_tile_key(r->cx, r->cz)) { w->tile_tag[ti] = 0; w->tiles_ready--; w->tile_dirty = 1; }
+            if (w->tile_tag[ti] == gme_tile_key(r->cx, r->cz)) { w->tile_tag[ti] = 0; w->tiles_ready--; tile_changed(w, ti); }
         }
         if (r->slot != NONE) slot_release(w, r->slot);
         else w->n_uniform_ready--;
@@ -596,7 +633,7 @@ static uint32_t build_batch(World* w, Batch* B) {
                     if (w->tile_tag[ti]) {        /* another column's stale tile: unpublish before overwriting */
                         w->tile_tag[ti] = 0;
                         w->tiles_ready--;
-                        w->tile_dirty = 1;
+                        tile_changed(w, ti);
                     }
                     GmeTileJob tj = { tcx, tcz, ti, 0 };
                     B->tiles[nt++] = tj;
@@ -783,9 +820,13 @@ void world_get_scene(World* w, RenderScene* s) {
     s->layers = w->layers;
     s->min_cy = w->cfg.min_cy;
     s->page_dirty = w->page_dirty;
+    s->page_dirty_idx = w->pdirty_full ? NULL : w->pdirty;   /* M4 scatter list (valid until the next world_update) */
+    s->page_dirty_n = w->pdirty_full ? 0 : w->pdirty_n;
     s->pool = w->gpu ? gpu_world_pool(w->gpu) : NULL;
     s->max_dist = (float)((w->radius > 1 ? w->radius - 1 : 1) * GME_CHUNK_DIM);
     w->page_dirty = 0;
+    w->pdirty_n = 0;
+    w->pdirty_full = 0;
     /* vegetation tint: device cells + regions + palette (sRGB -> linear, gamma 2
      * like the renderer's output encoding) */
     s->bio_cells = (w->gpu && w->cfg.bio.cells) ? gpu_world_biomap(w->gpu) : NULL;
@@ -801,14 +842,20 @@ void world_get_scene(World* w, RenderScene* s) {
     s->tiles = w->gpu ? gpu_world_tiles(w->gpu) : NULL;
     s->tile_tag = w->tile_tag;
     s->tile_dirty = w->tile_dirty;
+    s->tile_dirty_idx = w->tdirty_full ? NULL : w->tdirty;
+    s->tile_dirty_n = w->tdirty_full ? 0 : w->tdirty_n;
     w->tile_dirty = 0;
+    w->tdirty_n = 0;
+    w->tdirty_full = 0;
     s->planet = w->cfg.planet;
     s->seed = w->cfg.seed;
     s->bio = w->cfg.bio;
     s->bio.cells = s->bio_cells;        /* device cells (NULL without life or without GPU) */
     if (!s->bio.cells) s->bio.nreg = 0;
-    s->page_dirty_idx = NULL; s->page_dirty_n = 0;   /* M4 scatter lists */
-    s->tile_dirty_idx = NULL; s->tile_dirty_n = 0;
+}
+
+void world_set_render_fence(World* w, void* ev) {
+    if (w->gpu) gpu_world_set_fence(w->gpu, ev);
 }
 
 int world_surface_q8(const World* w, int32_t x, int32_t z, int32_t* t_q8) {

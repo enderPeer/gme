@@ -57,6 +57,7 @@ struct GpuWorld {
     size_t    bio_cells;
     GmeColTile* d_tiles;     // column tiles, tile_count records (toroidal page_n^2 table)
     uint32_t    tile_count;
+    cudaEvent_t fence;       // M4: the renderer's frame in flight (gpu_world_set_fence), NULL = none
 };
 
 // ---------------------------------------------------------------------------
@@ -134,7 +135,8 @@ k_commit(const GmeGenJob* __restrict__ jobs, const GmeChunkMeta* __restrict__ me
 // One block per tile job: the 36 x 36 columns (h, dev) in parallel, then the
 // same steps as gme_col_tile_finish (density.h) split over the threads: h range
 // by warp shuffles, packing by every thread, the 16 blocks (slot + bounds) by 16
-// threads, the header by one. All integer, so the bytes equal the CPU's
+// threads and the 81 lod4 lattice points (M3) by 81 others, the header and the
+// lod bounds by one. All integer, so the bytes equal the CPU's
 // gme_col_tile_build. direct != 0 writes tile k to out[k] instead of out[index].
 __global__ void __launch_bounds__(TILE_THREADS)
 k_col_tiles(const GmeTileJob* __restrict__ jobs, GmeColTile* __restrict__ out, int direct, uint32_t seed,
@@ -177,8 +179,15 @@ k_col_tiles(const GmeTileJob* __restrict__ jobs, GmeColTile* __restrict__ out, i
     __syncthreads();
     for (int i = threadIdx.x; i < GME_TILE_COLS; i += TILE_THREADS) gme_tile_pack_col(&s_t, i, s_h[i], s_dev[i]);
     if (threadIdx.x < 16) s_fl[threadIdx.x] = gme_tile_block(&s_t, (int)threadIdx.x, s_h, s_dev, seed, &planet, &bio);
+    if (threadIdx.x >= 32 && threadIdx.x < 32 + GME_LOD_N * GME_LOD_N) {   // M3: the 4 m LOD lattice, one point per thread
+        const int k = (int)threadIdx.x - 32;
+        s_t.lod4[k] = (int16_t)gme_tile_lod4_at(s_h, s_dev, k % GME_LOD_N, k / GME_LOD_N);
+    }
     __syncthreads();
-    if (threadIdx.x == 0) gme_tile_header(&s_t, s_fl, s_sat);
+    if (threadIdx.x == 0) {
+        gme_tile_header(&s_t, s_fl, s_sat);
+        gme_tile_lod_bounds(&s_t);
+    }
     __syncthreads();
     const uint4* src = (const uint4*)&s_t;
     uint4* dst = (uint4*)(out + (direct ? blockIdx.x : j.index));
@@ -319,6 +328,9 @@ extern "C" int gpu_submit(GpuWorld* g, int i, uint32_t n, uint32_t ntiles, uint3
         if (!g->d_bio) { snprintf(g_err, sizeof g_err, "biomap view without device cells (gpu_world_set_biomap)"); return -1; }
         bv.cells = g->d_bio;
     }
+    // M4: the renderer reads slots and tiles of the frame it queued last; a slot or tile cell
+    // freed since may be rewritten only after that frame (the GPU waits, the CPU does not)
+    if (g->fence) CK(cudaStreamWaitEvent(b->stream, g->fence, 0));
     if (ntiles) {
         CK(cudaMemcpyAsync(b->d_tjobs, b->h_tjobs, ntiles * sizeof(GmeTileJob), cudaMemcpyHostToDevice, b->stream));
         k_col_tiles<<<ntiles, TILE_THREADS, 0, b->stream>>>(b->d_tjobs, g->d_tiles, 0, seed, *planet, bv);
@@ -337,6 +349,8 @@ extern "C" int gpu_submit(GpuWorld* g, int i, uint32_t n, uint32_t ntiles, uint3
 fail:
     return -1;
 }
+
+extern "C" void gpu_world_set_fence(GpuWorld* g, void* ev) { g->fence = (cudaEvent_t)ev; }
 
 extern "C" int gpu_poll(GpuWorld* g, int i) {
     cudaError_t e = cudaEventQuery(g->b[i].done);
