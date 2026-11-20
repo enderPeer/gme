@@ -223,7 +223,8 @@ GME_HD uint32_t gme_tile_block(GmeColTile* t, int b, const int32_t* h36, const i
     int32_t top = (tmax + 255) >> 8, bot = tmin >> 8;              /* ceil / floor, metres */
     if (fl & GME_TILE_WET) top = top > p->sea_level + 1 ? top : p->sea_level + 1;   /* water plane */
     if (s->trad > 0) {
-        const int32_t ft = s->tcy + s->tvr + 2;                    /* crown top + |dev| <= 1 + rounding */
+        /* crown top + |dev| <= 1 + rounding: the top face of row tbase + ht (version 1: tcy + tvr), every crown class */
+        const int32_t ft = s->tbase + GME_SHAPE_HT(s->theight) + 2;
         top = top > ft ? top : ft;
         fl |= GME_TILE_TREES;
     }
@@ -398,6 +399,114 @@ GME_HD int gme_crown_inside_f(float dx, float dy, float dz, int32_t trad, int32_
 GME_HD int gme_trunk_inside_f(float dx, float y, float dz, const GmeSlot* s) {
     const float r = gme_trunk_radius(s->trad);
     return dx * dx + dz * dz <= r * r && y >= (float)(s->tbase + 1) && y <= (float)(s->tcy + 1);
+}
+
+/* ---- version 2 crowns (flora.h): float twins and the drawn solids ---------------- */
+/* Crown coordinates: (dx, u, dz) with dx, dz from the trunk axis (tx+.5, tz+.5)
+ * and u the height above the bottom face of the crown's lowest voxel row,
+ * u = y - (tbase + ht - ch + 1) on flat ground; r = GmeSlot.trad, ch = GmeSlot.tvr.
+ * gme_crown2_inside_f is gme_crown_v2_inside's inequality in floats, exact at
+ * voxel centres (D2). */
+GME_HD int gme_crown2_inside_f(uint32_t cls, float dx, float u, float dz, int32_t r, int32_t ch) {
+    const float H = (float)ch, rr = (float)(r * r + r), X = dx * dx + dz * dz;
+    if (u < 0.f || u > H) return 0;
+    switch (cls) {
+    case BIO_CROWN_CONE:     return X * H * H <= rr * (H - u) * (H - u);
+    case BIO_CROWN_UMBRELLA: return X * H <= rr * u;
+    case BIO_CROWN_COLUMN:   return X <= rr;
+    case BIO_CROWN_DOME:     return X * H * H + u * u * rr <= rr * H * H;
+    default:                 { const float e = 2.f * u - H, vv = H * H - 1.f; return X * vv + e * e * rr <= rr * vv; }
+    }
+}
+/* the version 2 crown of a slot at absolute height y (flat ground) */
+GME_HD int gme_crown2_inside_slot_f(const GmeSlot* s, float dx, float y, float dz) {
+    return gme_crown2_inside_f(GME_SHAPE_CLASS(s->theight), dx, y - (float)(s->tbase + GME_SHAPE_HT(s->theight) - s->tvr + 1), dz, s->trad, s->tvr);
+}
+
+/* The drawn solid of a crown class: a quadric of revolution about the trunk
+ * axis, clipped to 0 <= u <= H,
+ *     F(dx, u, dz) = (dx^2 + dz^2) / a^2 + k2 w^2 + k1 w - k0 <= 0,  w = u - uc:
+ *   ellipsoid  uc = H / 2, k2 = 4 / (H^2 - 1), k0 = 1
+ *   cone       uc = H (the apex), k2 = -1 / H^2, k0 = 0
+ *   umbrella   uc = 0 (the tip),  k1 = -1 / H,  k0 = 0
+ *   column     k0 = 1
+ *   dome       uc = 0, k2 = 1 / H^2, k0 = 1
+ * (the ellipsoid is listed for completeness: the tracer keeps its own ellipsoid
+ * code for it). Every class is convex, so a ray meets it in one interval. */
+typedef struct GmeCrownQ { float ia2, k2, k1, k0, uc, H; } GmeCrownQ;
+GME_HD void gme_crown_quadric(uint32_t cls, int32_t r, int32_t ch, GmeCrownQ* q) {
+    const float H = (float)ch;
+    q->ia2 = 1.f / (float)(r * r + r);
+    q->H = H; q->uc = 0.f; q->k2 = 0.f; q->k1 = 0.f; q->k0 = 1.f;
+    switch (cls) {
+    case BIO_CROWN_CONE:     q->uc = H; q->k2 = -1.f / (H * H); q->k0 = 0.f; break;
+    case BIO_CROWN_UMBRELLA: q->k1 = -1.f / H; q->k0 = 0.f; break;
+    case BIO_CROWN_COLUMN:   break;
+    case BIO_CROWN_DOME:     q->k2 = 1.f / (H * H); break;
+    default:                 q->uc = 0.5f * H; q->k2 = 4.f / (H * H - 1.f); break;
+    }
+}
+GME_HD float gme_crown_q_F(const GmeCrownQ* q, float dx, float u, float dz) {
+    const float w = u - q->uc;
+    return (dx * dx + dz * dz) * q->ia2 + (q->k2 * w + q->k1) * w - q->k0;
+}
+GME_HD int gme_crown_q_inside(const GmeCrownQ* q, float dx, float u, float dz) {
+    return u >= 0.f && u <= q->H && gme_crown_q_F(q, dx, u, dz) <= 0.f;
+}
+/* The part of the ray (px, pu, pz) + t (dx, dy, dz) inside the solid: t in
+ * [*t0, *t1] (either may be negative: behind the origin). 0 = the ray misses. */
+GME_HD int gme_crown_q_chord(const GmeCrownQ* q, float px, float pu, float pz, float dx, float dy, float dz, float* t0, float* t1) {
+    float a = -3.0e38f, b = 3.0e38f;
+    if (fabsf(dy) > 1e-9f) {                                       /* the slab 0 <= u <= H */
+        const float i = 1.f / dy, s0 = -pu * i, s1 = (q->H - pu) * i;
+        a = s0 < s1 ? s0 : s1;
+        b = s0 < s1 ? s1 : s0;
+    } else if (pu < 0.f || pu > q->H) {
+        return 0;
+    }
+    const float w = pu - q->uc;
+    const float A = q->ia2 * (dx * dx + dz * dz) + q->k2 * dy * dy;              /* F = A t^2 + 2 B t + C */
+    const float B = q->ia2 * (px * dx + pz * dz) + (q->k2 * w + 0.5f * q->k1) * dy;
+    const float C = q->ia2 * (px * px + pz * pz) + (q->k2 * w + q->k1) * w - q->k0;
+    if (fabsf(A) < 1e-7f) {                                        /* linear: a vertical ray (column, umbrella), a ray along the cone's side */
+        if (fabsf(B) < 1e-9f) { if (C > 0.f) return 0; }
+        else { const float tr = -0.5f * C / B; if (B > 0.f) b = b < tr ? b : tr; else a = a > tr ? a : tr; }
+    } else {
+        const float disc = B * B - A * C;
+        if (A > 0.f) {
+            if (disc < 0.f) return 0;
+            const float sq = sqrtf(disc);
+            const float r0 = (-B - sq) / A, r1 = (-B + sq) / A;
+            a = a > r0 ? a : r0;
+            b = b < r1 ? b : r1;
+        } else if (disc > 0.f) {                                   /* the cone, a ray steeper than its side: it is inside the lower */
+            const float sq = sqrtf(disc);                          /* nappe before the first root (climbing) or after the second */
+            if (dy > 0.f) { const float r0 = (-B + sq) / A; b = b < r0 ? b : r0; }
+            else          { const float r1 = (-B - sq) / A; a = a > r1 ? a : r1; }
+        }
+    }
+    if (!(b > a)) return 0;
+    *t0 = a;
+    *t1 = b;
+    return 1;
+}
+/* Distance estimate to the solid's surface at a point (negative inside): the
+ * quadric's first-order distance F / |grad F| and the two cap planes. face: 0
+ * the quadric, -1 the bottom cap, +1 the top cap (the nearest). */
+GME_HD float gme_crown_q_de(const GmeCrownQ* q, float dx, float u, float dz, int* face) {
+    const float w = u - q->uc;
+    const float gx = 2.f * q->ia2 * dx, gz = 2.f * q->ia2 * dz, gy = 2.f * q->k2 * w + q->k1;
+    const float F = (dx * dx + dz * dz) * q->ia2 + (q->k2 * w + q->k1) * w - q->k0;
+    float d = F / sqrtf(gx * gx + gy * gy + gz * gz + 1e-12f);
+    int f = 0;
+    if (-u > d) { d = -u; f = -1; }
+    if (u - q->H > d) { d = u - q->H; f = 1; }
+    if (face) *face = f;
+    return d;
+}
+/* crown volume per footprint area and metre of H (LAD = LAI / (H x this)): cone 1/3, umbrella 1/2, column 1, dome 2/3 */
+GME_HD float gme_crown_fill(uint32_t cls) {
+    return cls == BIO_CROWN_CONE ? (1.f / 3.f) : (cls == BIO_CROWN_UMBRELLA ? 0.5f : (cls == BIO_CROWN_COLUMN ? 1.f : (2.f / 3.f)));
 }
 
 /* Kelp strand length of column (x, z) of height h in a slot of cell `cell`:

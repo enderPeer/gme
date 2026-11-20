@@ -24,6 +24,8 @@ typedef unsigned long long uint64_t;
  * depend on thread order */
 #define BIO_ADD64(p, v) atomicAdd((unsigned long long*)(p), (unsigned long long)(int64_t)(v))
 #define BIO_ADD32(p, v) atomicAdd((unsigned int*)(p), (unsigned int)(v))
+#define BIO_MAX32(p, v) atomicMax((unsigned int*)(p), (unsigned int)(v))
+#define BIO_MIN64(p, v) atomicMin((unsigned long long*)(p), (unsigned long long)(v))
 #define BIO_DP4A(a, b, c) __dp4a((int)(a), (int)(b), (int)(c))
 #define BIO_UNROLL _Pragma("unroll")
 #else
@@ -45,6 +47,35 @@ static inline int bio_dp4a_c(int a, int b, int c) {
     return c;
 }
 #define BIO_DP4A(a, b, c) bio_dp4a_c((int)(a), (int)(b), (int)(c))
+/* atomic max / min: commutative, so the result does not depend on thread order */
+static inline void bio_max32_c(uint32_t* p, uint32_t v) {
+#if defined(_MSC_VER)
+    long cur = *(volatile long*)p;
+    while ((uint32_t)cur < v) {
+        const long seen = _InterlockedCompareExchange((volatile long*)p, (long)v, cur);
+        if (seen == cur) break;
+        cur = seen;
+    }
+#else
+    uint32_t cur = __atomic_load_n(p, __ATOMIC_RELAXED);
+    while (cur < v && !__atomic_compare_exchange_n(p, &cur, v, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+#endif
+}
+static inline void bio_min64_c(uint64_t* p, uint64_t v) {
+#if defined(_MSC_VER)
+    long long cur = *(volatile long long*)p;
+    while ((uint64_t)cur > v) {
+        const long long seen = _InterlockedCompareExchange64((volatile long long*)p, (long long)v, cur);
+        if (seen == cur) break;
+        cur = seen;
+    }
+#else
+    uint64_t cur = __atomic_load_n(p, __ATOMIC_RELAXED);
+    while (cur > v && !__atomic_compare_exchange_n(p, &cur, v, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+#endif
+}
+#define BIO_MAX32(p, v) bio_max32_c((uint32_t*)(p), (uint32_t)(v))
+#define BIO_MIN64(p, v) bio_min64_c((uint64_t*)(p), (uint64_t)(v))
 #endif
 
 /* accumulators private to one thread (GPU, reduced by warp shuffles in the
@@ -63,6 +94,25 @@ static inline int bio_dp4a_c(int a, int b, int c) {
 #define BIO_ATMG         7            /* = BIO_ATM_N of bio_api.h */
 #define BIO_LAI_BANDS    8
 #define BIO_KIN_BUCKETS  16
+#define BIO_PSLOTS       4            /* predator offers per cell per step (power of two) */
+#define BIO_MSLOTS       2            /* mate offers per cell per step (power of two) */
+#define BIO_NB           9            /* light bands: 8 of 45 nm (380-740 nm) + NIR 740-900 nm (spectrum_file.h) */
+#define BIO_NHAZE        8
+#define BIO_NHUE         16
+#define BIO_NDEPTH       33
+
+/* ---- features (BioParams.feat). All off = the simulation of the first public
+ * release, bit for bit: every checkpoint written before these existed carries 0
+ * and resumes exactly as it would have with the binary that wrote it. ------------- */
+#define BIO_FEAT_PRED   1u    /* animals: predation and grazing, gut, trophic level, predator / prey senses */
+#define BIO_FEAT_SEX    2u    /* sexual reproduction: crossover with a compatible cellmate (mate tags) */
+#define BIO_FEAT_LEARN  4u    /* learning by exploration (replaces the plain Hebbian rule) */
+#define BIO_FEAT_MORPH  8u    /* plant shapes: crown class, aspect, leaf angle, porosity, Q band width */
+#define BIO_FEAT_HUB    16u   /* per-realm gas exchange ledgers for the planet-wide atmosphere (island hub) */
+#define BIO_FEAT_ALL    31u
+/* light model (BioParams.light_mode) */
+#define BIO_LIGHT_SCALAR   0   /* one PAR number: S_top x par_q12 x haze */
+#define BIO_LIGHT_SPECTRAL 1   /* 9 wavelength bands from a GMESPEC1 file (spectrum_crc names it) */
 
 /* genome body genes (spec 3.2) */
 enum {
@@ -71,6 +121,9 @@ enum {
     BG_ARMOR = 16, BG_PIGMENT, BG_HUE, BG_UVSHIELD, BG_SENSE, BG_REPRO_E, BG_OFFS, BG_DISPERSE,
     BG_MUT = 24, BG_ETA, BG_DECAY, BG_PLASTIC, BG_NEURONS, BG_THINK, BG_TOPT, BG_TTOL,
     BG_O2TOL = 32, BG_SEX, BG_LIFESPAN, BG_KINSHARE, BG_STORE,
+    /* plant morphology (active with BIO_FEAT_MORPH, neutral before): crown class,
+     * height : width, leaf angle, crown porosity, width of the pigment's Q band */
+    BG_CROWN = 37, BG_ASPECT, BG_LEAFANG, BG_POROSITY, BG_QWIDTH,
     BG_NEUTRAL0 = 48
 };
 
@@ -86,7 +139,10 @@ enum { BF_DIC = 0, BF_DOC, BF_NH4, BF_PO4, BF_FE2, BF_H2S, BF_SO4, BF_O2, BF_CH4
 
 /* per-agent request scratch (written by k_pre, read by k_metab) */
 /* BR_FIXA / BR_FIXO: the parts of BR_FIX reduced with H2S (ANOX) or water (OXY) */
-enum { BR_PATH = 0, BR_FIX = 8, BR_ASSIM, BR_NH4, BR_PO4, BR_WATER, BR_AUX, BR_FIXA, BR_FIXO, BR_N };
+/* BR_PRED / BR_BITE (predation): written by the prey in k_pre (the predator it
+ * offers itself to, the carbon at stake) and again in k_metab (what it tells the
+ * predator about itself, the carbon actually lost); read by the predator in k_feed */
+enum { BR_PATH = 0, BR_FIX = 8, BR_ASSIM, BR_NH4, BR_PO4, BR_WATER, BR_AUX, BR_FIXA, BR_FIXO, BR_PRED, BR_BITE, BR_N };
 
 /* agent flags */
 #define BA_ALIVE   1u
@@ -95,6 +151,7 @@ enum { BR_PATH = 0, BR_FIX = 8, BR_ASSIM, BR_NH4, BR_PO4, BR_WATER, BR_AUX, BR_F
 #define BA_DEAD    8u     /* died this step (genome slot not yet freed) */
 #define BA_BIRTH   16u    /* reproduces this step */
 #define BA_THOUGHT 32u    /* ran its brain this step */
+#define BA_HUNT    64u    /* offered to attack this step (k_summary .. k_feed) */
 
 /* cached traits (derived from the genome at birth): bits 0-3 kin bucket,
  * 4-11 pigment, 12 holdfast >= 128, 13 motile, 14 phototroph-capable,
@@ -105,6 +162,30 @@ enum { BR_PATH = 0, BR_FIX = 8, BR_ASSIM, BR_NH4, BR_PO4, BR_WATER, BR_AUX, BR_F
 #define BT_MOTILE    (1u << 13)
 #define BT_PHOTO     (1u << 14)
 #define BT_PERIOD(t) ((((t) >> 16) & 63u) + 1u)
+/* second cached trait word (also from the genome at birth): bits 0-7 motor,
+ * 8-15 mouth, 16-20 size class (G_SIZE / 10: an individual weighs about 2^class
+ * mmol C), 21-23 crown class, 24-26 aspect bin, 27-30 leaf angle class
+ * (16 steps), 31 sexual (G_SEX >= 128) */
+#define BT2_MOTOR(t)   ((t) & 255u)
+#define BT2_MOUTH(t)   (((t) >> 8) & 255u)
+#define BT2_SIZEC(t)   (((t) >> 16) & 31u)
+#define BT2_CROWN(t)   (((t) >> 21) & 7u)
+#define BT2_ASPECT(t)  (((t) >> 24) & 7u)
+#define BT2_LEAFANG(t) (((t) >> 27) & 15u)
+#define BT2_SEXUAL     (1u << 31)
+/* gape: the largest individual (mmol C) an attacker can swallow: its own size x MOUTH / 32 */
+#define BT2_GAPE(t)    ((((uint64_t)1 << BT2_SIZEC(t)) * BT2_MOUTH(t)) >> 5)
+
+/* ecology word of an agent (BioWorld.eco; all zero for a newly seeded agent):
+ * bits 0-7   trophic level above 1, in 1/16 (0 = a producer's level 1)
+ * bits 8-15  share of its organic carbon intake that came from its gut (prey), q8, moving average
+ * bits 16-23 share of its meals that were producers on dry land, q8, moving average
+ * bits 24-31 generations in a row born to a land animal (saturating) */
+#define BE_TROPH(e)    ((e) & 255u)
+#define BE_GUTSHARE(e) (((e) >> 8) & 255u)
+#define BE_LANDPROD(e) (((e) >> 16) & 255u)
+#define BE_LANDGEN(e)  (((e) >> 24) & 255u)
+#define BE_MAKE(troph, gut, land, gen) ((uint32_t)(troph) | ((uint32_t)(gut) << 8) | ((uint32_t)(land) << 16) | ((uint32_t)(gen) << 24))
 
 /* 64-bit accumulators in BioGlobals.acc (all exact integer sums) */
 enum {
@@ -122,6 +203,21 @@ enum {
     BACC_ATMD = 32,                   /* 7 pending atmosphere deltas (env -> box) */
     BACC_N = 40
 };
+/* second accumulator block (BioGlobals.acc2), written only by the features
+ * above. Kernels address both blocks through one index space: k < BACC_N is
+ * acc[k], BACC_N + j is acc2[j]. */
+enum {
+    BACC2_XLAND = 0,                  /* 7: cumulative gas flux atmosphere -> land cells (BIO_FEAT_HUB) */
+    BACC2_XALL = 7,                   /* 7: cumulative gas flux atmosphere -> all cells */
+    BACC2_PRED_C = 14,                /* carbon moved from prey into guts */
+    BACC2_KILLS,                      /* prey eaten whole */
+    BACC2_BITES,                      /* bites out of colonies (grazing) */
+    BACC2_SEXB,                       /* births with a second parent */
+    BACC2_GUT_C,                      /* gut carbon respired or assimilated */
+    BACC2_N = 24
+};
+#define BACC_TOT (BACC_N + BACC2_N)
+#define BACC_X(j) (BACC_N + (j))      /* combined index of acc2[j] */
 
 /* ---- genome (spec 3.2), 384 B, immutable for the agent's life ----------------- */
 typedef struct BioGenome {
@@ -186,11 +282,25 @@ typedef struct BioParams {
     int32_t atm_scale_ppm;
     int32_t closed_box;                                 /* 1: no vents, weathering, burial, exchange */
     int32_t mut_off;                                    /* 1: no mutation (null control) */
-    int32_t learn_off;                                  /* 1: eta forced to 0 (test) */
+    int32_t learn_off;                                  /* 1: eta forced to 0 (test); 2: explore but never change a weight (control) */
     int32_t brain_off;                                  /* 1: outputs fixed at the biases (test) */
     int32_t light_off;                                  /* 1: no light (null control) */
     int32_t grow_off;                                   /* 1: no growth or birth (light profile test) */
-    int32_t reserved[16];
+    /* ---- what used to be reserved[16]; all zero = the first release's behaviour ---- */
+    int32_t light_mode;                                 /* BIO_LIGHT_* */
+    int32_t spectrum_crc;                               /* crc32 of the GMESPEC1 payload the run uses (bits of a u32) */
+    int32_t feat;                                       /* BIO_FEAT_* */
+    int32_t eff_sp_anox_q16, eff_sp_oxy_q16;            /* spectral harvest: eu per step per (umol photons/s x eV), q16, set at creation */
+    int32_t pred_bite_q10;                              /* bite out of a colony: C_att x MOUTH/255 x this >> 10 */
+    int32_t pred_kill_q8;                               /* share of a prey eaten whole that reaches the gut (rest -> DOC) */
+    int32_t gut_k_q8;                                   /* gut half saturation: this x C >> 8 */
+    int32_t explore_q7;                                 /* exploration: output noise amplitude at ETA 255, q7 */
+    int32_t morph_pmax;                                 /* light saturation of a crown: eu per step per m^2 of sunlit leaf */
+    int32_t morph_gain_q8;                              /* harvest gain of the crown model (keeps a reference plant's yield) */
+    int32_t qwidth_cost_q8;                             /* pigment cost of the widest Q band, relative to the pigment cost, q8 */
+    int32_t pred_refuge1;                               /* 1 + hiding places per cell: that many of its non-motile agents cannot be found */
+    int32_t learn_shift;                                /* exploration learning: weight step = ETA x reward x nudge x hidden >> this */
+    int32_t reserved[2];
 } BioParams;
 
 /* ---- lookup tables (built by integer routines, uploaded) ------------------------ */
@@ -200,7 +310,23 @@ typedef struct BioTables {
     int32_t q10_q16[128];       /* 65536 * 2^((i-64)/10) */
     int32_t sigmoid_q16[256];   /* 65536 / (1 + exp(-(i-128)/32)) */
     int8_t  tanh_q7[256];       /* 127 * tanh((i-128)/64) */
+    /* leaf projection (Goudriaan): k = G(theta) / cos(theta) for 16 leaf angle
+     * classes (erect .. flat) and the 24 hours, q12, capped at 8.0; 0 at night.
+     * 4096 = flat leaves (every hour). Built by bio_build_tables. */
+    int32_t kleaf_q12[16][24];
 } BioTables;
+
+/* ---- spectral light tables (GMESPEC1, spectrum_file.h): loaded by the host,
+ * uploaded, read-only. Integer only. --------------------------------------------- */
+typedef struct BioSpectral {
+    int32_t surf_q16[BIO_NHAZE][24][BIO_NB];   /* band irradiance on a horizontal surface / S_top */
+    int32_t water_q16[BIO_NB][BIO_NDEPTH];     /* band transmittance of 0..32 m of water */
+    int32_t kw_q16[BIO_NB];                    /* attenuation per m below 32 m (bio_light's kw scale) */
+    int32_t phot_q16[BIO_NB];                  /* umol photons per J */
+    int32_t ev_q16[BIO_NB];                    /* mean photon energy, eV */
+    int32_t uphill_q16[BIO_NB][2];             /* usable share of a band's photons: [0] OXY, [1] ANOX */
+    int32_t eps_q12[BIO_NHUE][BIO_NB];         /* pigment shape per hue bin */
+} BioSpectral;
 
 /* ---- per-step globals, device resident --------------------------------------- */
 typedef struct BioGlobals {
@@ -216,7 +342,13 @@ typedef struct BioGlobals {
     int32_t day_sin_q12;            /* signed diurnal sine */
     int32_t birth_q16;              /* share of eligible parents allowed to reproduce (capacity guard) */
     uint32_t think_n;               /* agents due to think this step (list in BioWorld.pre_a) */
+    /* ---- appended after the first release (a checkpoint of that release stops
+     * above this line and loads with zeros below) ---- */
+    int64_t acc2[BACC2_N];          /* second accumulator block (BACC2_*) */
+    int32_t i0b_q8[BIO_NB];         /* spectral: band irradiance at the surface this step, W/m^2 q8 */
+    int32_t pad_g[3];
 } BioGlobals;
+#define BIO_GLOBALS_V2_BYTES 520   /* sizeof(BioGlobals) of the first release */
 
 /* ---- the world as kernels see it (passed BY VALUE to every kernel) ------------
  * Pointers are device pointers on the GPU path and host pointers on the CPU
@@ -268,13 +400,31 @@ typedef struct BioWorld {
     uint32_t* fstack;
     /* stats partials [block * BIO_STAT_N + k] */
     int64_t* part;
+    /* ---- added with the features (bio_types.h BIO_FEAT_*) ---- */
+    const BioSpectral* SP;           /* spectral light tables; valid when P.light_mode == BIO_LIGHT_SPECTRAL */
+    uint32_t* pslot;                 /* [k * n_cells + c], k < BIO_PSLOTS: predator offers of this step */
+    uint32_t* mslot;                 /* [k * n_cells + c], k < BIO_MSLOTS: mate offers of this step */
+    uint32_t* thr;                   /* per cell: reach (largest prey body) of its strongest attacker this step */
+    uint32_t* nmot;                  /* per cell: movers (a real motor and no photosynthesis, bio_mover) this step */
+    uint64_t* claim;                 /* per agent: the prey that offered itself to this attacker (minimum wins) */
+    uint32_t* tr2;                   /* per agent: second cached trait word (BT2_*) */
+    uint32_t* eco;                   /* per agent: ecology word (BE_*) */
+    uint64_t* expl;                  /* per agent: exploration of the last think, 8 x int8 (BIO_FEAT_LEARN) */
 } BioWorld;
 
 /* stats partial layout (per block, int64) */
 enum {
     BS_LIVE = 0, BS_MOTILE, BS_SPHOTO, BS_CMAR, BS_CCOAST, BS_CLAND, BS_C, BS_N, BS_P,
-    BS_THINK, BS_ABSDW, BS_NEGA, BS_AGENT_N, BS_GENE = 16, BS_FLD = 80, BS_VEG = 92, BS_O2CELLS, BS_NEGF, BIO_STAT_N = 96
+    BS_THINK, BS_ABSDW, BS_NEGA,
+    BS_CONSUMER,          /* agents living mostly on prey (gut share > 1/2) */
+    BS_TROPH,             /* sum of their trophic level above 1, in 1/16 */
+    BS_LANDANIM,          /* gate G4: creatures that are fast consumers of land producers on dry land, 5+ generations */
+    BS_SEXUAL,            /* agents with G_SEX >= 128 */
+    BS_CREATURE,          /* creatures (bio_creature): what the engine is given to draw as animals */
+    BS_AGENT_N, BS_GENE = 24, BS_FLD = 88, BS_VEG = 100, BS_O2CELLS, BS_NEGF, BIO_STAT_N = 104
 };
+/* A creature moves at least this fast at full effort (MOTOR 16: 1 m per step) unless it lives on prey. */
+#define BIO_CREATURE_MOTOR 16
 
 /* ---- RNG: stateless hash, a copy of gme_hash3 (worldgen.h) -------------------- */
 BIO_FN uint32_t bio_hash(int32_t x, int32_t y, int32_t z, uint32_t seed) {
@@ -290,6 +440,10 @@ BIO_FN uint32_t bio_hash(int32_t x, int32_t y, int32_t z, uint32_t seed) {
 
 /* hash purposes (third argument) */
 enum { BH_TIDE = 1, BH_DRIFT, BH_MOVE, BH_SR, BH_DEATH, BH_KINP, BH_BIRTH, BH_MUT, BH_MACRO,
-       BH_LEARN, BH_SEED, BH_COST, BH_IMPORT, BH_DISP, BH_TAG };
+       BH_LEARN, BH_SEED, BH_COST, BH_IMPORT, BH_DISP, BH_TAG,
+       /* purposes of the features; far from the ranges the first release derives
+        * from the ones above (BH_LEARN * 64 + ..., BH_MUT + 64, BH_SR + 16, ...) */
+       BH_PSLOT = 4096, BH_PMASK, BH_PREY, BH_CLAIM, BH_ROLL, BH_MSLOT, BH_MMASK, BH_MATE, BH_CROSS, BH_EXPL,
+       BH_HIDE };
 
 #endif

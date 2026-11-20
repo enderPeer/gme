@@ -729,6 +729,14 @@ double spectral_pigment_eps(double l, int bin) {
     const double ds = (l - 435) / 30.0, dq = (l - lq) / 25.0;
     return 1.2 * exp(-0.5 * ds * ds) + exp(-0.5 * dq * dq) + 0.15 * s;
 }
+/* version 2 (spec 5.3, gene BG_QWIDTH): the Q band's width is the cell's, 15 .. 60 nm */
+double spectral_pigment_eps_w(double l, int bin, double wq) {
+    if (bin <= 0 || bin >= SPEC_NHUE) bin = SPEC_HUE_DEFAULT;
+    const double lq = 383.0 + 34.13 * bin;
+    const double s = l < 690 ? 1.0 : (l > 740 ? 0.0 : (740 - l) / 50.0);
+    const double ds = (l - 435) / 30.0, dq = (l - lq) / wq;
+    return 1.2 * exp(-0.5 * ds * ds) + exp(-0.5 * dq * dq) + 0.15 * s;
+}
 static double pigment_A_nm(double l, int bin, double pig) { return 1 - pow(10.0, -pig / 255.0 * 4.0 * spectral_pigment_eps(l, bin)); }
 double spectral_leaf_rho_nm(double l, int bin, double pig) { return 0.04 + 0.44 * (1 - pigment_A_nm(l, bin, pig)); }
 /* band means at 1 nm of the absorptance, and the tissue spectra built from it:
@@ -749,6 +757,20 @@ static void build_pigments(SpectralAtmo* a) {
         for (int i = 0; i < 160; ++i) s += pigment_A_nm(740.5 + i, h, SPEC_PIG_REF);
         a->pig_A_nir[h] = s / 160.0;
     }
+    /* version 2: the same band means for the pigment amounts and Q band widths a biomap's morphology
+     * can carry (OD = PIG / 255 x 4 x eps is linear in PIG: one eps per nm serves the 15 levels) */
+    for (int h = 0; h < SPEC_NHUE; ++h)
+        for (int w = 0; w < SPEC_NQW; ++w)
+            for (int b = 0; b < SPEC_NB; ++b) {
+                double eps[45];
+                for (int i = 0; i < 45; ++i) eps[i] = spectral_pigment_eps_w(SPEC_L0 + SPEC_BW * b + i + 0.5, h, SPEC_QW_NM(w));
+                for (int L = 0; L < SPEC_NPIG; ++L) {
+                    const double k = -17.0 * (L + 1) / 255.0 * 4.0 * 2.302585092994046;   /* 10^-OD = e^(k eps) */
+                    double s = 0;
+                    for (int i = 0; i < 45; ++i) s += 1.0 - exp(k * eps[i]);
+                    a->pig_A2[h][L][w][b] = (float)(s / 45.0);
+                }
+            }
 }
 
 /* smooth band reflectance basis: minimum-slope spectra whose colour under an

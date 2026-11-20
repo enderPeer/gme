@@ -440,6 +440,11 @@ World* world_create(const WorldConfig* cfg, const SysInfo* si, const GpuInfo* gi
             fprintf(stderr, "world: biomap upload failed: %s\n", gpu_last_error());
             goto fail;
         }
+        /* version 2: the morphology words, parallel to the cells */
+        if (cfg->bio.cells && cfg->bio.morph && gpu_world_set_biomorph(w->gpu, cfg->bio.morph, bio_view_cells(&cfg->bio))) {
+            fprintf(stderr, "world: biomap morphology upload failed: %s\n", gpu_last_error());
+            goto fail;
+        }
     }
     for (int b = 0; b < w->nbuf; ++b) {
         Batch* B = &w->batch[b];
@@ -878,6 +883,8 @@ void world_get_scene(World* w, RenderScene* s) {
     s->bio = w->cfg.bio;
     s->bio.cells = s->bio_cells;        /* device cells (NULL without life or without GPU) */
     if (!s->bio.cells) s->bio.nreg = 0;
+    /* version 2: the device morphology words (NULL: version 1 shapes, for the fallback classes too) */
+    s->bio.morph = (w->gpu && w->cfg.bio.cells && w->cfg.bio.morph) ? gpu_world_biomorph(w->gpu) : NULL;
 }
 
 void world_set_render_fence(World* w, void* ev) {

@@ -4,7 +4,7 @@ GME is an experimental game engine in **C17 + CUDA**. It builds its world from f
 
 1. **A star system forms.** A star and a dust disk; planetesimals collide and merge into planets through GPU N-body gravity. Rock, ice and gas are sorted by the disk's temperature.
 2. **Chemistry decides the materials.** The chosen planet's crust becomes atoms with real valences (H1, O2, N3, C4, Si4, …). They form, break and swap bonds by real bond energies while the planet cools. What survives becomes the building blocks: granite or basalt, iron ore, sulfides, water, the atmosphere's gases, and organics. Carbon is the atom with the most varied bonds.
-3. **Life evolves.** Self-copying organisms carry an energy budget, a genome of enzymes and body genes, and a small neural network. They evolve on islands of the real terrain, starting at hydrothermal vents. Phototrophs, oxygenic photosynthesis and land plants emerge without scripting. The simulation is integer-only, so a run is bit-identical on every GPU and on the CPU.
+3. **Life evolves.** Self-copying organisms carry an energy budget, a genome of enzymes and body genes, and a small neural network. They evolve on islands of the real terrain, starting at hydrothermal vents. Phototrophs, oxygenic photosynthesis and land plants emerge without scripting; grazers and hunters, sexual reproduction, learning within a lifetime, pigments tuned to the light they get and crown shapes follow from the same genes. The simulation is integer-only, so a run is bit-identical on every GPU and on the CPU.
 4. **The world is streamed and rendered on the GPU.** A sparse voxel world is sized to the machine, and a CUDA ray tracer shows it. Evolved vegetation becomes part of the voxel world.
 
 The heavy stages run headless on a small GPU cluster over SSH. The rigs need only the NVIDIA driver: GPU code is compiled at run time with NVRTC, so no CUDA toolkit is required there.
@@ -21,7 +21,7 @@ The heavy stages run headless on a small GPU cluster over SSH. The rigs need onl
 |---|---|
 | ![evolved](docs/images/evolved_world.jpg) | ![sunset](docs/images/sunset.jpg) |
 
-**Status:** research prototype, Windows-first (headless Linux build for render nodes). Star system formation, chemistry and the integer life simulation work end to end. On the current planet, life has run for 3,000+ simulated years on two cluster GPUs: oxygenic photosynthesis took over, an oxidation event followed, and 70–78% of the islands are vegetated. The renderer upgrade (smooth density surfaces, 8-band spectral light, far field to 32 km, bounced light, pigment colours; [docs/render-upgrade-spec.md](docs/render-upgrade-spec.md)) is built, reviewed and fixed; `--quality classic|low|medium|high|ref` picks the renderer (classic = the original voxel ray tracer). Animals (predation), creature rendering and a walkable player are not built yet.
+**Status:** research prototype, Windows-first (headless Linux build for render nodes). Star system formation, chemistry and the integer life simulation work end to end. On the current planet, life has run for 3,000+ simulated years on two cluster GPUs: oxygenic photosynthesis took over, an oxidation event followed, and 70–78% of the islands are vegetated. The renderer upgrade (smooth density surfaces, 8-band spectral light, far field to 32 km, bounced light, pigment colours; [docs/render-upgrade-spec.md](docs/render-upgrade-spec.md)) is built, reviewed and fixed; `--quality classic|low|medium|high|ref` picks the renderer (classic = the original voxel ray tracer). Animals (predation and grazing), sexual reproduction, learning, light in wavelength bands, crown shapes, the island hub and seed banks are built as features of the life simulation, and the engine draws evolved crown shapes and creatures. On the evolved islands animals start from very little (see [docs/biosphere-spec.md](docs/biosphere-spec.md) 10.1); a walkable player is not built yet.
 
 ## Requirements
 
@@ -43,7 +43,7 @@ From PowerShell (the `.\` prefix is required there):
 
 View options: `--width`, `--height`, `--scale 0.5` (render at a lower resolution), `--fps N` (0 means uncapped), `--spawn X Z [EYE]`, `--look YAW PITCH`, `--region K` (start at the coast of life island K), `--frames N --screenshot file.png` (render N frames, save, exit).
 
-World options: `--vram 0..1` (share of free VRAM for chunks, default 0.6), `--ram 0..1` (share of free RAM for the host mirror, default 0.5), `--batch N`, `--radius N`, `--seed N`, `--planet file`, `--biomap file` / `--no-life` / `--biomap-test`.
+World options: `--vram 0..1` (share of free VRAM for chunks, default 0.6), `--ram 0..1` (share of free RAM for the host mirror, default 0.5), `--batch N`, `--radius N`, `--seed N`, `--planet file`, `--biomap file` / `--no-life` / `--biomap-test` / `--biomap-test2` (the test pattern with every crown class and aspect), `--sky-planet` (the planet file's atmosphere instead of the one life has made), `--fauna file` (creatures; default `life/home.fauna` if present) / `--no-fauna` / `--fauna-test [N]` (a built-in herd around the view point).
 
 ## Genesis: booting a world from physics
 
@@ -77,11 +77,40 @@ Life is simulated offline by `gme_genesis` on square **islands** of real terrain
 .\build\gme_genesis.exe life-test                        # test suite (--cpu for the CPU reference)
 ```
 
-`life` options: `--device D` or `--cpu`, `--cap N` agents (0 = from free memory), `--duty 0..1` (share of GPU time), `--years Y` / `--days D` (0 = forever), `--minutes M` (wall-clock limit), `--checkpoint-min M` (default 30; the last 3 checkpoints are kept), `--salt S`, `--seed-protocells N` (default 20000), `--maps-every Y`, `--metrics-every D`. It exits 3 when life goes extinct. One step is one hour, one sim-year is 8760 steps.
+`life` options: `--device D` or `--cpu`, `--cap N` agents (0 = from free memory), `--duty 0..1` (share of GPU time), `--years Y` / `--days D` (0 = forever), `--minutes M` (wall-clock limit), `--checkpoint-min M` (default 30; the last 3 checkpoints are kept), `--salt S`, `--seed-protocells N` (default 20000), `--maps-every Y`, `--metrics-every D`, `--features LIST` / `--enable LIST`, `--spectrum FILE` / `--no-spectrum`, `--bank FILE` (found the run from a seed bank), `--no-hub`. It exits 3 when life goes extinct. One step is one hour, one sim-year is 8760 steps.
 
-A run folder holds `env.bin`, `ckpt_*.bin`, `metrics.csv` (daily: population, carbon by realm, pathway fluxes, atmosphere, conservation residuals, mean genes), `census.csv` (yearly carbon by guild and realm), `stages.log` (gates G0–G5, interventions) and `maps/` (yearly PNGs). `biostat --run DIR` summarises the newest checkpoint.
+A run folder holds `env.bin`, `ckpt_*.bin`, `metrics.csv` (daily: population, carbon by realm, pathway fluxes, atmosphere, conservation residuals, mean genes, animals and sex), `census.csv` (yearly carbon by guild and realm, species count), `stages.log` (gates G0–G5, interventions), `maps/` (yearly PNGs) and, with the hub, `outbox/`, `inbox/` and `imported/`. `biostat --run DIR` summarises the newest checkpoint.
 
 Compressions to know about: the island atmosphere is a box of 1e-4 of the real air column, tides are ±1 m, one agent is a clonal colony (super-individual) of up to 1e9 mmol C, and the population is held at 0.95 of `--cap` by a fair birth lottery. Each island has its own land-barrier multiplier (×0.7 … ×1.3) as a parameter study.
+
+### Features: animals, sex, learning, light in bands, plant shapes, the hub
+
+Six additions are **features** of a run ([docs/biosphere-spec.md](docs/biosphere-spec.md) section 10):
+
+| Feature | What it adds |
+|---|---|
+| `animals` | Predation and grazing: a mouth, a motor and the will to attack make an animal. Prey is edible when one of its individuals fits the attacker's gape; anchored colonies are grazed in bites, but only by attackers that can move a metre an hour (the slower ones take what comes to them). A gut, trophic levels, senses for danger and food, and the land-animal gate G4. |
+| `sex` | A parent with the sex gene crosses its genome with a compatible cellmate (mate tags within 3 bits), block by block. Alone it still reproduces alone. |
+| `learn` | Learning by exploration: plastic outputs try small random nudges and keep what paid. On the foraging test it beats no learning by 26% and beats the same exploration with frozen weights by 9%. |
+| `spectral` | Light in 9 wavelength bands from `life/spectrum.bin` (written by `gme --export-spectrum`): water takes the red first, methane haze colours the sky, and a pigment only harvests the photons its reaction centre can use. |
+| `morph` | Crown shapes: class (ellipsoid, cone, umbrella, column, dome), height : width, leaf angle, porosity. A crown catches no more light than falls on it, leaves saturate in strong light, and plants shade each other with what they intercept; shapes are exported to the engine. Switching it on in an evolved world re-sorts its vegetation: on island 1 the shrub cells fell from 23% to 11% in one sim-year and to 7% in three (spec 10.6). Try it on one island first. |
+| `hub` | The island keeps the books the planet-wide atmosphere needs and trades emigrants through its outbox and inbox. |
+
+A **new** run has all of them by default, light in bands only when `life/spectrum.bin` is there (choose with `--features animals,sex,...` or `none`; an explicit `all` or `spectral` requires the file). A **resumed** run keeps the features of its checkpoint: a new build changes nothing on a running island. `life --resume --enable LIST` switches features on in a living world; that is logged in `stages.log` as an intervention. With every feature off the simulation is the first release, bit for bit, which the test suite checks against recorded state hashes.
+
+```
+.\build\gme.exe --export-spectrum life/spectrum.bin              # the planet's light in bands, once per planet
+.\build\gme_genesis.exe life --island 5 --resume --enable animals,sex   # switch features on in a running world
+.\build\gme_genesis.exe biostat --run DIR --species              # species = clusters of similar genomes
+.\build\gme_genesis.exe life-hub --islands 0,1 --runs DIR0,DIR1  # one pass of the island hub on this machine
+.\build\gme_genesis.exe life-seedbank --runs runs\bio_<planet>   # best genomes per guild x habitat -> life/seedbank.bin
+.\build\gme_genesis.exe life-rebase --bank life\seedbank.bin --island 2   # a new run (also on another planet) founded from the bank
+.\build\gme_genesis.exe life-inoculate --from DIR_A --to DIR_B --guild land_plant --n 500
+```
+
+- **Hub.** Each sim-year an island writes its gas uptake and its emigrants (its most successful genomes of each guild in each habitat) to `outbox/`. `life-hub` moves the planet's atmosphere by the islands' uptake per m² of ocean and of land, weighted by the planet's real ocean cover, and routes emigrants around the ring. One hub folder serves one planet. Islands move a quarter of the way to the planet's atmosphere and take in the migrants at their next sim-year. Without a hub an island runs closed.
+- **Seed bank.** Genomes carry no planet state. A bank from one planet's islands founds runs on another (`life-rebase`), and `life-inoculate` moves one guild between islands. Both are logged.
+- **Export.** `bioexport` writes the vegetation with its evolved shapes (biomap version 2) and the creatures (`fauna_<K>.bin`: what moves or lives on prey and is not vegetation); `bioexport --merge` also writes `life/home.fauna` for the engine.
 
 ## Running on a GPU cluster
 
@@ -97,7 +126,9 @@ On each rig: the NVIDIA driver, gcc, cmake, tmux, and an NVRTC library (for exam
 pwsh cluster/launch.ps1 -Deploy         # star-system search on every rig GPU (endless; several processes per GPU)
 pwsh cluster/status.ps1 [-Fetch]        # habitability ranking; -Fetch copies the best system to ./genesis
 pwsh cluster/bio_launch.ps1 -Deploy     # life islands: copy + build in ~/gme/build-bio, check env CRCs, start tmux bio-isl<k>
-pwsh cluster/bio_status.ps1 [-Fetch]    # per island progress; -Fetch exports and merges into life/home.biomap
+pwsh cluster/bio_launch.ps1 -Deploy -Restart -Enable animals,sex   # new build, and switch features on in the running islands
+pwsh cluster/bio_status.ps1 [-Fetch]    # per island progress; -Fetch exports and merges into life/home.biomap and life/home.fauna
+pwsh cluster/bio_hub.ps1                # every 10 min: outboxes -> life/hub/<planet>, planet-wide atmosphere + migrants, -> inboxes
 pwsh cluster/timeline.ps1               # every 30 min: fetch, screenshots of every island, charts; stops when "playable"
 pwsh cluster/render_remote.ps1 -Run "--frames 600 --screenshot {out}/view.png --perf" -Out status/render/x
                                         # render tests on rig B: headless Linux build of gme, coolest free GPU
@@ -114,11 +145,13 @@ Render tests run headless on a Linux rig: `gme` builds there without a display (
 | `src/gpu.*`, `src/world.*` | CUDA chunk pool and batched generation; residency, streaming, eviction, adaptive view radius, validation |
 | `src/render.*`, `src/window_win32.c` | CUDA ray tracer and the native window |
 | `src/density.h`, `src/trace.cuh` | Render upgrade (in progress): smooth density surface and its column tracer |
-| `src/flora.h`, `src/biomap.*` | Vegetation voxels from the frozen biomap, the `GMEBMAP1` file |
+| `src/flora.h`, `src/biomap.*` | Vegetation voxels from the frozen biomap: the `GMEBMAP1` file, and `GMEBMAP2` with evolved crown shapes |
+| `src/fauna_scene.*` | Creatures in the 3D view: placement on the drawn ground or at depth, a hash grid of 32 m cells the renderer walks |
 | `src/planetfile.*` | `home.planet` load/save and the planet hash |
 | `src/rtcuda.*` | Run-time CUDA: driver API + NVRTC loaded dynamically (no toolkit needed) |
 | `src/genesis/` | `gme_genesis`: cosmos (N-body), chem (bond Monte Carlo), planet derivation |
-| `src/bio/` | Life simulation: `bio_api.h` (contract), `bio_core.h` + `bio_kernels.cu` (integer math, NVRTC kernels), `bio_sim.c` / `bio_cpu.c` (GPU driver / CPU reference), `bio_io.c`, `bio_env.c`, `bio_main.c`, `bio_test.c` |
+| `src/bio/` | Life simulation: `bio_api.h` (contract), `bio_core.h` + `bio_kernels.cu` (integer math, NVRTC kernels), `bio_sim.c` / `bio_cpu.c` (GPU driver / CPU reference), `bio_io.c` (checkpoints, vegetation), `bio_bank.c` (seed bank, seeding, creatures), `bio_hub.c` (island hub), `bio_stats.c` (species), `bio_env.c`, `bio_main.c`, `bio_test.c` |
+| `src/fauna.h`, `src/spectrum_file.h` | File contracts between the life simulation and the engine: creatures (`GMEFAUN1`), light in bands (`GMESPEC1`) |
 | `cluster/` | Cluster scripts (search, life islands, timeline) |
 | `docs/` | Design specs: biosphere and render upgrade |
 

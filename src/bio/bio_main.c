@@ -9,17 +9,23 @@
  *   bioexport --merge P... [--out life/home.biomap]   parts -> the engine's biomap
  *   biostat --run DIR [--hash]       statistics of the newest checkpoint
  *   biomap-test [--out F]            T11 checkerboard of every vegetation kind around the engine spawn
+ *   life-hub --dir D --islands ...   one pass of the island hub: planet-wide atmosphere, migrants
+ *   life-seedbank --runs DIR         the best genomes of every island -> a seed bank
+ *   life-rebase --bank F --island K  a new run on this planet founded from a seed bank
+ *   life-inoculate --from A --to B   evolved genomes of one guild from run A into run B
  *
  * genesis_main.c hands these stages to bio_main() before its own option
  * parser; bio_main returns -1 for any other stage name. */
 #include "bio_internal.h"     /* read-only use: accumulators, raw stats and agent download for metrics and maps */
 #include "bio_env.h"
 #include "../biomap.h"
+#include "../fauna.h"
 #include "../flora.h"
 #include "../image.h"
 #include "../jobs.h"
 #include "../planetfile.h"
 #include "../platform.h"
+#include "../spectrum_file.h"
 #include <math.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -37,6 +43,10 @@
 #define DEFAULT_PLANET  "genesis/home.planet"
 #define DEFAULT_REGIONS "life/regions.txt"
 #define DEFAULT_BIOMAP  "life/home.biomap"
+#define DEFAULT_SPECTRUM "life/spectrum.bin"
+#define DEFAULT_BANK    "life/seedbank.bin"
+#define DEFAULT_HUB     "life/hub"
+#define HUB_MIGRANTS    256          /* genomes per habitat an island sends each epoch (spec 6.4) */
 #define STEPS_DAY       24u
 #define STEPS_YEAR      8760u
 #define KEEP_CKPTS      3
@@ -56,6 +66,21 @@ typedef struct Opt {
     int32_t  x, z;
     const char* merge[64];
     int      nmerge;
+    /* features, light, hub, seed bank */
+    const char* features;          /* --features LIST: of a new run (default all) */
+    const char* enable;            /* --enable LIST: switched on when resuming (an intervention) */
+    const char* spectrum;          /* --spectrum FILE: light in bands (default life/spectrum.bin when present) */
+    int      no_spectrum, no_hub, species, fauna_set;
+    const char* bank;              /* --bank FILE */
+    const char* from;              /* --from RUN (life-inoculate) */
+    const char* to;                /* --to RUN */
+    const char* guild;             /* --guild NAME[@HABITAT] */
+    const char* runs;              /* --runs DIR[,DIR...] */
+    const char* dir;               /* --dir DIR (life-hub) */
+    const char* islands;           /* --islands 0,1,... */
+    const char* fauna;             /* --fauna FILE */
+    uint32_t n;                    /* --n N */
+    int      stop_at_start;        /* internal (life-rebase): create, checkpoint, stop */
 } Opt;
 
 static void usage(void) {
@@ -66,14 +91,28 @@ static void usage(void) {
            "  life --island K [--run DIR] [--device D | --cpu] [--resume] [--duty X] [--cap N]\n"
            "       [--years Y | --days D] [--minutes M] [--salt S] [--checkpoint-min M] [--seed-protocells N]\n"
            "       [--maps-every Y] [--metrics-every D] [--barrier X] [--hash]\n"
-           "  life-test [--device D | --cpu] [--quiet]        test suite T1-T9, T12\n"
-           "  bioexport --run DIR [--out FILE] [--device D]   island -> biomap part (default DIR/biopart_K.bin)\n"
-           "  bioexport --merge PATH... [--out %s] [--no-fallback]\n"
-           "  biostat --run DIR [--hash] [--device D]         statistics of the newest checkpoint\n"
+           "       [--features LIST] (new run: all | none | animals,sex,learn,morph,hub,spectral; default all)\n"
+           "       [--enable LIST] (with --resume: switch features on in a running world; logged as an intervention)\n"
+           "       [--spectrum FILE | --no-spectrum] (light in wavelength bands; default %s when present)\n"
+           "       [--bank FILE] (new run: found it from a seed bank instead of protocells) [--no-hub]\n"
+           "  life-test [--device D | --cpu] [--quiet]        test suite T1-T10, T12-T19\n"
+           "  bioexport --run DIR [--out FILE] [--fauna FILE] [--device D]   island -> biomap part (DIR/biopart_K.bin)\n"
+           "                                                  and its creatures (DIR/fauna_K.bin)\n"
+           "  bioexport --merge PATH... [--out %s] [--fauna life/home.fauna] [--no-fallback]\n"
+           "  biostat --run DIR [--hash] [--species] [--device D]   statistics of the newest checkpoint\n"
            "  biomap-test [--out life/test.biomap] [--x X --z Z]   T11 pattern around the engine spawn\n"
+           "  life-hub [--dir %s] --islands 0,1,... [--runs DIR,DIR,...]   one pass of the hub: the planet-wide\n"
+           "       atmosphere from the islands' gas uptake, migrants around the ring. --runs: the islands' run folders\n"
+           "       on this machine (outboxes are collected and inboxes filled; rigs: cluster/bio_hub.ps1 does that)\n"
+           "  life-seedbank --runs DIR [--out %s] [--n 2000]   best genomes per guild x habitat of every\n"
+           "       island_* run under DIR (or of DIR itself)\n"
+           "  life-rebase --bank FILE --island K [--run DIR] [--n 20000]   new run on this planet founded from the bank\n"
+           "  life-inoculate --from RUN --to RUN --guild G [--n 500]   evolved genomes of guild G (producer, chemotroph,\n"
+           "       decomposer, consumer, any; with @marine, @coastal or @land; land_plant, land_animal) from one run's\n"
+           "       newest checkpoint into the other's (stop that island first)\n"
            "  common: [--planet %s] [--regions %s] [--threads N]\n"
            "  DIR defaults to runs/bio_<planet hash>/island_K\n",
-           BIO_ISLANDS, DEFAULT_BIOMAP, DEFAULT_PLANET, DEFAULT_REGIONS);
+           BIO_ISLANDS, DEFAULT_SPECTRUM, DEFAULT_BIOMAP, DEFAULT_HUB, DEFAULT_BANK, DEFAULT_PLANET, DEFAULT_REGIONS);
 }
 
 static int parse(int argc, char** argv, Opt* o) {
@@ -94,6 +133,9 @@ static int parse(int argc, char** argv, Opt* o) {
         else if (!strcmp(k, "--hash"))        { o->hash = 1; used = 0; }
         else if (!strcmp(k, "--quiet"))       { o->quiet = 1; used = 0; }
         else if (!strcmp(k, "--no-fallback")) { o->no_fallback = 1; used = 0; }
+        else if (!strcmp(k, "--no-spectrum")) { o->no_spectrum = 1; used = 0; }
+        else if (!strcmp(k, "--no-hub"))      { o->no_hub = 1; used = 0; }
+        else if (!strcmp(k, "--species"))     { o->species = 1; used = 0; }
         else if (!strcmp(k, "--cpu"))         { o->device = -1; o->device_set = 1; used = 0; }
         else if (!strcmp(k, "--merge")) {
             used = 0;
@@ -103,7 +145,9 @@ static int parse(int argc, char** argv, Opt* o) {
         else if (!v) {
             static const char* vals[] = { "--planet", "--regions", "--run", "--out", "--island", "--device", "--threads",
                                           "--duty", "--years", "--days", "--minutes", "--checkpoint-min", "--barrier", "--cap",
-                                          "--salt", "--seed-protocells", "--maps-every", "--metrics-every", "--x", "--z" };
+                                          "--salt", "--seed-protocells", "--maps-every", "--metrics-every", "--x", "--z",
+                                          "--features", "--enable", "--spectrum", "--bank", "--from", "--to", "--guild", "--runs",
+                                          "--dir", "--islands", "--fauna", "--n" };
             int known = 0;
             for (size_t q = 0; q < sizeof vals / sizeof vals[0]; ++q) known |= !strcmp(k, vals[q]);
             fprintf(stderr, known ? "%s needs a value\n" : "unknown option %s\n", k);
@@ -127,6 +171,18 @@ static int parse(int argc, char** argv, Opt* o) {
         else if (!strcmp(k, "--seed-protocells")) o->seed_n = (uint32_t)strtoul(v, NULL, 10);
         else if (!strcmp(k, "--maps-every"))    o->maps_every = (uint32_t)strtoul(v, NULL, 10);
         else if (!strcmp(k, "--metrics-every")) o->metrics_every = (uint32_t)strtoul(v, NULL, 10);
+        else if (!strcmp(k, "--features")) o->features = v;
+        else if (!strcmp(k, "--enable"))  o->enable = v;
+        else if (!strcmp(k, "--spectrum")) o->spectrum = v;
+        else if (!strcmp(k, "--bank"))    o->bank = v;
+        else if (!strcmp(k, "--from"))    o->from = v;
+        else if (!strcmp(k, "--to"))      o->to = v;
+        else if (!strcmp(k, "--guild"))   o->guild = v;
+        else if (!strcmp(k, "--runs"))    o->runs = v;
+        else if (!strcmp(k, "--dir"))     o->dir = v;
+        else if (!strcmp(k, "--islands")) o->islands = v;
+        else if (!strcmp(k, "--fauna"))   { o->fauna = v; o->fauna_set = 1; }
+        else if (!strcmp(k, "--n"))       o->n = (uint32_t)strtoul(v, NULL, 10);
         else if (!strcmp(k, "--x"))       { o->x = atoi(v); o->xz_set |= 1; }
         else if (!strcmp(k, "--z"))       { o->z = atoi(v); o->xz_set |= 2; }
         else { fprintf(stderr, "unknown option %s\n", k); return -1; }
@@ -170,6 +226,50 @@ static const char* fmt_n(double v, char* buf, size_t n) {   /* 1.23M, 41.0k, 512
     else if (v >= 1e3) snprintf(buf, n, "%.1fk", v / 1e3);
     else snprintf(buf, n, "%.0f", v);
     return buf;
+}
+
+/* "animals,sex,learn" -> BIO_F_*; -1 on an unknown name */
+static const struct { const char* name; uint32_t bit; } FEATS[] = {
+    { "animals", BIO_F_ANIMALS }, { "sex", BIO_F_SEX }, { "learn", BIO_F_LEARN }, { "morph", BIO_F_MORPH }, { "hub", BIO_F_HUB },
+    { "spectral", BIO_F_SPECTRAL },
+};
+static int64_t parse_features(const char* list) {
+    if (!list || !*list) return 0;
+    uint32_t m = 0;
+    char buf[256];
+    snprintf(buf, sizeof buf, "%s", list);
+    for (char* t = strtok(buf, ",+ "); t; t = strtok(NULL, ",+ ")) {
+        if (!strcmp(t, "all")) { m |= BIO_F_ALL | BIO_F_SPECTRAL; continue; }
+        if (!strcmp(t, "none")) continue;
+        int found = 0;
+        for (size_t k = 0; k < sizeof FEATS / sizeof FEATS[0]; ++k) if (!strcmp(t, FEATS[k].name)) { m |= FEATS[k].bit; found = 1; }
+        if (!found) { fprintf(stderr, "unknown feature '%s' (animals, sex, learn, morph, hub, spectral, all, none)\n", t); return -1; }
+    }
+    return m;
+}
+static const char* features_str(uint32_t m, char* buf, size_t n) {
+    size_t w = 0;
+    buf[0] = 0;
+    for (size_t k = 0; k < sizeof FEATS / sizeof FEATS[0]; ++k)
+        if (m & FEATS[k].bit) w += (size_t)snprintf(buf + w, n - w, "%s%s", w ? "," : "", FEATS[k].name);
+    if (!w) snprintf(buf, n, "none");
+    return buf;
+}
+
+/* The spectrum file of a run: --spectrum, else life/spectrum.bin when it exists.
+ * Returns 1 loaded, 0 none (scalar light), -1 given but unusable. */
+static int load_spectrum(const Opt* o, uint64_t ph, SpectrumFile* sf) {
+    if (o->no_spectrum) return 0;
+    const char* path = o->spectrum ? o->spectrum : DEFAULT_SPECTRUM;
+    const int rc = spectrum_load(path, sf);
+    if (rc == -1 && !o->spectrum) return 0;                       /* no default file: scalar light */
+    if (rc) { fprintf(stderr, "%s: %s\n", path, rc == -1 ? "cannot read it" : rc == -3 ? "CRC mismatch (corrupt)" : "not a GMESPEC1 file"); return -1; }
+    if (sf->planet_hash != ph) {
+        fprintf(stderr, "%s was made for planet %016llx; this planet is %016llx (gme --export-spectrum %s)\n", path,
+                (unsigned long long)sf->planet_hash, (unsigned long long)ph, path);
+        return o->spectrum ? -1 : 0;                              /* a stale default file is ignored, a named one is an error */
+    }
+    return 1;
 }
 
 static void gates_str(uint32_t g, char* buf, size_t n) {
@@ -303,6 +403,32 @@ static int count_lines_with(const char* path, const char* needle) {
     while (fgets(line, sizeof line, f)) n += strstr(line, needle) != NULL;
     fclose(f);
     return n;
+}
+
+/* Opens a CSV for appending. A file written with other columns (an older
+ * build) is kept as <name>_old<k>.csv and a new one started, so every file has
+ * one header and rows that match it. */
+static FILE* open_table(const char* dir, const char* name, const char* header) {
+    char p[1100], q[1200];
+    snprintf(p, sizeof p, "%s/%s.csv", dir, name);
+    FILE* f = fopen(p, "rb");
+    if (f) {
+        static char line[8192];
+        const int same = fgets(line, sizeof line, f) && !strcmp(line, header);
+        fclose(f);
+        if (!same) {
+            for (int k = 1; k < 100; ++k) {
+                snprintf(q, sizeof q, "%s/%s_old%d.csv", dir, name, k);
+                if (!file_exists(q)) break;
+            }
+            if (rename(p, q)) remove(p);
+            printf("life: %s.csv had other columns: kept as %s, starting a new table\n", name, q);
+        }
+    }
+    const int fresh = !file_exists(p);
+    f = fopen(p, "ab");
+    if (f && fresh) fputs(header, f);
+    return f;
 }
 
 static void stage_log(const char* dir, const char* fmt, ...) {
@@ -500,6 +626,7 @@ static int stage_env(const Opt* o) {
 typedef struct Snap {           /* everything we report at one moment */
     BioStats st;
     int64_t  acc[BACC_N];
+    int64_t  acc2[BACC2_N];
     int64_t  raw[BIO_STAT_N];
     double   wall;
 } Snap;
@@ -508,6 +635,7 @@ static int snap(BioSim* s, Snap* x) {
     if (bio_sim_stats(s, &x->st)) return -1;
     if (bio_stats_raw(s, x->raw) < 0) return -1;      /* also refreshes s->Gh */
     memcpy(x->acc, s->Gh.acc, sizeof x->acc);
+    memcpy(x->acc2, s->Gh.acc2, sizeof x->acc2);
     x->wall = time_now();
     return 0;
 }
@@ -582,6 +710,16 @@ static void print_block(Run* R, const Snap* x, const Snap* p, double days, doubl
     printf("  think %.0f%% of agents  dW|mean| %.2f  rollbacks %d  %.0f st/s (duty %.2f)  gates %s  land veg cells %u  resid %s\n",
            100.0 * st->think_share, st->mean_abs_dw, R->rollbacks, sps, R->duty, g, st->land_cells_vegetated,
            resid ? "NONZERO" : "0");
+    if (st->features & (BIO_F_ANIMALS | BIO_F_SEX))
+    {
+        char cr[32];
+        printf("  animals: %s creatures, %s land animals; %s agents live mostly on prey (trophic level %.2f); "
+               "per day %.3g kills, %.3g bites, %.3g mol C eaten | sexual %s, %.3g births/d with two parents\n",
+               fmt_n((double)st->creatures, cr, sizeof cr), fmt_n((double)st->land_animals, b, sizeof b),
+               fmt_n((double)st->consumers, a, sizeof a), st->mean_troph, (double)(st->kills - p->st.kills) / dd,
+               (double)(st->bites - p->st.bites) / dd, (double)(st->pred_carbon - p->st.pred_carbon) / pd,
+               fmt_n((double)st->sexual, c, sizeof c), (double)(st->sexual_births - p->st.sexual_births) / dd);
+    }
     fflush(stdout);
 }
 
@@ -595,7 +733,8 @@ static const char* METRICS_HEADER =
     "total_C,total_N,total_S,total_Fe,resid_C,resid_N,resid_S,resid_Fe,neg_agents,neg_cells,"
     "g_E_METH,g_E_ANOX,g_E_OXY,g_E_FERM,g_E_SULFRED,g_E_AERO,g_E_METHOX,g_E_FEOX,"
     "g_size,g_struct,g_holdfast,g_cuticle,g_root,g_buoy,g_motor,g_pigment,g_hue,g_uvshield,g_disperse,g_mut,g_think,"
-    "think_period,mean_abs_dw,think_share,land_cells_veg,o2_cells,gates\n";
+    "think_period,mean_abs_dw,think_share,land_cells_veg,o2_cells,"
+    "consumers,creatures,mean_troph,land_animals,kills,bites,pred_C,sexual,sexual_births,gut_C,features,gates\n";
 
 /* one metrics row; fluxes are per day, averaged over the row interval */
 static void metrics_row(Run* R, const Snap* x, const Snap* p, double t_start) {
@@ -624,8 +763,14 @@ static void metrics_row(Run* R, const Snap* x, const Snap* p, double t_start) {
     static const int gn[13] = { BG_SIZE, BG_STRUCT, BG_HOLDFAST, BG_CUTICLE, BG_ROOT, BG_BUOY, BG_MOTOR, BG_PIGMENT, BG_HUE,
                                 BG_UVSHIELD, BG_DISPERSE, BG_MUT, BG_THINK };
     for (int k = 0; k < 13; ++k) fprintf(f, ",%u", s->mean_gene[gn[k]]);
-    fprintf(f, ",%.2f,%.4f,%.4f,%u,%lld,%u\n", 1.0 + s->mean_gene[BG_THINK] / 4.0, s->mean_abs_dw, s->think_share,
-            s->land_cells_vegetated, (long long)x->raw[BS_O2CELLS], s->gates);
+    fprintf(f, ",%.2f,%.4f,%.4f,%u,%lld", 1.0 + s->mean_gene[BG_THINK] / 4.0, s->mean_abs_dw, s->think_share,
+            s->land_cells_vegetated, (long long)x->raw[BS_O2CELLS]);
+    /* animals and sex: counts now, events per day over the row interval */
+    fprintf(f, ",%llu,%llu,%.3f,%llu,%lld,%lld,%lld,%llu,%lld,%lld,%u,%u\n", (unsigned long long)s->consumers,
+            (unsigned long long)s->creatures, s->mean_troph, (unsigned long long)s->land_animals, (long long)((s->kills - q->kills) / days), (long long)((s->bites - q->bites) / days),
+            (long long)((s->pred_carbon - q->pred_carbon) / days), (unsigned long long)s->sexual,
+            (long long)((s->sexual_births - q->sexual_births) / days),
+            (long long)((x->acc2[BACC2_GUT_C] - p->acc2[BACC2_GUT_C]) / days), s->features, s->gates);
     fflush(f);
 }
 
@@ -743,16 +888,22 @@ static int epoch_outputs(Run* R, int last) {
     }
     free(gh);
     free(a);
+    BioSpecies sp;                       /* clusters of similar genomes in a sample (spec 8.3) */
+    memset(&sp, 0, sizeof sp);
+    if (bio_sim_species(s, 4096, &sp)) fprintf(stderr, "epoch: species: %s\n", bio_error());
     if (R->census && R->census_step != st.step) {
         R->census_step = st.step;
         fprintf(R->census, "%llu,%.3f,%u", (unsigned long long)st.step, st.sim_years, n);
         for (int rl = 0; rl < 3; ++rl) fprintf(R->census, ",%lld", (long long)nreal[rl]);
         for (int rl = 0; rl < 3; ++rl) for (int gd = 0; gd < GUILD_N; ++gd) fprintf(R->census, ",%lld", (long long)cg[rl][gd]);
         for (int rl = 0; rl < 3; ++rl) for (int gd = 0; gd < GUILD_N; ++gd) fprintf(R->census, ",%lld", (long long)ng[rl][gd]);
-        fprintf(R->census, ",%lld,%.3f,%.3f,%llu,%.2f,%.3f\n", (long long)motile, n ? (double)neur / n : 0.0,
+        fprintf(R->census, ",%lld,%.3f,%.3f,%llu,%.2f,%.3f", (long long)motile, n ? (double)neur / n : 0.0,
                 n ? (double)plast / n : 0.0, (unsigned long long)distinct, hmax / 16.0, ph_n ? ph_h / 16.0 / ph_n : 0.0);
+        fprintf(R->census, ",%u,%u,%u,%.4f,%.4f,%.4f\n", sp.sample, sp.richness, sp.clusters2, sp.shannon, sp.simpson, sp.top_share);
         fflush(R->census);
     }
+    printf("  species y=%.2f: %u clusters in a sample of %u genomes (%u with 2+ members), Shannon H %.2f, Simpson %.3f, largest %.0f%%\n",
+           st.sim_years, sp.richness, sp.sample, sp.clusters2, sp.shannon, sp.simpson, 100.0 * sp.top_share);
     printf("  census y=%.2f: C mol [marine prod %.2e chemo %.2e decomp %.2e cons %.2e] [coastal prod %.2e chemo %.2e decomp %.2e cons %.2e]\n"
            "                [land prod %.2e chemo %.2e decomp %.2e cons %.2e]  %llu distinct genomes, tallest %.2f m, sessile producers %.3f m mean\n",
            st.sim_years, cg[0][0] / 1e3, cg[0][1] / 1e3, cg[0][2] / 1e3, cg[0][3] / 1e3, cg[1][0] / 1e3, cg[1][1] / 1e3,
@@ -878,6 +1029,20 @@ static int stage_life(const Opt* o) {
     static const int32_t barrier_q8[5] = { 179, 218, 256, 294, 333 };   /* islands 0-4: x0.7 .. x1.3 (spec 4) */
     cfg.barrier_q8 = o->barrier > 0 ? (int32_t)lround(o->barrier * 256.0) : (R.island >= 0 && R.island < 5 ? barrier_q8[R.island] : 256);
     R.duty = cfg.duty;
+    /* features of a new run (default: all), what a resumed run switches on, and the light file */
+    static SpectrumFile sf;
+    const int64_t fm = o->features ? parse_features(o->features) : (int64_t)(BIO_F_ALL | BIO_F_SPECTRAL);
+    const int64_t en = parse_features(o->enable);
+    const int have_sf = (fm < 0 || en < 0) ? -1 : load_spectrum(o, ph, &sf);
+    if (fm < 0 || en < 0 || have_sf < 0) { bio_env_free(&e); return 2; }
+    if (!have_sf && ((o->features && (fm & BIO_F_SPECTRAL)) || (en & BIO_F_SPECTRAL) || o->spectrum)) {
+        fprintf(stderr, "light in bands needs a spectrum file: gme --export-spectrum %s (or --spectrum FILE)\n", DEFAULT_SPECTRUM);
+        bio_env_free(&e);
+        return 1;
+    }
+    cfg.features = (uint32_t)fm & BIO_F_ALL;
+    cfg.enable = (uint32_t)en;
+    cfg.spectrum = have_sf ? &sf : NULL;       /* a resumed run takes it when its checkpoint (or --enable) says so */
 
     BioSim* s = NULL;
     uint64_t step0 = 0;
@@ -913,10 +1078,21 @@ static int stage_life(const Opt* o) {
         snprintf(mp, sizeof mp, "%s/stages.log", R.dir);
         prune_after(mp, step0, 0);
     }
+    int founders = 0;
+    uint32_t bank_n = 0;
     if (!s) {
+        if (!(fm & BIO_F_SPECTRAL)) cfg.spectrum = NULL;       /* a new run with scalar light */
         s = bio_sim_create(&e, &cfg);
         if (!s) { fprintf(stderr, "life: %s\n", bio_error()); bio_env_free(&e); return 1; }
-        if (bio_sim_seed(s, o->seed_n)) { fprintf(stderr, "life: seeding failed: %s\n", bio_error()); bio_sim_destroy(s); bio_env_free(&e); return 1; }
+        if (o->bank) {      /* founded from a seed bank: evolved genomes into their habitats (spec 6.6) */
+            BioBankRec* br = NULL;
+            uint64_t bph = 0;
+            if (bio_bank_load(o->bank, &br, &bank_n, &bph)) { fprintf(stderr, "life: %s\n", bio_error()); bio_sim_destroy(s); bio_env_free(&e); return 1; }
+            founders = bio_sim_seed_bank(s, br, bank_n, o->seed_n, -1, -1);
+            free(br);
+            if (founders <= 0) { fprintf(stderr, "life: the seed bank %s placed no founders: %s\n", o->bank, founders < 0 ? bio_error() : "no matching habitat"); bio_sim_destroy(s); bio_env_free(&e); return 1; }
+            printf("life: founded from %s (%u genomes of planet %016llx): %d founders\n", o->bank, bank_n, (unsigned long long)bph, founders);
+        } else if (bio_sim_seed(s, o->seed_n)) { fprintf(stderr, "life: seeding failed: %s\n", bio_error()); bio_sim_destroy(s); bio_env_free(&e); return 1; }
     }
     R.s = s;
     {
@@ -928,39 +1104,51 @@ static int stage_life(const Opt* o) {
     else printf("life: CPU reference (%d threads)", jobs_thread_count());
     printf(", cap %u agents, duty %.2f, salt %u, barrier x%.2f, atm scale %d ppm, ready in %.1f s\n", s->cfg.cap, cfg.duty,
            s->w.salt, s->w.P.barrier_q8 / 256.0, s->w.P.atm_scale_ppm, time_now() - tc);
+    char fs[96], fs0[96];
+    const uint32_t feat = bio_sim_features(s);
+    features_str(feat, fs, sizeof fs);
+    printf("life: features %s%s\n", fs, (feat & BIO_F_SPECTRAL) ? "" : (have_sf ? "" : " (scalar light: no spectrum file)"));
+    if (feat & BIO_F_SPECTRAL)
+        printf("life: light in 9 bands from %s (crc %08x): harvest %.3f / %.3f eu per umol photons s (oxygenic / anoxygenic)\n",
+               o->spectrum ? o->spectrum : DEFAULT_SPECTRUM, (uint32_t)s->w.P.spectrum_crc, s->w.P.eff_sp_oxy_q16 / 65536.0,
+               s->w.P.eff_sp_anox_q16 / 65536.0);
     if (ckname[0]) {
         printf("life: resumed %s at step %llu (year %.3f)\n", ckname, (unsigned long long)step0, step0 / (double)STEPS_YEAR);
-        stage_log(R.dir, "step=%llu year=%.3f RESUME from %s salt %u", (unsigned long long)step0, step0 / (double)STEPS_YEAR,
-                  ckname, s->w.salt);
+        stage_log(R.dir, "step=%llu year=%.3f RESUME from %s salt %u features %s", (unsigned long long)step0, step0 / (double)STEPS_YEAR,
+                  ckname, s->w.salt, fs);
+        if (feat != s->feat_loaded) {      /* switched on in a living world: an intervention, on the record */
+            features_str(feat & ~s->feat_loaded, fs0, sizeof fs0);
+            printf("life: INTERVENTION: switched on %s at step %llu\n", fs0, (unsigned long long)step0);
+            stage_log(R.dir, "step=%llu year=%.3f INTERVENTION enable %s (features now %s)", (unsigned long long)step0,
+                      step0 / (double)STEPS_YEAR, fs0, fs);
+        }
+    } else if (o->bank) {
+        printf("life: new run from a seed bank, %d founders, salt %u\n", founders, s->w.salt);
+        stage_log(R.dir, "step=0 year=0.000 START island %d, rebase: %d founders of %u banked genomes (%s), salt %u, cap %u, barrier x%.2f, features %s",
+                  R.island, founders, bank_n, o->bank, s->w.salt, s->cfg.cap, s->w.P.barrier_q8 / 256.0, fs);
     } else {
         printf("life: new run, %u protocells, salt %u\n", o->seed_n, s->w.salt);
-        stage_log(R.dir, "step=0 year=0.000 START island %d, %u protocells, salt %u, cap %u, barrier x%.2f", R.island,
-                  o->seed_n, s->w.salt, s->cfg.cap, s->w.P.barrier_q8 / 256.0);
+        stage_log(R.dir, "step=0 year=0.000 START island %d, %u protocells, salt %u, cap %u, barrier x%.2f, features %s", R.island,
+                  o->seed_n, s->w.salt, s->cfg.cap, s->w.P.barrier_q8 / 256.0, fs);
     }
     /* output files */
     {
-        char p[1100];
-        snprintf(p, sizeof p, "%s/metrics.csv", R.dir);
-        const int fresh = !file_exists(p);
-        R.metrics = fopen(p, "ab");
-        if (R.metrics && fresh) fputs(METRICS_HEADER, R.metrics);
-        snprintf(p, sizeof p, "%s/census.csv", R.dir);
-        const int fresh2 = !file_exists(p);
-        R.census = fopen(p, "ab");
-        if (R.census && fresh2) {
-            fputs("step,year,live,n_marine,n_coastal,n_land", R.census);
-            static const char* rn[3] = { "mar", "coast", "land" }, * gn[4] = { "prod", "chemo", "decomp", "cons" };
-            for (int r = 0; r < 3; ++r) for (int g = 0; g < 4; ++g) fprintf(R.census, ",C_%s_%s", rn[r], gn[g]);
-            for (int r = 0; r < 3; ++r) for (int g = 0; g < 4; ++g) fprintf(R.census, ",n_%s_%s", rn[r], gn[g]);
-            fputs(",motile,neurons,plastic_rows,distinct_genomes,tallest_m,producer_height_m\n", R.census);
-        }
+        static char ch[2048];
+        size_t cw = (size_t)snprintf(ch, sizeof ch, "step,year,live,n_marine,n_coastal,n_land");
+        static const char* rn[3] = { "mar", "coast", "land" }, * gn[4] = { "prod", "chemo", "decomp", "cons" };
+        for (int r = 0; r < 3; ++r) for (int g = 0; g < 4; ++g) cw += (size_t)snprintf(ch + cw, sizeof ch - cw, ",C_%s_%s", rn[r], gn[g]);
+        for (int r = 0; r < 3; ++r) for (int g = 0; g < 4; ++g) cw += (size_t)snprintf(ch + cw, sizeof ch - cw, ",n_%s_%s", rn[r], gn[g]);
+        snprintf(ch + cw, sizeof ch - cw, ",motile,neurons,plastic_rows,distinct_genomes,tallest_m,producer_height_m"
+                                          ",sp_sample,species,species_2plus,shannon,simpson,top_share\n");
+        R.metrics = open_table(R.dir, "metrics", METRICS_HEADER);
+        R.census = open_table(R.dir, "census", ch);
         if (!R.metrics || !R.census) fprintf(stderr, "life: cannot open the metrics files in %s\n", R.dir);
     }
     make_base(&R);
     R.census_step = UINT64_MAX;
     install_signals();
 
-    const uint64_t target = o->days ? (uint64_t)o->days * STEPS_DAY
+    const uint64_t target = o->stop_at_start ? step0 : o->days ? (uint64_t)o->days * STEPS_DAY
                           : (o->years > 0 ? (uint64_t)ceil(o->years * STEPS_YEAR / STEPS_DAY - 1e-9) * STEPS_DAY : UINT64_MAX);
     const uint64_t epoch = (uint64_t)STEPS_YEAR * (o->maps_every ? o->maps_every : 1);
     const double t_start = time_now();
@@ -976,12 +1164,25 @@ static int stage_life(const Opt* o) {
     if (!ckname[0] && o->maps_every) epoch_outputs(&R, 0);           /* year 0: the seed */
     int rc = 0, extinct = 0;
     const char* why = "done";
+    const int hub = (bio_sim_features(s) & BIO_F_HUB) && !o->no_hub;
     while (1) {
         if (g_stop) { why = "signal"; break; }
         if (s->w.step >= target) { why = "years reached"; break; }
         if (o->minutes > 0 && time_now() - t_start >= o->minutes * 60.0) { why = "time limit"; break; }
         const uint64_t nstep = STEPS_DAY - s->w.step % STEPS_DAY;
         if (bio_sim_run(s, nstep)) { fprintf(stderr, "life: step %llu failed: %s\n", (unsigned long long)s->w.step, bio_error()); rc = 1; why = "error"; break; }
+        if (hub && s->w.step % STEPS_YEAR == 0 && s->w.step / STEPS_YEAR > bio_sim_hub_epoch(s)) {
+            /* the island hub: this year's figures and emigrants out, what arrived in (spec 6.4) */
+            const uint64_t ep = s->w.step / STEPS_YEAR;
+            int nm = 0, na = 0;
+            if (bio_hub_export(s, R.dir, ep, HUB_MIGRANTS) || bio_hub_import(s, R.dir, ep, &nm, &na))
+                fprintf(stderr, "life: hub at year %llu: %s\n", (unsigned long long)ep, bio_error());
+            else if (nm || na) {
+                stage_log(R.dir, "step=%llu year=%.3f HUB %d migrants imported%s", (unsigned long long)s->w.step, (double)ep, nm,
+                          na ? ", atmosphere moved a quarter toward the planet's" : "");
+                printf("life: hub at year %llu: %d migrants imported%s\n", (unsigned long long)ep, nm, na ? ", atmosphere relaxed toward the planet's" : "");
+            }
+        }
         if (snap(s, &cur)) { fprintf(stderr, "life: stats: %s\n", bio_error()); rc = 1; why = "error"; break; }
         const uint64_t step = cur.st.step, day = step / STEPS_DAY;
         if (day % o->metrics_every == 0) { metrics_row(&R, &cur, &mrow, t_start); mrow = cur; }
@@ -1050,6 +1251,10 @@ static int open_run_sim(const Opt* o, const HomePlanet* hp, BioEnv* e, BioSim** 
     bio_config_default(&cfg);
     cfg.device = o->device_set ? o->device : -1;     /* CPU by default: never competes with a running island */
     cfg.duty = 1.0;
+    static SpectrumFile sf;                          /* a run with light in bands cannot be loaded without its light file */
+    const int have_sf = load_spectrum(o, planet_hash(hp), &sf);
+    if (have_sf < 0) { bio_env_free(e); return 1; }
+    cfg.spectrum = have_sf ? &sf : NULL;
     *s = ck_load_newest(o->run, e, &cfg, step, 1);
     if (!*s) { fprintf(stderr, "no valid checkpoint in %s\n", o->run); bio_env_free(e); return 1; }
     return 0;
@@ -1087,6 +1292,18 @@ static int stage_biostat(const Opt* o) {
     printf("  mean genes:");
     for (int k = 0; k < 48; ++k) printf(" %u", x.st.mean_gene[k]);
     printf("\n");
+    {
+        char fs[96];
+        printf("  features %s; cumulative: %lld kills, %lld bites, %.3e mol C eaten, %lld births with two parents\n",
+               features_str(x.st.features, fs, sizeof fs), (long long)x.st.kills, (long long)x.st.bites, x.st.pred_carbon / 1e3,
+               (long long)x.st.sexual_births);
+    }
+    if (o->species) {
+        BioSpecies sp;
+        if (bio_sim_species(s, 4096, &sp)) fprintf(stderr, "biostat: species: %s\n", bio_error());
+        else printf("  species: %u clusters in a sample of %u genomes (%u with 2+ members), Shannon H %.2f, Simpson %.3f, largest %.0f%%\n",
+                    sp.richness, sp.sample, sp.clusters2, sp.shannon, sp.simpson, 100.0 * sp.top_share);
+    }
     if (o->hash) printf("biostat: state hash %016llx\n", (unsigned long long)bio_sim_hash(s));
     bio_sim_destroy(s);
     bio_env_free(&e);
@@ -1107,6 +1324,23 @@ static void print_kinds(const char* tag, const uint32_t* c, size_t n) {
     printf("%s: %.2fM cells: bare %.2f%% mat %.2f%% kelp %.2f%% cover %.2f%% shrub %.2f%% tree %.2f%%; mean cover %.0f/255, tallest %u m\n",
            tag, n / 1e6, 100.0 * k[0] / n, 100.0 * k[1] / n, 100.0 * k[2] / n, 100.0 * k[3] / n, 100.0 * k[4] / n,
            100.0 * k[5] / n, nveg ? (double)cov / nveg : 0.0, hmax);
+}
+
+/* crown classes among shrubs and trees with an evolved shape word */
+static void print_shapes(const char* tag, const uint32_t* c, const uint32_t* m, size_t n) {
+    uint64_t cc[BIO_CROWN_N] = { 0 }, woody = 0, shaped = 0, asp = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (BIOCELL_KIND(c[i]) < BIO_KIND_SHRUB) continue;
+        ++woody;
+        if (!(m[i] & BIOMORPH_VALID)) continue;
+        ++shaped;
+        if (BIOMORPH_CROWN(m[i]) < BIO_CROWN_N) cc[BIOMORPH_CROWN(m[i])]++;
+        asp += BIOMORPH_ASPECT_Q8(BIOMORPH_ASPECT(m[i]));
+    }
+    const double d = shaped ? (double)shaped : 1.0;
+    printf("%s: shapes of %llu shrub and tree cells (%llu with evolved shape): ellipsoid %.1f%% cone %.1f%% umbrella %.1f%% column %.1f%% "
+           "dome %.1f%%; mean height : width %.2f\n", tag, (unsigned long long)woody, (unsigned long long)shaped, 100.0 * cc[0] / d,
+           100.0 * cc[1] / d, 100.0 * cc[2] / d, 100.0 * cc[3] / d, 100.0 * cc[4] / d, asp / d / 256.0);
 }
 
 static void print_fallback(const uint32_t fb[64], uint32_t on) {
@@ -1141,20 +1375,61 @@ static int export_one(const Opt* o, const HomePlanet* hp) {
     b.ncells = (size_t)e.w * e.h;
     b.cells = (uint32_t*)malloc(sizeof(uint32_t) * b.ncells);
     if (!b.cells) { fprintf(stderr, "bioexport: out of memory\n"); goto out; }
-    if (bio_sim_vegetation(s, b.cells, b.fallback, b.palette)) { fprintf(stderr, "bioexport: %s\n", bio_error()); goto out; }
+    /* a run with any feature writes version 2: evolved shapes (zeros while that feature is off) and the
+     * atmosphere life has made; a first-release run keeps writing version 1, byte for byte */
+    const uint32_t feat = bio_sim_features(s);
+    if (feat) {
+        b.morph = (uint32_t*)calloc(b.ncells, sizeof(uint32_t));
+        if (!b.morph) { fprintf(stderr, "bioexport: out of memory\n"); goto out; }
+        int64_t tot = 0;
+        for (int g = 0; g < BIO_ATM_N; ++g) tot += st.atm[g] > 0 ? st.atm[g] : 0;
+        const int64_t per_ppm = tot / 1000000 > 0 ? tot / 1000000 : 1;      /* divide first: the box is ~1e13 mmol */
+        for (int g = 0; g < BIO_ATM_N && tot > 0; ++g) {
+            const int64_t ppm = (st.atm[g] > 0 ? st.atm[g] : 0) / per_ppm;
+            b.atm_ppm[g] = (int32_t)(ppm > 1000000 ? 1000000 : ppm);
+        }
+        b.atm_known = tot > 0;
+    }
+    if (bio_sim_vegetation2(s, b.cells, b.morph, b.fallback, b.morph ? b.fallback_morph : NULL, b.palette)) { fprintf(stderr, "bioexport: %s\n", bio_error()); goto out; }
     for (int k = 0; k < 64; ++k) b.fallback_on |= b.fallback[k] != 0;
     char path[1100];
     if (o->out) snprintf(path, sizeof path, "%s", o->out);
     else snprintf(path, sizeof path, "%s/biopart_%d.bin", o->run, e.island);
     if (mkdirs_for(path) || biomap_save(path, &b)) { fprintf(stderr, "bioexport: cannot write %s\n", path); goto out; }
+    {   /* its creatures next to the part (fauna_<K>.bin), or where --fauna says */
+        Fauna fa;
+        char fp[1200];
+        if (o->fauna) snprintf(fp, sizeof fp, "%s", o->fauna);
+        else {
+            snprintf(fp, sizeof fp, "%s", path);
+            char* sl = strrchr(fp, '/');
+            char* bs = strrchr(fp, '\\');
+            if (bs && (!sl || bs > sl)) sl = bs;
+            snprintf(sl ? sl + 1 : fp, sizeof fp - (size_t)(sl ? sl + 1 - fp : 0), "fauna_%d.bin", e.island);
+        }
+        if (bio_sim_fauna(s, &fa, FAUNA_MAX)) fprintf(stderr, "bioexport: creatures: %s\n", bio_error());
+        else {
+            if (mkdirs_for(fp) || fauna_save(fp, &fa)) fprintf(stderr, "bioexport: cannot write %s\n", fp);
+            else printf("bioexport: wrote %s: %u of %u creatures (largest %.2f m)\n", fp, fa.count, fa.total, fa.count ? fa.rec[0].size_q4 / 16.0 : 0.0);
+            fauna_free(&fa);
+        }
+        uint32_t mc[6];
+        if (!bio_sim_motor_census(s, mc))
+            printf("bioexport: %u agents carry a motor gene: %u creatures; %u plants with a holdfast, drawn as vegetation (%u of them live mostly "
+                   "on prey that comes to them, %u could move 1 m per hour); %u free but slower than that and not living on prey\n",
+                   mc[0], mc[1], mc[2], mc[3], mc[4], mc[5]);
+    }
     printf("bioexport: island %d, checkpoint step %llu (year %.2f), %llu live agents, %llu sessile phototrophs, gates %02x\n",
            e.island, (unsigned long long)step, st.sim_years, (unsigned long long)st.live, (unsigned long long)st.sessile_photo, st.gates);
     print_kinds("bioexport", b.cells, b.ncells);
     print_fallback(b.fallback, b.fallback_on);
-    printf("bioexport: wrote %s (region x %d z %d, %dx%d cells of %d m)\n", path, e.x0, e.z0, e.w, e.h, 1 << e.shift);
+    if (b.morph) print_shapes("bioexport", b.cells, b.morph, b.ncells);
+    printf("bioexport: wrote %s (%s; region x %d z %d, %dx%d cells of %d m)\n", path, b.morph ? "version 2" : "version 1", e.x0, e.z0,
+           e.w, e.h, 1 << e.shift);
     rc = 0;
 out:
     free(b.cells);
+    free(b.morph);
     bio_sim_destroy(s);
     bio_env_free(&e);
     return rc;
@@ -1177,6 +1452,12 @@ static void sub_add(void* ctx, const char* name) {
     L->dir = keep;
 }
 static int cmp_str(const void* a, const void* b) { return strcmp((const char*)a, (const char*)b); }
+static int fauna_size_cmp(const void* a, const void* b) {       /* largest bodies first; position breaks ties (a stable file) */
+    const FaunaRec* x = (const FaunaRec*)a; const FaunaRec* y = (const FaunaRec*)b;
+    if (x->size_q4 != y->size_q4) return x->size_q4 > y->size_q4 ? -1 : 1;
+    if (x->x_q4 != y->x_q4) return x->x_q4 < y->x_q4 ? -1 : 1;
+    return x->z_q4 < y->z_q4 ? -1 : (x->z_q4 > y->z_q4 ? 1 : 0);
+}
 
 typedef struct BinCtx { const Biomap* m; const GmePlanet* p; uint32_t seed; uint8_t* bins; } BinCtx;
 static void bins_rows(void* ctx, uint32_t b, uint32_t e_, uint32_t wk) {
@@ -1209,7 +1490,8 @@ static int export_merge(const Opt* o, const HomePlanet* hp) {
     Biomap out;
     memset(&out, 0, sizeof out);
     Biomap parts[BIOMAP_MAX_REGIONS];
-    int np = 0;
+    static char part_path[BIOMAP_MAX_REGIONS][1100];
+    int np = 0, np_paths = 0;
     size_t total = 0;
     for (int k = 0; k < L->n; ++k) {
         Biomap m;
@@ -1237,6 +1519,7 @@ static int export_merge(const Opt* o, const HomePlanet* hp) {
         total += m.ncells;
         if (m.sim_year > out.sim_year) out.sim_year = m.sim_year;
         out.gates |= m.gates;
+        snprintf(part_path[np_paths++], sizeof part_path[0], "%s", L->p[k]);
         parts[np++] = m;
     }
     free(L);
@@ -1248,11 +1531,24 @@ static int export_merge(const Opt* o, const HomePlanet* hp) {
     out.cells = (uint32_t*)malloc(sizeof(uint32_t) * (total ? total : 1));
     uint8_t* bins = (uint8_t*)malloc(total ? total : 1);
     int rc = 1;
-    if (!out.cells || !bins) { fprintf(stderr, "merge: out of memory\n"); goto done; }
+    int any_morph = 0;
+    for (int k = 0; k < np; ++k) any_morph |= parts[k].morph != NULL;
+    if (any_morph) out.morph = (uint32_t*)calloc(total ? total : 1, sizeof(uint32_t));     /* version 2: parts without shapes stay 0 */
+    if (!out.cells || !bins || (any_morph && !out.morph)) { fprintf(stderr, "merge: out of memory\n"); goto done; }
     memset(bins, 0xFF, total ? total : 1);       /* cells outside every region keep 255: not counted */
     {
         size_t off = 0;
-        for (int k = 0; k < np; ++k) { memcpy(out.cells + off, parts[k].cells, sizeof(uint32_t) * parts[k].ncells); off += parts[k].ncells; }
+        int64_t atm[BIOMAP_ATM] = { 0 };
+        int natm = 0;
+        for (int k = 0; k < np; ++k) {
+            memcpy(out.cells + off, parts[k].cells, sizeof(uint32_t) * parts[k].ncells);
+            if (out.morph && parts[k].morph) memcpy(out.morph + off, parts[k].morph, sizeof(uint32_t) * parts[k].ncells);
+            if (parts[k].atm_known) { for (int g = 0; g < BIOMAP_ATM; ++g) atm[g] += parts[k].atm_ppm[g]; ++natm; }
+            off += parts[k].ncells;
+        }
+        /* the sky: the mean of the islands' atmospheres (with the hub they are one) */
+        for (int g = 0; g < BIOMAP_ATM && natm; ++g) out.atm_ppm[g] = (int32_t)(atm[g] / natm);
+        out.atm_known = natm > 0;
     }
     /* combined fallback: the environment class of every region cell (as bio_env_build
      * stores it), then the same statistics as bio_sim_vegetation over all regions */
@@ -1282,6 +1578,29 @@ static int export_merge(const Opt* o, const HomePlanet* hp) {
             const int64_t cov = kcov[b][best] / ncell[b], hgt = khgt[b][best] / kcnt[b][best];
             out.fallback[b] = cov > 0 ? BIOCELL((uint32_t)best, pi, (uint32_t)cov, (uint32_t)hgt, 0u) : 0u;
         }
+        if (out.morph) {      /* the commonest shape per environment class, among its cells of the fallback kind */
+            static int64_t mc[64][5], ma[64][8], ml[64][4], mp[64][4], mq[64][16], mpig[64], mn[64];
+            memset(mc, 0, sizeof mc); memset(ma, 0, sizeof ma); memset(ml, 0, sizeof ml); memset(mp, 0, sizeof mp);
+            memset(mq, 0, sizeof mq); memset(mpig, 0, sizeof mpig); memset(mn, 0, sizeof mn);
+            for (size_t c = 0; c < total; ++c) {
+                const int b = bins[c];
+                const uint32_t mw = out.morph[c];
+                if (b > 63 || !(mw & BIOMORPH_VALID) || !out.fallback[b] || BIOCELL_KIND(out.cells[c]) != BIOCELL_KIND(out.fallback[b])) continue;
+                if (BIOMORPH_CROWN(mw) < 5) mc[b][BIOMORPH_CROWN(mw)]++;
+                ma[b][BIOMORPH_ASPECT(mw)]++; ml[b][BIOMORPH_LEAFANG(mw)]++; mp[b][BIOMORPH_POROSITY(mw)]++; mq[b][BIOMORPH_QWIDTH(mw)]++;
+                mpig[b] += BIOMORPH_PIG(mw); mn[b]++;
+            }
+            for (int b = 0; b < 64; ++b) {
+                if (!mn[b]) continue;
+                uint32_t bc = 0, ba = 0, bl = 0, bp = 0, bq = 0;
+                for (uint32_t q = 1; q < 5; ++q) if (mc[b][q] > mc[b][bc]) bc = q;
+                for (uint32_t q = 1; q < 8; ++q) if (ma[b][q] > ma[b][ba]) ba = q;
+                for (uint32_t q = 1; q < 4; ++q) if (ml[b][q] > ml[b][bl]) bl = q;
+                for (uint32_t q = 1; q < 4; ++q) if (mp[b][q] > mp[b][bp]) bp = q;
+                for (uint32_t q = 1; q < 16; ++q) if (mq[b][q] > mq[b][bq]) bq = q;
+                out.fallback_morph[b] = BIOMORPH(bc, ba, bl, bp, (uint32_t)(mpig[b] / mn[b]), bq);
+            }
+        }
         if (np == 1) {
             int same = 1;
             for (int b = 0; b < 64; ++b) same &= out.fallback[b] == parts[0].fallback[b];
@@ -1296,13 +1615,59 @@ static int export_merge(const Opt* o, const HomePlanet* hp) {
         if (mkdirs_for(path) || biomap_save(path, &out)) { fprintf(stderr, "merge: cannot write %s\n", path); goto done; }
         print_kinds("merge", out.cells, out.ncells);
         print_fallback(out.fallback, out.fallback_on);
-        printf("merge: wrote %s: %d region(s), sim year %u, gates %02x, planet %016llx seed %u\n", path, out.nreg, out.sim_year,
-               out.gates, (unsigned long long)ph, out.seed);
+        if (out.morph) print_shapes("merge", out.cells, out.morph, out.ncells);
+        printf("merge: wrote %s (%s): %d region(s), sim year %u, gates %02x, planet %016llx seed %u\n", path,
+               out.morph ? "version 2" : "version 1", out.nreg, out.sim_year, out.gates, (unsigned long long)ph, out.seed);
+        if (out.atm_known)
+            printf("merge: atmosphere for the sky: H2S %.2f%% CH4 %.2f%% NH3 %.2f%% CO2 %.3f%% O2 %.3f%% N2 %.2f%% H2 %.3f%%\n", out.atm_ppm[0] / 1e4,
+                   out.atm_ppm[1] / 1e4, out.atm_ppm[2] / 1e4, out.atm_ppm[3] / 1e4, out.atm_ppm[4] / 1e4, out.atm_ppm[5] / 1e4, out.atm_ppm[6] / 1e4);
+        /* creatures: fauna_<K>.bin beside each part -> one file beside the biomap (home.fauna) */
+        Fauna all;
+        memset(&all, 0, sizeof all);
+        all.rec = (FaunaRec*)malloc(sizeof(FaunaRec) * (size_t)FAUNA_MAX * (size_t)(np > 0 ? np : 1));
+        uint32_t nf = 0, nfiles = 0;
+        for (int k = 0; all.rec && k < np_paths; ++k) {
+            char fp[1300];
+            snprintf(fp, sizeof fp, "%s", part_path[k]);
+            char* sl = strrchr(fp, '/');
+            char* bs = strrchr(fp, '\\');
+            if (bs && (!sl || bs > sl)) sl = bs;
+            const char* base = sl ? sl + 1 : fp;
+            int isl = -1;
+            if (sscanf(base, "biopart_%d.bin", &isl) != 1) continue;
+            snprintf(sl ? sl + 1 : fp, sizeof fp - (size_t)(sl ? sl + 1 - fp : 0), "fauna_%d.bin", isl);
+            Fauna f1;
+            if (fauna_load(fp, &f1)) continue;
+            if (f1.planet_hash == ph) {
+                memcpy(all.rec + nf, f1.rec, sizeof(FaunaRec) * f1.count);
+                nf += f1.count; all.total += f1.total; ++nfiles;
+                memcpy(all.palette, f1.palette, sizeof all.palette);
+            }
+            fauna_free(&f1);
+        }
+        if (all.rec && nfiles) {
+            qsort(all.rec, nf, sizeof(FaunaRec), fauna_size_cmp);
+            all.count = nf > FAUNA_MAX ? FAUNA_MAX : nf;
+            all.planet_hash = ph; all.seed = hp->system_seed; all.sim_year = out.sim_year;
+            char fo[1300];
+            if (o->fauna) snprintf(fo, sizeof fo, "%s", o->fauna);
+            else {
+                snprintf(fo, sizeof fo, "%s", path);
+                char* dot = strrchr(fo, '.');
+                char* sl = strrchr(fo, '/');
+                if (dot && (!sl || dot > sl)) *dot = 0;
+                strncat(fo, ".fauna", sizeof fo - strlen(fo) - 1);
+            }
+            if (mkdirs_for(fo) || fauna_save(fo, &all)) fprintf(stderr, "merge: cannot write %s\n", fo);
+            else printf("merge: wrote %s: %u of %u creatures from %u island file(s)\n", fo, all.count, all.total, nfiles);
+        }
+        free(all.rec);
     }
     rc = 0;
 done:
     for (int k = 0; k < np; ++k) biomap_free(&parts[k]);
     free(out.cells);
+    free(out.morph);
     free(bins);
     return rc;
 }
@@ -1360,6 +1725,249 @@ static int stage_lifetest(const Opt* o) {
 }
 
 /* ======================================================================================
+ * hub, seed bank, rebase, inoculation
+ * ====================================================================================== */
+static int parse_int_list(const char* list, int* out, int max) {
+    int n = 0;
+    char buf[512];
+    snprintf(buf, sizeof buf, "%s", list ? list : "");
+    for (char* t = strtok(buf, ", "); t && n < max; t = strtok(NULL, ", ")) out[n++] = atoi(t);
+    return n;
+}
+static int split_list(const char* list, char out[][1024], int max) {
+    int n = 0;
+    const char* p = list ? list : "";
+    while (*p && n < max) {
+        const char* e = strchr(p, ',');
+        const size_t l = e ? (size_t)(e - p) : strlen(p);
+        if (l && l < 1024) { memcpy(out[n], p, l); out[n][l] = 0; ++n; }
+        if (!e) break;
+        p = e + 1;
+    }
+    return n;
+}
+
+/* One pass of the island hub (bio_hub.c). With --runs the islands' run folders are
+ * on this machine and the hub carries the files itself; for rigs cluster/bio_hub.ps1
+ * copies outboxes into DIR/in before, and DIR/out/<k> into the inboxes after. */
+static int stage_hub(const Opt* o) {
+    HomePlanet hp;
+    if (load_planet(o->planet, &hp)) return 1;
+    int isl[16];
+    const int n = parse_int_list(o->islands, isl, 16);
+    if (n < 1) { fprintf(stderr, "life-hub needs --islands 0,1,...\n"); return 2; }
+    const char* dir = o->dir ? o->dir : DEFAULT_HUB;
+    static char runs[16][1024];
+    const int nr = split_list(o->runs, runs, 16);
+    if (nr && nr != n) { fprintf(stderr, "life-hub: --runs needs one folder per island of --islands (%d given for %d islands)\n", nr, n); return 2; }
+    char a[1200], b[1200];
+    snprintf(b, sizeof b, "%s/in", dir);
+    for (int k = 0; k < nr; ++k) {             /* in/ holds, per island, what its outbox holds now */
+        char pre[2][32];
+        snprintf(a, sizeof a, "%s/outbox", runs[k]);
+        snprintf(pre[0], sizeof pre[0], "atm_%d_", isl[k]);
+        snprintf(pre[1], sizeof pre[1], "mig_%d_", isl[k]);
+        for (int q = 0; q < 2; ++q)
+            if (bio_dir_mirror(a, b, pre[q]) < 0) { fprintf(stderr, "life-hub: cannot copy %s to %s\n", a, b); return 1; }
+    }
+    static char report[4096];
+    const int32_t ocean_ppm = (int32_t)lround(hp.ocean_cover * 1e6);
+    const int rc = bio_hub_run(dir, isl, n, ocean_ppm, report, sizeof report);
+    if (rc < 0) { fprintf(stderr, "life-hub: %s\n", bio_error()); return 1; }
+    fputs(report, stdout);
+    printf("hub: planet ocean cover %.1f%%; state in %s/hub_state.txt, atmosphere in %s/atm_global.txt\n", ocean_ppm / 1e4, dir, dir);
+    for (int k = 0; k < nr; ++k) {
+        snprintf(a, sizeof a, "%s/out/%d", dir, isl[k]);
+        snprintf(b, sizeof b, "%s/inbox", runs[k]);
+        const int c = bio_dir_copy(a, b, "");
+        if (c < 0) { fprintf(stderr, "life-hub: cannot copy %s to %s\n", a, b); return 1; }
+        bio_dir_clear(a);
+        printf("hub: island %d: %d file(s) into %s\n", isl[k], c, b);
+    }
+    return 0;
+}
+
+/* A run folder opened on its own authority: env.bin says which planet and island it
+ * is, no planet file needed (the run may be of another planet). CPU unless --device. */
+static int open_run_any(const Opt* o, const char* dir, BioEnv* e, BioSim** s, uint64_t* step) {
+    char path[1100];
+    snprintf(path, sizeof path, "%s/env.bin", dir);
+    uint32_t q = 0, fc = 0;
+    const int rc = bio_env_load(path, e, &q, &fc);
+    if (rc) { fprintf(stderr, "%s: %s\n", path, rc == -1 ? "cannot read it" : rc == -3 ? "CRC mismatch (corrupt)" : "not a valid env file"); return 1; }
+    BioConfig cfg;
+    bio_config_default(&cfg);
+    cfg.device = o->device_set ? o->device : -1;
+    cfg.duty = 1.0;
+    static SpectrumFile sf;                      /* needed only when the run uses light in bands */
+    if (!o->no_spectrum && !spectrum_load(o->spectrum ? o->spectrum : DEFAULT_SPECTRUM, &sf)) cfg.spectrum = &sf;
+    *s = ck_load_newest(dir, e, &cfg, step, 1);
+    if (!*s) { fprintf(stderr, "no valid checkpoint in %s\n", dir); bio_env_free(e); return 1; }
+    return 0;
+}
+
+typedef struct DirList { char name[64][160]; int n; } DirList;
+static void dir_add(void* ctx, const char* name) {
+    DirList* L = (DirList*)ctx;
+    if (L->n < 64 && strlen(name) < 160) snprintf(L->name[L->n++], 160, "%s", name);
+}
+
+static void bank_table(const BioBankRec* r, uint32_t n) {
+    int cls[BIO_GUILD_N][BIO_HAB_N];
+    memset(cls, 0, sizeof cls);
+    for (uint32_t k = 0; k < n; ++k) cls[r[k].guild][r[k].habitat]++;
+    printf("  genomes        marine  coastal     land\n");
+    for (int g = 0; g < BIO_GUILD_N; ++g)
+        printf("  %-12s %8d %8d %8d\n", bio_guild_name(g), cls[g][BIO_HAB_MARINE], cls[g][BIO_HAB_COASTAL], cls[g][BIO_HAB_LAND]);
+}
+
+/* life-seedbank: the best genomes per guild x habitat of every island under --runs */
+static int stage_seedbank(const Opt* o) {
+    if (!o->runs) { fprintf(stderr, "life-seedbank needs --runs DIR (a folder of island_* runs, or one run)\n"); return 2; }
+    static DirList L;
+    L.n = 0;
+    char probe[1100];
+    snprintf(probe, sizeof probe, "%s/env.bin", o->runs);
+    if (file_exists(probe)) dir_add(&L, ".");
+    else list_dir(o->runs, "island_", "", dir_add, &L);
+    if (!L.n) { fprintf(stderr, "life-seedbank: no run (env.bin) in %s or in its island_* folders\n", o->runs); return 1; }
+    qsort(L.name, (size_t)L.n, sizeof L.name[0], cmp_str);
+    const uint32_t per = o->n ? o->n : 2000;
+    BioBankRec* all = NULL;
+    uint32_t na = 0;
+    uint64_t ph = 0;
+    int used = 0;
+    for (int k = 0; k < L.n; ++k) {
+        char dir[1300];
+        if (!strcmp(L.name[k], ".")) snprintf(dir, sizeof dir, "%s", o->runs);
+        else snprintf(dir, sizeof dir, "%s/%s", o->runs, L.name[k]);
+        snprintf(probe, sizeof probe, "%s/env.bin", dir);
+        if (!file_exists(probe)) continue;
+        BioEnv e;
+        BioSim* s = NULL;
+        uint64_t step = 0;
+        if (open_run_any(o, dir, &e, &s, &step)) continue;
+        if (used && e.planet_hash != ph) {
+            fprintf(stderr, "life-seedbank: %s is of planet %016llx, the others of %016llx: skipped\n", dir, (unsigned long long)e.planet_hash, (unsigned long long)ph);
+            bio_sim_destroy(s); bio_env_free(&e);
+            continue;
+        }
+        ph = e.planet_hash;
+        BioBankRec* r = NULL;
+        uint32_t n = 0;
+        if (bio_sim_bank(s, &r, &n)) fprintf(stderr, "life-seedbank: %s: %s\n", dir, bio_error());
+        else {
+            const uint32_t kept = bio_bank_top(r, n, per);      /* per island first: bounds the memory */
+            BioBankRec* grown = (BioBankRec*)realloc(all, sizeof(BioBankRec) * ((size_t)na + kept + 1));
+            if (grown) { all = grown; memcpy(all + na, r, sizeof(BioBankRec) * kept); na += kept; ++used; }
+            printf("seedbank: %s: island %d at year %.1f, %u live agents, %u genome x habitat records, %u kept\n", dir, e.island,
+                   step / (double)STEPS_YEAR, s->n_live, n, kept);
+        }
+        free(r);
+        bio_sim_destroy(s); bio_env_free(&e);
+    }
+    if (!used) { fprintf(stderr, "life-seedbank: no run could be read\n"); free(all); return 1; }
+    na = bio_bank_top(all, na, per);
+    const char* out = o->out ? o->out : DEFAULT_BANK;
+    if (mkdirs_for(out) || bio_bank_save(out, all, na, ph)) { fprintf(stderr, "life-seedbank: cannot write %s: %s\n", out, bio_error()); free(all); return 1; }
+    printf("seedbank: wrote %s: %u genomes of %d island(s) of planet %016llx, the best %u per guild x habitat\n", out, na, used, (unsigned long long)ph, per);
+    bank_table(all, na);
+    free(all);
+    return 0;
+}
+
+/* life-rebase: a new run on this planet founded from a seed bank; writes its
+ * first checkpoint and stops (life --island K --resume takes it from there) */
+static int stage_life(const Opt* o);
+static int stage_rebase(const Opt* o) {
+    if (!o->bank || o->island < 0) { fprintf(stderr, "life-rebase needs --bank FILE and --island K\n"); return 2; }
+    Opt o2 = *o;
+    o2.stage = "life";
+    o2.resume = 0;
+    o2.stop_at_start = 1;
+    o2.seed_n = o->n ? o->n : 20000;
+    return stage_life(&o2);
+}
+
+/* "producer@land", "consumer", "land_plant", ... -> guild, habitat (-1 = any); 0 ok */
+static int parse_guild(const char* spec, int* guild, int* habitat) {
+    *guild = -1; *habitat = -1;
+    if (!spec || !*spec) return -1;
+    if (!strcmp(spec, "land_plant")) { *guild = BIO_GUILD_PRODUCER; *habitat = BIO_HAB_LAND; return 0; }
+    if (!strcmp(spec, "land_animal")) { *guild = BIO_GUILD_CONSUMER; *habitat = BIO_HAB_LAND; return 0; }
+    char buf[96];
+    snprintf(buf, sizeof buf, "%s", spec);
+    char* at = strchr(buf, '@');
+    if (at) *at++ = 0;
+    if (strcmp(buf, "any") && strcmp(buf, "all")) {
+        for (int g = 0; g < BIO_GUILD_N; ++g) if (!strcmp(buf, bio_guild_name(g))) *guild = g;
+        if (*guild < 0) return -1;
+    }
+    if (at && strcmp(at, "any")) {
+        for (int h = 0; h < BIO_HAB_N; ++h) if (!strcmp(at, bio_habitat_name(h))) *habitat = h;
+        if (*habitat < 0) return -1;
+    }
+    return 0;
+}
+
+/* life-inoculate: evolved genomes of one guild from run A's newest checkpoint into
+ * run B's, into cells of their habitat. Genomes only, never behaviour; logged. */
+static int stage_inoculate(const Opt* o) {
+    int guild, habitat;
+    if (!o->from || !o->to || parse_guild(o->guild, &guild, &habitat)) {
+        fprintf(stderr, "life-inoculate needs --from RUN --to RUN --guild G, G = producer | chemotroph | decomposer | consumer | any, "
+                        "optionally @marine | @coastal | @land, or land_plant, land_animal\n");
+        return 2;
+    }
+    const uint32_t want = o->n ? o->n : 500;
+    BioEnv ea, eb;
+    BioSim* a = NULL; BioSim* b = NULL;
+    uint64_t sa = 0, sb = 0;
+    if (open_run_any(o, o->from, &ea, &a, &sa)) return 1;
+    BioBankRec* r = NULL;
+    uint32_t n = 0;
+    int rc = 1;
+    if (bio_sim_bank(a, &r, &n)) { fprintf(stderr, "life-inoculate: %s\n", bio_error()); bio_sim_destroy(a); bio_env_free(&ea); return 1; }
+    n = bio_bank_top(r, n, 2000);
+    const uint64_t pha = ea.planet_hash;
+    const int isla = ea.island;
+    bio_sim_destroy(a); bio_env_free(&ea);
+    if (open_run_any(o, o->to, &eb, &b, &sb)) { free(r); return 1; }
+    const uint32_t before = b->n_live;
+    const int placed = bio_sim_seed_bank(b, r, n, want, guild, habitat);
+    if (placed <= 0) {
+        fprintf(stderr, "life-inoculate: nothing placed: %s\n", placed < 0 ? bio_error() : "the source has no such genomes, or the target island no such habitat");
+        goto out;
+    }
+    {   /* the checkpoint it replaces is kept aside */
+        char keep[1200], pre[64], kept[1300];
+        snprintf(keep, sizeof keep, "%s/before_inoculate", o->to);
+        snprintf(pre, sizeof pre, "ckpt_%012llu", (unsigned long long)sb);
+        snprintf(kept, sizeof kept, "%s/%s.bin", keep, pre);
+        FILE* kf = fopen(kept, "rb");
+        if (kf) fclose(kf);      /* an earlier inoculation at this step: that copy is the untouched checkpoint and stays */
+        else if (bio_dir_copy(o->to, keep, pre) < 1) {
+            fprintf(stderr, "life-inoculate: cannot keep a copy of the checkpoint in %s: nothing was changed\n", keep);
+            goto out;
+        }
+        double secs, mb;
+        if (ck_save(b, o->to, sb, &secs, &mb)) goto out;
+        stage_log(o->to, "step=%llu year=%.3f INTERVENTION inoculate %d founders of guild %s@%s from %s (island %d of planet %016llx, year %.1f); live %u -> %u",
+                  (unsigned long long)sb, sb / (double)STEPS_YEAR, placed, bio_guild_name(guild), bio_habitat_name(habitat), o->from, isla,
+                  (unsigned long long)pha, sa / (double)STEPS_YEAR, before, b->n_live);
+        printf("inoculate: %d founders of guild %s@%s from %s (island %d, planet %016llx) into %s (island %d): live %u -> %u\n", placed,
+               bio_guild_name(guild), bio_habitat_name(habitat), o->from, isla, (unsigned long long)pha, o->to, eb.island, before, b->n_live);
+        printf("inoculate: wrote ckpt_%012llu.bin (%.0f MB; the one before is in %s) and logged the intervention in stages.log\n",
+               (unsigned long long)sb, mb, keep);
+        rc = 0;
+    }
+out:
+    free(r);
+    bio_sim_destroy(b); bio_env_free(&eb);
+    return rc;
+}
+
+/* ======================================================================================
  * dispatch
  * ====================================================================================== */
 int bio_main(int argc, char** argv) {
@@ -1367,16 +1975,12 @@ int bio_main(int argc, char** argv) {
     static const struct { const char* name; int (*fn)(const Opt*); } T[] = {
         { "env", stage_env }, { "life", stage_life }, { "life-test", stage_lifetest }, { "bioexport", stage_bioexport },
         { "biostat", stage_biostat }, { "biomap-test", stage_biomaptest },
+        { "life-hub", stage_hub }, { "life-seedbank", stage_seedbank }, { "life-rebase", stage_rebase },
+        { "life-inoculate", stage_inoculate },
     };
     int (*fn)(const Opt*) = NULL;
     for (size_t i = 0; i < sizeof T / sizeof T[0]; ++i) if (!strcmp(argv[1], T[i].name)) fn = T[i].fn;
-    if (!fn) {
-        if (!strcmp(argv[1], "life-rebase") || !strcmp(argv[1], "life-seedbank") || !strcmp(argv[1], "life-inoculate")) {
-            fprintf(stderr, "%s is not implemented yet (milestone M6)\n", argv[1]);
-            return 2;
-        }
-        return -1;
-    }
+    if (!fn) return -1;
     Opt o;
     if (parse(argc, argv, &o)) { usage(); return 2; }
     platform_init();

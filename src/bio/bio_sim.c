@@ -4,6 +4,7 @@
 #include "bio_internal.h"
 #include "../platform.h"
 #include "../jobs.h"
+#include "../spectrum_file.h"
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -92,6 +93,9 @@ void bio_config_default(BioConfig* c) {
     c->barrier_q8 = 256;
     c->atm_scale_ppm = 100;   /* 1e-4 of the real column */
     c->closed_box = 0;
+    c->features = BIO_F_ALL;  /* a new run has everything; light in bands also needs a spectrum file */
+    c->enable = 0;
+    c->spectrum = NULL;
 }
 
 /* ---- sim memory (device or host) --------------------------------------------- */
@@ -136,9 +140,12 @@ void bio_agent_array(const BioWorld* w, int k, void** p, int* elem) {
                            w->age, w->flags, w->rbase, w->elast, w->gslot, w->uid, w->tr,
                            w->lineage, w->parent, w->bstep };
     if (k < 20) { *p = a4[k]; *elem = 4; return; }
+    if (k == 30) { *p = w->tr2; *elem = 4; return; }
+    if (k == 31) { *p = w->eco; *elem = 4; return; }
     *elem = 8;
     if (k == 20) { *p = w->hid; return; }
     if (k == 21) { *p = w->out; return; }
+    if (k == 32) { *p = w->expl; return; }
     *p = w->dW + (size_t)(k - 22) * w->cap;
 }
 
@@ -149,7 +156,7 @@ static int       g_prof = -1;
 static const char* const g_kname[BK_N] = { "k_globals", "k_env", "k_summary", "k_pre", "k_supply", "k_metab",
     "k_scan_a", "k_scan_b", "k_birth", "k_free", "k_gather32", "k_gather64", "k_stats",
     "k_sort_count", "k_cscan_a", "k_cscan_b", "k_cscan_c", "k_sort_scatter", "k_sort_fix", "k_permute32", "k_permute64",
-    "k_think_list", "k_think" };
+    "k_think_list", "k_think", "k_feed" };
 
 static int gpu_init(BioSim* s) {
     if (rt_init(s->cfg.device, &s->dev)) { bio_set_error("CUDA init (device %d): %s", s->cfg.device, rt_error()); return -1; }
@@ -215,7 +222,7 @@ static int stage_raw(BioSim* s, int id, int arg, int arg2) {
     switch (id) {
     case BK_GLOBALS: r = rt_launch(s->k[id], 1, 32, 0, a1); break;
     case BK_ENV: case BK_SUPPLY: r = rt_launch(s->k[id], blocks((uint64_t)w->n_cells, BIO_BLOCK), BIO_BLOCK, 0, a1); break;
-    case BK_SUMMARY: case BK_PRE: case BK_METAB: case BK_BIRTH: case BK_FREE:
+    case BK_SUMMARY: case BK_PRE: case BK_METAB: case BK_FEED: case BK_BIRTH: case BK_FREE:
         if (!w->n_slots) return 0;
         r = rt_launch(s->k[id], blocks(w->n_slots, BIO_BLOCK), BIO_BLOCK, 0, a1);
         break;
@@ -327,6 +334,9 @@ static int alloc_all(BioSim* s) {
     A(cscan, uint32_t, n / BIO_SCAN_BLOCK + 2);
     A(gen, BioGenome, cap); A(fstack, uint32_t, cap);
     A(part, int64_t, BIO_STAT_N);
+    A(SP, BioSpectral, 1);
+    A(pslot, uint32_t, n * BIO_PSLOTS); A(mslot, uint32_t, n * BIO_MSLOTS); A(thr, uint32_t, n); A(nmot, uint32_t, n);
+    A(claim, uint64_t, sl); A(tr2, uint32_t, sl); A(eco, uint32_t, sl); A(expl, uint64_t, sl);
 #undef A
     s->scratch = sim_alloc(s, 8 * sl);
     return s->scratch ? 0 : -1;
@@ -352,7 +362,106 @@ static BioWorld host_view(BioSim* s) {
     BioWorld hw = s->w;
     hw.T = &s->tables;
     hw.G = &s->Gh;
+    hw.SP = s->spectral;
     return hw;
+}
+
+/* ---- features ------------------------------------------------------------------ */
+uint32_t bio_spectrum_crc(const struct SpectrumFile* f) {
+    static uint8_t buf[SPECF_HDR + SPECF_PAYLOAD_BYTES];
+    spectrum_serialize(f, buf);
+    return specf_get32(buf + 56);
+}
+
+/* Light in bands: the tables into sim memory, then the two harvest efficiencies,
+ * retuned so that a reference leaf (pigment 200, hue bin 8, at the surface, summed
+ * over the day at the present haze) yields what the scalar model gives it. The
+ * energy scale of the world stays; which light a pigment catches is what changes. */
+int bio_set_spectrum(BioSim* s, const struct SpectrumFile* f) {
+    if (!f) { bio_set_error("no spectrum file"); return -1; }
+    if (f->planet_hash && s->planet_hash && f->planet_hash != s->planet_hash) {
+        bio_set_error("the spectrum file was made for planet %016llx, this run is on %016llx",
+                      (unsigned long long)f->planet_hash, (unsigned long long)s->planet_hash);
+        return -1;
+    }
+    if (!s->spectral) s->spectral = (BioSpectral*)calloc(1, sizeof(BioSpectral));
+    if (!s->spectral) { bio_set_error("out of memory"); return -1; }
+    BioSpectral* sp = s->spectral;
+    memcpy(sp->surf_q16, f->surf_q16, sizeof sp->surf_q16);
+    memcpy(sp->water_q16, f->water_T_q16, sizeof sp->water_q16);
+    memcpy(sp->kw_q16, f->kw_q16, sizeof sp->kw_q16);
+    memcpy(sp->phot_q16, f->phot_q16, sizeof sp->phot_q16);
+    memcpy(sp->ev_q16, f->ev_q16, sizeof sp->ev_q16);
+    memcpy(sp->uphill_q16, f->uphill_q16, sizeof sp->uphill_q16);
+    memcpy(sp->eps_q12, f->eps_q12, sizeof sp->eps_q12);
+    if (bio_copy_in(s, (void*)s->w.SP, sp, sizeof *sp)) return -1;
+    BioParams* P = &s->w.P;
+    const uint32_t crc = bio_spectrum_crc(f);
+    if (P->light_mode == BIO_LIGHT_SPECTRAL && (uint32_t)P->spectrum_crc == crc && P->eff_sp_oxy_q16 > 0) return 0;   /* resumed: keep the calibration */
+    P->light_mode = BIO_LIGHT_SPECTRAL;
+    P->spectrum_crc = (int32_t)crc;
+    {
+        BioWorld hw = host_view(s);
+        const int32_t haze = s->Gh.haze_q12 > 0 ? s->Gh.haze_q12 : 4096;
+        int32_t d = 4096 - haze, k = d >> 8, fr = d & 255;
+        if (d < 0) { k = 0; fr = 0; }
+        if (k > BIO_NHAZE - 2) { k = BIO_NHAZE - 2; fr = 255; }
+        int64_t sum_l = 0, sum_q[2] = { 0, 0 };
+        for (int hr = 0; hr < 24; ++hr) {
+            const int64_t sn = bio_sin24(hr) > 0 ? bio_sin24(hr) : 0;
+            sum_l += ((int64_t)s->w.s_top * P->par_q12 * haze / 4096 * sn) >> 24;
+            int32_t ib[BIO_NB];
+            for (int b = 0; b < BIO_NB; ++b) {
+                const int64_t a = sp->surf_q16[k][hr][b], c = sp->surf_q16[k + 1][hr][b];
+                const int64_t share = a + (((c - a) * fr) >> 8);
+                ib[b] = share > 0 ? (int32_t)(((int64_t)s->w.s_top * share) >> 8) : 0;
+            }
+            int64_t q[2];
+            bio_harvest(&hw, ib, 200, 128, 0, q);
+            sum_q[0] += q[0]; sum_q[1] += q[1];
+        }
+        if (sum_q[0] <= 0 || sum_q[1] <= 0 || sum_l <= 0) { bio_set_error("spectrum file gives no light"); return -1; }
+        const int64_t eo = sum_l * P->eff_oxy_q16 / 255 * 200 * 256 / sum_q[0];
+        const int64_t ea = sum_l * P->eff_anox_q16 / 255 * 200 * 256 / sum_q[1];
+        P->eff_sp_oxy_q16 = (int32_t)(eo > 0x7FFFFFFF ? 0x7FFFFFFF : eo);
+        P->eff_sp_anox_q16 = (int32_t)(ea > 0x7FFFFFFF ? 0x7FFFFFFF : ea);
+    }
+    return 0;
+}
+
+/* Parameters of the features, filled in where still zero (a new run, or a
+ * checkpoint from before the feature). The crown model's gain needs this
+ * planet's day: it scales the leaf projection k so that the reference foliage
+ * (a thin ellipsoid crown, mid leaf angle) has a light-weighted mean
+ * projection of 1, gain = sum(lt) / sum(lt k) over the hours. In light too
+ * weak to saturate a leaf such a crown then gains over a day what its leaf
+ * area gained without the model; other shapes gain or lose against it, and
+ * strong light is used less well by every land leaf (bio_saturate). */
+void bio_features_init(BioSim* s) {
+    BioParams* P = &s->w.P;
+    bio_params_features(P);
+    if (!P->morph_gain_q8) {
+        const int32_t haze = s->Gh.haze_q12 > 0 ? s->Gh.haze_q12 : 4096;
+        int64_t num = 0, den = 0;
+        for (int hr = 0; hr < 24; ++hr) {
+            const int64_t sn = bio_sin24(hr) > 0 ? bio_sin24(hr) : 0;
+            const int64_t lt = ((int64_t)s->w.s_top * P->par_q12 * haze / 4096 * sn) >> 24;                 /* W/m^2 */
+            if (lt <= 0) continue;
+            int64_t k = ((int64_t)s->tables.kleaf_q12[8][hr] * bio_crown_clump_q8(0)) >> 8;                 /* q12 */
+            if (k < 64) k = 64;                                                                             /* as bio_crown */
+            num += lt * 4096;
+            den += lt * k;
+        }
+        int64_t g = den > 0 ? num * 256 / den : 256;
+        if (g < 64) g = 64;
+        if (g > 4096) g = 4096;
+        P->morph_gain_q8 = (int32_t)g;
+    }
+}
+
+uint32_t bio_sim_features(const BioSim* s) {
+    if (!s) return 0;
+    return ((uint32_t)s->w.P.feat & BIO_F_ALL) | (s->w.P.light_mode == BIO_LIGHT_SPECTRAL ? BIO_F_SPECTRAL : 0u);
 }
 
 static int init_fields(BioSim* s) {
@@ -420,6 +529,7 @@ BioSim* bio_sim_create(const BioEnv* env, const BioConfig* cfg) {
     w->P.barrier_q8 = cfg->barrier_q8 > 0 ? cfg->barrier_q8 : 256;
     w->P.atm_scale_ppm = cfg->atm_scale_ppm > 0 ? cfg->atm_scale_ppm : 100;
     w->P.closed_box = cfg->closed_box ? 1 : 0;
+    w->P.feat = (int32_t)(cfg->features & BIO_F_ALL);
     if (env->organic_ppm > 0) w->P.weath_doc_q16 = (int32_t)((int64_t)w->P.weath_doc_q16 * env->organic_ppm / 3800);
     /* capacity: configured, or from free device memory leaving >= 1.5 GB to others */
     uint32_t cap = cfg->cap;
@@ -427,9 +537,9 @@ BioSim* bio_sim_create(const BioEnv* env, const BioConfig* cfg) {
         if (s->gpu) {
             size_t fr = 0, tt = 0;
             rt_mem_info(&fr, &tt);
-            const int64_t cells = (int64_t)w->n_cells * 420;
+            const int64_t cells = (int64_t)w->n_cells * 452;
             const int64_t avail = (int64_t)fr - ((int64_t)1536 << 20) - ((int64_t)128 << 20) - cells;
-            int64_t c = avail > 0 ? avail / 860 : 0;
+            int64_t c = avail > 0 ? avail / 924 : 0;
             if (c > 4194304) c = 4194304;
             cap = (uint32_t)c;
         } else cap = 262144;
@@ -442,6 +552,7 @@ BioSim* bio_sim_create(const BioEnv* env, const BioConfig* cfg) {
     if (alloc_all(s) || upload_env(s)) { bio_sim_destroy(s); return NULL; }
     bio_build_tables(&s->tables);
     if (bio_copy_in(s, (void*)w->T, &s->tables, sizeof s->tables)) { bio_sim_destroy(s); return NULL; }
+    bio_params_features(&w->P);
     /* free genome stack: pops return 0, 1, 2, ... */
     {
         uint32_t* fs = (uint32_t*)malloc((size_t)cap * 4);
@@ -457,6 +568,12 @@ BioSim* bio_sim_create(const BioEnv* env, const BioConfig* cfg) {
     atm_init(env, w->P.atm_scale_ppm, s->Gh.atm);
     w->cap_agents = cap;
     { BioWorld hw = host_view(s); bio_globals_update(&hw); }
+    bio_features_init(s);     /* needs the haze just computed */
+    if (cfg->spectrum) {      /* light in bands: needs the haze just computed; then this step's bands */
+        if (bio_set_spectrum(s, cfg->spectrum)) { bio_sim_destroy(s); return NULL; }
+        BioWorld hw = host_view(s);
+        bio_globals_update(&hw);
+    }
     if (bio_g_put(s) || init_fields(s)) { bio_sim_destroy(s); return NULL; }
     for (int32_t c = 0; c < w->n_cells; ++c) {
         if (env->wet[2][c] == 0) s->dry_cells++;
@@ -465,6 +582,7 @@ BioSim* bio_sim_create(const BioEnv* env, const BioConfig* cfg) {
     int64_t st[BIO_STAT_N];
     if (compute_totals(s, s->init_total, st)) { bio_sim_destroy(s); return NULL; }
     s->g0_since = s->g1_since = UINT64_MAX;
+    s->g4_since = UINT64_MAX;
     return s;
 }
 
@@ -475,12 +593,14 @@ void bio_sim_destroy(BioSim* s) {
         else free(s->mem[i]);
     }
     free(s->part_host);
+    free(s->spectral);
     free(s);
 }
 
 /* ---- agents: append / download ------------------------------------------------ */
-static uint64_t rec_get(const BioAgentRec* r, int k, uint32_t cell, uint32_t gslot, uint32_t tr) {
+static uint64_t rec_get(const BioAgentRec* r, int k, uint32_t cell, uint32_t gslot, uint32_t tr, uint32_t tr2) {
     switch (k) {
+    case 30: return tr2;             case 31: return r->eco;          case 32: return r->expl;
     case 0: return (uint32_t)r->x;   case 1: return (uint32_t)r->z;   case 2: return cell;
     case 3: return (uint32_t)r->C;   case 4: return (uint32_t)r->S;   case 5: return (uint32_t)r->E;
     case 6: return (uint32_t)r->N;   case 7: return (uint32_t)r->P;   case 8: return (uint32_t)r->gut;
@@ -494,6 +614,7 @@ static uint64_t rec_get(const BioAgentRec* r, int k, uint32_t cell, uint32_t gsl
 static void rec_set(BioAgentRec* r, int k, uint64_t v) {
     const uint32_t u = (uint32_t)v;
     switch (k) {
+    case 30: break;                     case 31: r->eco = u; break;          case 32: r->expl = v; break;
     case 0: r->x = (int32_t)u; break;   case 1: r->z = (int32_t)u; break;   case 2: break;
     case 3: r->C = (int32_t)u; break;   case 4: r->S = (int32_t)u; break;   case 5: r->E = (int32_t)u; break;
     case 6: r->N = (int32_t)u; break;   case 7: r->P = (int32_t)u; break;   case 8: r->gut = (int32_t)u; break;
@@ -512,7 +633,7 @@ int bio_append_agents(BioSim* s, BioAgentRec* a, uint32_t n, int fresh) {
     if (w->n_slots + n > s->slots && bio_compact(s, 0)) return -1;
     uint32_t* gs = (uint32_t*)malloc((size_t)n * 4);
     uint32_t* cells = (uint32_t*)malloc((size_t)n * 4);
-    uint32_t* trs = (uint32_t*)malloc((size_t)n * 4);
+    uint32_t* trs = (uint32_t*)malloc((size_t)n * 8);     /* tr, then tr2 */
     uint8_t* tmp = (uint8_t*)malloc((size_t)n * 8);
     if (!gs || !cells || !trs || !tmp) { free(gs); free(cells); free(trs); free(tmp); bio_set_error("out of memory"); return -1; }
     int rc = -1;
@@ -535,12 +656,13 @@ int bio_append_agents(BioSim* s, BioAgentRec* a, uint32_t n, int fresh) {
         a[k].z = bio_clampi(a[k].z, 0, (w->h << (w->shift + 8)) - 1);
         cells[k] = (uint32_t)bio_cell_at(w, a[k].x, a[k].z);
         trs[k] = bio_traits(&a[k].g);
+        trs[n + k] = bio_traits2(&a[k].g);
     }
     for (int k = 0; k < BIO_AGENT_ARRAYS; ++k) {
         void* p; int el;
         bio_agent_array(w, k, &p, &el);
         for (uint32_t i = 0; i < n; ++i) {
-            const uint64_t v = rec_get(&a[i], k, cells[i], gs[i], trs[i]);
+            const uint64_t v = rec_get(&a[i], k, cells[i], gs[i], trs[i], trs[n + i]);
             if (el == 4) ((uint32_t*)tmp)[i] = (uint32_t)v; else ((uint64_t*)tmp)[i] = v;
         }
         if (bio_copy_in(s, (uint8_t*)p + (size_t)w->n_slots * el, tmp, (size_t)n * el)) goto done;
@@ -656,7 +778,7 @@ int bio_compact(BioSim* s, int sort) {
     if (scan(s, 1, tot)) return -1;
     if (tot[2] != s->n_live) { bio_set_error("compact: live %u vs %u", tot[2], s->n_live); return -1; }
     static const int order[BIO_AGENT_ARRAYS] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 17, 18, 19,
-                                                 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 11 };   /* flags last */
+                                                 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 11 };   /* flags last */
     for (int oi = 0; oi < BIO_AGENT_ARRAYS; ++oi) {
         void* p; int el;
         bio_agent_array(w, order[oi], &p, &el);
@@ -700,6 +822,7 @@ static int sim_step(BioSim* s) {
     { int64_t* t = w->fld; w->fld = w->fld_new; w->fld_new = t; }
     if (stage(s, BK_SUMMARY, 0, 0) || stage(s, BK_THINK_LIST, 0, 0) || stage(s, BK_THINK, 0, 0) ||
         stage(s, BK_PRE, 0, 0) || stage(s, BK_SUPPLY, 0, 0) || stage(s, BK_METAB, 0, 0)) return -1;
+    if ((w->P.feat & BIO_FEAT_PRED) && stage(s, BK_FEED, 0, 0)) return -1;      /* attackers collect their prey */
     uint32_t tot[3];
     const double t0 = s_prof_on() ? time_now() : 0.0;
     if (scan(s, 0, tot)) return -1;
@@ -761,6 +884,11 @@ static void update_gates(BioSim* s, const int64_t st[BIO_STAT_N]) {
     s->g2_prev_oxy = G->acc[BACC_PATH + BP_OXY];
     /* G3: > 1% of dry land cells vegetated */
     if (s->dry_cells && (uint64_t)st[BS_VEG] * 100 > s->dry_cells) s->gates |= 1u << BIO_G3_LAND_PLANTS;
+    /* G4: >= 1000 land animals (motile, on dry land, living on land producers, 5+ generations) for a sim-year */
+    if (st[BS_LANDANIM] >= 1000) {
+        if (s->g4_since == UINT64_MAX) s->g4_since = step;
+        if (step - s->g4_since >= 8760) s->gates |= 1u << BIO_G4_LAND_ANIMALS;
+    } else s->g4_since = UINT64_MAX;
     /* G5: O2 > 1% of the island box */
     int64_t tot = 0;
     for (int g = 0; g < BIO_ATMG; ++g) tot += G->atm[g] > 0 ? G->atm[g] : 0;
@@ -816,6 +944,15 @@ int bio_sim_stats(BioSim* s, BioStats* o) {
     o->land_cells_vegetated = (uint32_t)st[BS_VEG];
     o->gates = s->gates;
     o->steps_per_s = s->steps_per_s;
+    o->features = bio_sim_features(s);
+    o->consumers = (uint64_t)st[BS_CONSUMER];
+    o->creatures = (uint64_t)st[BS_CREATURE];
+    o->land_animals = (uint64_t)st[BS_LANDANIM];
+    o->sexual = (uint64_t)st[BS_SEXUAL];
+    o->mean_troph = st[BS_CONSUMER] ? 1.0 + (double)st[BS_TROPH] / (16.0 * (double)st[BS_CONSUMER]) : 0.0;
+    o->kills = G->acc2[BACC2_KILLS]; o->bites = G->acc2[BACC2_BITES];
+    o->pred_carbon = G->acc2[BACC2_PRED_C]; o->sexual_births = G->acc2[BACC2_SEXB];
+    for (int g = 0; g < BIO_ATM_N; ++g) { o->xch_all[g] = G->acc2[BACC2_XALL + g]; o->xch_land[g] = G->acc2[BACC2_XLAND + g]; }
     return 0;
 }
 
@@ -925,6 +1062,12 @@ static uint64_t hash_rec(uint64_t h, const BioAgentRec* r) {
     h = bio_fnv64(h, r->dW, sizeof r->dW);
     return bio_fnv64(h, &r->g, sizeof r->g);
 }
+/* state added with the features; hashed only while one of them is on, so a run
+ * with all of them off hashes exactly as the first release did */
+static uint64_t hash_rec2(uint64_t h, const BioAgentRec* r) {
+    h = bio_fnv64(h, &r->eco, 4);
+    return bio_fnv64(h, &r->expl, 8);
+}
 
 uint64_t bio_sim_hash(BioSim* s) {
     if (!s) return 0;
@@ -935,6 +1078,12 @@ uint64_t bio_sim_hash(BioSim* s) {
     h = bio_fnv64(h, hdr, sizeof hdr);
     h = bio_fnv64(h, s->Gh.atm, sizeof s->Gh.atm);
     h = bio_fnv64(h, s->Gh.acc, sizeof s->Gh.acc);
+    const int feat_on = w->P.feat != 0 || w->P.light_mode != BIO_LIGHT_SCALAR;
+    if (feat_on) {
+        const int32_t fm[3] = { w->P.feat, w->P.light_mode, w->P.spectrum_crc };
+        h = bio_fnv64(h, fm, sizeof fm);
+        h = bio_fnv64(h, s->Gh.acc2, sizeof s->Gh.acc2);
+    }
     int64_t* f = (int64_t*)malloc((size_t)w->n_cells * BF_N * 8);
     if (!f) return 0;
     if (bio_fields_get(s, f)) { free(f); return 0; }
@@ -943,7 +1092,7 @@ uint64_t bio_sim_hash(BioSim* s) {
     BioAgentRec* a = NULL;
     uint32_t n = 0;
     if (bio_download_agents(s, &a, &n)) return 0;
-    for (uint32_t i = 0; i < n; ++i) h = hash_rec(h, &a[i]);
+    for (uint32_t i = 0; i < n; ++i) { h = hash_rec(h, &a[i]); if (feat_on) h = hash_rec2(h, &a[i]); }
     free(a);
     return h;
 }

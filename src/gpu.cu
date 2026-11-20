@@ -55,6 +55,8 @@ struct GpuWorld {
     size_t   device_bytes, pinned_bytes;
     uint32_t* d_bio;         // biomap cells (vegetation), NULL = none
     size_t    bio_cells;
+    uint32_t* d_morph;       // version 2: one morphology word per cell (parallel to d_bio), NULL = version 1
+    size_t    morph_cells;
     GmeColTile* d_tiles;     // column tiles, tile_count records (toroidal page_n^2 table)
     uint32_t    tile_count;
     cudaEvent_t fence;       // M4: the renderer's frame in flight (gpu_world_set_fence), NULL = none
@@ -249,6 +251,7 @@ extern "C" void gpu_world_destroy(GpuWorld* g) {
     }
     cudaFree(g->d_pool);
     cudaFree(g->d_bio);
+    cudaFree(g->d_morph);
     cudaFree(g->d_tiles);
     free(g);
 }
@@ -334,6 +337,26 @@ fail:
 
 extern "C" const uint32_t* gpu_world_biomap(const GpuWorld* g) { return g->d_bio; }
 
+extern "C" int gpu_world_set_biomorph(GpuWorld* g, const uint32_t* morph, size_t n) {
+    // as gpu_world_set_biomap: no batch is generating
+    cudaFree(g->d_morph);
+    g->device_bytes -= g->morph_cells * sizeof(uint32_t);
+    g->d_morph = NULL;
+    g->morph_cells = 0;
+    if (!morph || !n) return 0;
+    CK(cudaMalloc(&g->d_morph, n * sizeof(uint32_t)));
+    CK(cudaMemcpy(g->d_morph, morph, n * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    g->morph_cells = n;
+    g->device_bytes += n * sizeof(uint32_t);
+    return 0;
+fail:
+    cudaFree(g->d_morph);
+    g->d_morph = NULL;
+    return -1;
+}
+
+extern "C" const uint32_t* gpu_world_biomorph(const GpuWorld* g) { return g->d_morph; }
+
 extern "C" int gpu_submit(GpuWorld* g, int i, uint32_t n, uint32_t ntiles, uint32_t seed, const GmePlanet* planet,
                           const GmeBioView* view) {
     Buf* b = &g->b[i];
@@ -346,6 +369,13 @@ extern "C" int gpu_submit(GpuWorld* g, int i, uint32_t n, uint32_t ntiles, uint3
     if (bv.cells) {  // same cells, device copy
         if (!g->d_bio) { snprintf(g_err, sizeof g_err, "biomap view without device cells (gpu_world_set_biomap)"); return -1; }
         bv.cells = g->d_bio;
+    }
+    if (bv.morph) {  // version 2: the morphology words, device copy (fallback_morph travels in the view)
+        if (!g->d_morph || g->morph_cells != g->bio_cells) {
+            snprintf(g_err, sizeof g_err, "biomap view with morphology but no device copy of it (gpu_world_set_biomorph)");
+            return -1;
+        }
+        bv.morph = g->d_morph;
     }
     // M4: the renderer reads slots and tiles of the frame it queued last; a slot or tile cell
     // freed since may be rewritten only after that frame (the GPU waits, the CPU does not)
@@ -400,6 +430,7 @@ extern "C" int gpu_build_tiles(const GmeTileJob* jobs, uint32_t n, uint32_t seed
     GmeTileJob* d_jobs = NULL;
     GmeColTile* d_out = NULL;
     uint32_t* d_cells = NULL;
+    uint32_t* d_morph = NULL;
     int rc = -1;
     GmeBioView bv;
     if (view) bv = *view; else memset(&bv, 0, sizeof bv);
@@ -409,8 +440,14 @@ extern "C" int gpu_build_tiles(const GmeTileJob* jobs, uint32_t n, uint32_t seed
         CK(cudaMalloc(&d_cells, ncells * sizeof(uint32_t)));
         CK(cudaMemcpy(d_cells, bv.cells, ncells * sizeof(uint32_t), cudaMemcpyHostToDevice));
         bv.cells = d_cells;
+        if (bv.morph) {                                    // version 2: the morphology words
+            CK(cudaMalloc(&d_morph, ncells * sizeof(uint32_t)));
+            CK(cudaMemcpy(d_morph, bv.morph, ncells * sizeof(uint32_t), cudaMemcpyHostToDevice));
+            bv.morph = d_morph;
+        }
     } else {
         bv.cells = NULL;
+        bv.morph = NULL;
     }
     CK(cudaMalloc(&d_jobs, n * sizeof(GmeTileJob)));
     CK(cudaMalloc(&d_out, (size_t)n * sizeof(GmeColTile)));
@@ -424,5 +461,6 @@ fail:
     cudaFree(d_jobs);
     cudaFree(d_out);
     cudaFree(d_cells);
+    cudaFree(d_morph);
     return rc;
 }

@@ -40,6 +40,10 @@ const GmeColTile* gpu_world_tiles(const GpuWorld* g); /* device pointer, tile_co
  * device (replacing any previous ones; cells == NULL or n == 0 frees them). 0 ok. */
 int             gpu_world_set_biomap(GpuWorld* g, const uint32_t* cells, size_t n);
 const uint32_t* gpu_world_biomap(const GpuWorld* g); /* device pointer or NULL */
+/* Version 2: the n morphology words parallel to the cells (GmeBioView.morph),
+ * uploaded after the cells; morph == NULL or n == 0 frees them. 0 ok. */
+int             gpu_world_set_biomorph(GpuWorld* g, const uint32_t* morph, size_t n);
+const uint32_t* gpu_world_biomorph(const GpuWorld* g); /* device pointer or NULL */
 
 /* Pinned host staging for batch `buf`. Write jobs, then gpu_submit. After
  * completion, meta[i] is filled and voxels[i] holds chunk i if it is not
@@ -51,8 +55,9 @@ GmeTileJob*   gpu_staging_tiles(GpuWorld* g, int buf);   /* max_batch tile jobs 
 
 /* Generates `count` chunk jobs and `ntiles` tile jobs (k_col_tiles writes
  * tile job k to record jobs[k].index; it runs first on the batch stream).
- * bio: host view of the vegetation (NULL = none). Its cells are replaced by the
- * ones uploaded with gpu_world_set_biomap, which must match. 0 ok. */
+ * bio: host view of the vegetation (NULL = none). Its cells (and morphology
+ * words, version 2) are replaced by the ones uploaded with
+ * gpu_world_set_biomap (gpu_world_set_biomorph), which must match. 0 ok. */
 int gpu_submit(GpuWorld* g, int buf, uint32_t count, uint32_t ntiles, uint32_t seed, const GmePlanet* planet,
                const GmeBioView* bio);
 int gpu_poll(GpuWorld* g, int buf);   /* 1 done, 0 running, -1 error */
@@ -67,8 +72,8 @@ int gpu_read_slot(GpuWorld* g, uint32_t slot, uint8_t* dst);
 int gpu_read_tile(GpuWorld* g, uint32_t index, GmeColTile* dst);
 
 /* Self-test D1: builds n tiles with k_col_tiles outside any world (jobs[k].index
- * is ignored; tile k goes to out[k]). bio: host view, its ncells cells are
- * uploaded for the call. 0 ok. */
+ * is ignored; tile k goes to out[k]). bio: host view, its ncells cells (and
+ * morphology words) are uploaded for the call. 0 ok. */
 int gpu_build_tiles(const GmeTileJob* jobs, uint32_t n, uint32_t seed, const GmePlanet* planet,
                     const GmeBioView* bio, size_t ncells, GmeColTile* out);
 

@@ -4,6 +4,8 @@
  * --metrics, --raw / --compare, --settle and --selftest; M5: --pigment-table,
  * --export-spectrum (GMESPEC1 for the bio), --sheet and the probe's photons. */
 #include "biomap.h"
+#include "fauna.h"
+#include "fauna_scene.h"
 #include "image.h"
 #include "jobs.h"
 #include "planetfile.h"
@@ -17,6 +19,7 @@
 #include <string.h>
 
 #define DEFAULT_BIOMAP  "life/home.biomap"
+#define DEFAULT_FAUNA   "life/home.fauna"
 #define DEFAULT_REGIONS "life/regions.txt"
 
 static const char* QUALITY_NAME[RQ_COUNT] = { "classic", "low", "medium", "high", "ref" };
@@ -28,7 +31,11 @@ typedef struct Options {
     const char* screenshot;
     const char* planet;
     const char* biomap;            /* --biomap file */
-    int      no_life, biomap_test; /* --no-life, --biomap-test */
+    int      no_life, biomap_test; /* --no-life, --biomap-test (1), --biomap-test2 (2: the version 2 pattern) */
+    int      sky_planet;           /* --sky-planet: the planet file's atmosphere even when the biomap carries one */
+    const char* fauna;             /* --fauna file */
+    int      no_fauna;             /* --no-fauna */
+    int      fauna_test;           /* --fauna-test [N]: the built-in herd, N creatures (0 = off) */
     int      spawn_set;            /* --spawn X Z [EYE] */
     int32_t  spawn_x, spawn_z, spawn_eye;
     int      look_set;             /* --look YAW PITCH (degrees) */
@@ -96,9 +103,14 @@ static void usage(void) {
            "         [--spawn X Z [EYE]] (start column, eye EYE m above ground, default 50)\n"
            "         [--look YAW PITCH] (start view direction, degrees) [--eye-y Y] (absolute eye height)\n"
            "         [--view coast|peak|forest|shelf|far|mountain] (deterministic spawn + look from the generator)\n"
-           "  life : [--biomap file] (default " DEFAULT_BIOMAP " if present) | [--no-life]\n"
+           "  life : [--biomap file] (default " DEFAULT_BIOMAP " if present; GMEBMAP1 or GMEBMAP2) | [--no-life]\n"
            "         | [--biomap-test] (built-in pattern of every vegetation kind around the spawn)\n"
+           "         | [--biomap-test2] (the same pattern as version 2: every crown class x aspect bin)\n"
            "         [--region K] (start at the coast of biomap region K, default 0)\n"
+           "         [--sky-planet] (the planet file's atmosphere, also when the biomap carries the one life has made)\n"
+           "  fauna: [--fauna file] (creatures, GMEFAUN1; default " DEFAULT_FAUNA " if present) | [--no-fauna]\n"
+           "         | [--fauna-test [N]] (built-in herd of N creatures, default 4096, on a 6 m grid around the view point)\n"
+           "         (--no-life also turns the creatures off; --still holds their idle motion)\n"
            "  M5   : --pigment-table (leaf colour of the 15 hue bins: Soret + Q band; spec 5.1) | --export-spectrum FILE\n"
            "         (GMESPEC1 integer light file for the bio: 8 haze bins x 24 h x 9 bands, water, photons, pigments)\n"
            "         [--sheet FILE] (with --biomap-test: 5 kinds x 15 hues, one close-up each) [--debug palette]\n"
@@ -135,7 +147,17 @@ static int parse(int argc, char** argv, Options* o) {
         if (!strcmp(a, "--cpu"))   { o->cpu = 1; o->bench = 1; continue; }
         if (!strcmp(a, "--bench")) { o->bench = 1; continue; }
         if (!strcmp(a, "--no-life"))     { o->no_life = 1; continue; }
-        if (!strcmp(a, "--biomap-test")) { o->biomap_test = 1; continue; }
+        if (!strcmp(a, "--biomap-test")) { if (!o->biomap_test) o->biomap_test = 1; continue; }
+        if (!strcmp(a, "--biomap-test2")) { o->biomap_test = 2; continue; }
+        if (!strcmp(a, "--sky-planet"))  { o->sky_planet = 1; continue; }
+        if (!strcmp(a, "--no-fauna"))    { o->no_fauna = 1; continue; }
+        if (!strcmp(a, "--fauna-test")) {            /* optional count */
+            o->fauna_test = 4096;
+            if (v && v[0] >= '0' && v[0] <= '9') { o->fauna_test = atoi(v); ++i; }
+            if (o->fauna_test < 1) o->fauna_test = 1;
+            if (o->fauna_test > (int)FAUNA_MAX) o->fauna_test = (int)FAUNA_MAX;
+            continue;
+        }
         if (!strcmp(a, "--settle"))   { o->settle = 1; continue; }
         if (!strcmp(a, "--raw"))      { o->raw = 1; continue; }
         if (!strcmp(a, "--metrics"))  { o->metrics = 1; continue; }
@@ -188,6 +210,7 @@ static int parse(int argc, char** argv, Options* o) {
         else if (!strcmp(a, "--screenshot")) o->screenshot = v;
         else if (!strcmp(a, "--planet"))     o->planet = v;
         else if (!strcmp(a, "--biomap"))     o->biomap = v;
+        else if (!strcmp(a, "--fauna"))      o->fauna = v;
         else if (!strcmp(a, "--region"))     o->region = atoi(v);
         else if (!strcmp(a, "--seconds")) o->seconds = atof(v);
         else if (!strcmp(a, "--speed"))   o->speed = atof(v);
@@ -211,7 +234,7 @@ static int parse(int argc, char** argv, Options* o) {
         else if (!strcmp(a, "--warmup"))  o->warmup = atoi(v);
         else if (!strcmp(a, "--gi"))      o->gi_off = atoi(v) == 0;
         else if (!strcmp(a, "--export-spectrum")) o->export_path = v;
-        else if (!strcmp(a, "--sheet"))   { o->sheet = v; o->biomap_test = 1; }
+        else if (!strcmp(a, "--sheet"))   { o->sheet = v; if (!o->biomap_test) o->biomap_test = 1; }
         else if (!strcmp(a, "--accum"))   { o->accum = atoi(v); o->settle = 1; o->still = 1; }
         else if (!strcmp(a, "--ms")) {
             if (!strcmp(v, "hillaire")) o->ms_hillaire = 1;
@@ -236,8 +259,12 @@ static int parse(int argc, char** argv, Options* o) {
         else { usage(); return -1; }
         ++i;
     }
-    if (o->no_life + o->biomap_test + (o->biomap != NULL) > 1) {
-        fprintf(stderr, "--no-life, --biomap and --biomap-test exclude each other\n");
+    if (o->no_life + (o->biomap_test != 0) + (o->biomap != NULL) > 1) {
+        fprintf(stderr, "--no-life, --biomap and --biomap-test / --biomap-test2 exclude each other\n");
+        return -1;
+    }
+    if ((o->fauna != NULL) + (o->fauna_test != 0) + o->no_fauna > 1) {
+        fprintf(stderr, "--fauna, --fauna-test and --no-fauna exclude each other\n");
         return -1;
     }
     if (o->view && strcmp(o->view, "coast") && strcmp(o->view, "peak") && strcmp(o->view, "forest") &&
@@ -482,6 +509,27 @@ static void print_biomap(const char* what, const Biomap* b) {
         if (other) printf(" unknown %llu", (unsigned long long)other);
         printf("\n");
     }
+    if (b->morph) {                       /* version 2: evolved shapes */
+        static const char* crowns[BIO_CROWN_N] = { "ellipsoid", "cone", "umbrella", "column", "dome" };
+        uint64_t valid = 0, woody = 0, cn[BIO_CROWN_N] = { 0 };
+        double pig = 0;
+        for (size_t i = 0; i < b->ncells; ++i) {
+            const uint32_t m = b->morph[i], k = BIOCELL_KIND(b->cells[i]);
+            if (!(m & BIOMORPH_VALID)) continue;
+            ++valid;
+            pig += BIOMORPH_PIG(m);
+            if (k != BIO_KIND_SHRUB && k != BIO_KIND_TREE) continue;
+            ++woody;
+            cn[BIOMORPH_CROWN(m) < (uint32_t)BIO_CROWN_N ? BIOMORPH_CROWN(m) : 0]++;
+        }
+        printf("       version 2 (GMEBMAP2): %llu cells with morphology (mean pigment %.0f); crowns of shrub / tree cells:",
+               (unsigned long long)valid, valid ? pig / (double)valid : 0.0);
+        for (int k = 0; k < BIO_CROWN_N; ++k) printf(" %s %.1f%%", crowns[k], woody ? 100.0 * (double)cn[k] / (double)woody : 0.0);
+        printf("\n");
+        if (b->atm_known)
+            printf("       atmosphere at sim year %u (ppm): H2S %d CH4 %d NH3 %d CO2 %d O2 %d N2 %d H2 %d\n", b->sim_year, b->atm_ppm[ATM_H2S],
+                   b->atm_ppm[ATM_CH4], b->atm_ppm[ATM_NH3], b->atm_ppm[ATM_CO2], b->atm_ppm[ATM_O2], b->atm_ppm[ATM_N2], b->atm_ppm[ATM_H2]);
+    }
 }
 
 static double gib(double b) { return b / (1024.0 * 1024.0 * 1024.0); }
@@ -687,9 +735,9 @@ static void print_probe(Renderer* rd, const SpectralAtmo* a) {
     RenderProbe pr;
     if (!a || renderer_probe(rd, &pr)) { printf("probe: not available (classic path or no frame yet)\n"); fflush(stdout); return; }
     if (!pr.valid) { printf("probe: the crosshair sees the sky (sun elevation %.1f deg)\n", pr.sun_elev_deg); fflush(stdout); return; }
-    static const char* kinds[10] = { "?", "terrain", "crown", "trunk", "kelp", "voxel", "ice", "terrain (4 m LOD)", "far field",
-                                      "distant ground" };
-    printf("probe: %s (material %d", kinds[pr.kind >= 0 && pr.kind < 10 ? pr.kind : 0], pr.material);
+    static const char* kinds[11] = { "?", "terrain", "crown", "trunk", "kelp", "voxel", "ice", "terrain (4 m LOD)", "far field",
+                                      "distant ground", "creature" };
+    printf("probe: %s (material %d", kinds[pr.kind >= 0 && pr.kind < 11 ? pr.kind : 0], pr.material);
     if (pr.w1 > 0.01f) printf(" + %.0f%% material %d", 100.0 * pr.w1, pr.material1);
     printf(") at (%.1f, %.1f, %.1f), normal (%.2f %.2f %.2f), %s, sun visibility %.2f, AO %.2f, sun elevation %.1f deg\n", pr.pos[0],
            pr.pos[1], pr.pos[2], pr.normal[0], pr.normal[1], pr.normal[2], pr.depth > 0 ? "under water" : "in air", pr.sun_vis, pr.ao,
@@ -739,10 +787,14 @@ static void print_probe(Renderer* rd, const SpectralAtmo* a) {
         const int h = pr.pal >= 1 && pr.pal < SPEC_NHUE ? pr.pal : SPEC_HUE_DEFAULT;
         const double kT = 8.617333262e-5 * a->t_surf, erc[2] = { 1239.84198 / 680.0, 1239.84198 / 870.0 };
         double abs_ph = 0, use[2] = { 0, 0 };
-        printf("       pigment: hue bin %d%s (Q band %.0f nm, PIG %.0f), cover %.2f; absorbed umol/m^2/s", h, pr.pal ? "" : " (palette 0: the default)",
-               383 + 34.13 * h, SPEC_PIG_REF, pr.cover);
+        /* version 2: the cell's own pigment amount and Q band width (pigment level 0: no morphology) */
+        const int pl = pr.pig_level >= 1 && pr.pig_level <= SPEC_NPIG ? pr.pig_level : 0;
+        const int qw = pr.qw_bin >= 0 && pr.qw_bin < SPEC_NQW ? pr.qw_bin : 0;
+        printf("       pigment: hue bin %d%s (Q band %.0f nm, width %.0f nm, PIG %.0f%s), cover %.2f; absorbed umol/m^2/s", h,
+               pr.pal ? "" : " (palette 0: the default)", 383 + 34.13 * h, pl ? SPEC_QW_NM(qw) : 25.0, pl ? 17.0 * pl : SPEC_PIG_REF,
+               pl ? ", the cell's morphology" : "", pr.cover);
         for (int b = 0; b < SPEC_NB; ++b) {
-            const double q = ph_tot[b] * a->pig_A[h][b];
+            const double q = ph_tot[b] * (pl ? a->pig_A2[h][pl - 1][qw][b] : a->pig_A[h][b]);
             abs_ph += q;
             for (int p = 0; p < 2; ++p) use[p] += q * fmin(1.0, exp(-(erc[p] - a->ev_band[b]) / kT));
             printf(" %.1f", q);
@@ -1560,6 +1612,11 @@ static int sheet_in_crown(double x, double y, double z, uint32_t seed, const Gme
             GmeSlot s;
             gme_slot(sx + i, sz + j, seed, pl, bv, &s);
             if (s.trad <= 0) continue;
+            if (GME_SHAPE_IS_V2(s.theight)) {          /* version 2: the crown's rows end at tbase + ht */
+                const double top = s.tbase + GME_SHAPE_HT(s.theight) + 1.0, ddx = x - (s.tx + 0.5), ddz = z - (s.tz + 0.5);
+                if (y > top - s.tvr - 3.0 && y < top + 3.0 && ddx * ddx + ddz * ddz < (s.trad + 3.5) * (s.trad + 3.5)) return 1;
+                continue;
+            }
             if (gme_crown_inside_f((float)(x - (s.tx + 0.5)), (float)(y - (s.tcy + 1.5)), (float)(z - (s.tz + 0.5)), s.trad + 3, s.tvr + 3)) return 1;
         }
     return 0;
@@ -1599,24 +1656,38 @@ static int sheet_suits(int kind, int32_t xc, int32_t zc, int32_t hc, uint32_t se
     return plants >= 4;
 }
 
+/* With the version 2 pattern (--biomap-test2) the sheet shows the evolved shapes instead: rows = the 5
+ * crown classes (ellipsoid, cone, umbrella, column, dome), columns = the 8 aspect bins, each tile the
+ * nearest block of the tallest trees of that class and aspect on gentle ground. */
 static int run_sheet(World* w, const Options* o, const HomePlanet* hp, Renderer* rd, const Biomap* bm, uint32_t seed) {
     const GmePlanet* pl = &hp->gen;
-    enum { TW = 192, TH = 144, NK = 5, NH = 15 };
+    enum { TW = 192, TH = 144, NK = 5, NHMAX = 15 };
+    const int v2 = bm->morph != NULL;
+    const int NH = v2 ? 8 : NHMAX;
     const int SW = NH * TW, SHT = NK * TH;
     if (!bm->cells || bm->nreg < 1) { fprintf(stderr, "--sheet: needs the test pattern\n"); return 1; }
     GmeBioView bv;
     biomap_view(bm, &bv);
-    SheetPick pick[NK][NH];
+    SheetPick pick[NK][NHMAX];
     memset(pick, 0, sizeof pick);
     const int32_t nb = bm->reg[0].w / 2, x0 = bm->reg[0].x0, z0 = bm->reg[0].z0;
     const double t0 = time_now();
     for (int32_t bj = 0; bj < nb; ++bj)
         for (int32_t bi = 0; bi < nb; ++bi) {
-            const uint32_t cell = bm->cells[(size_t)(2 * bj) * (size_t)bm->reg[0].w + (size_t)(2 * bi)];
+            const size_t ci = (size_t)(2 * bj) * (size_t)bm->reg[0].w + (size_t)(2 * bi);
+            const uint32_t cell = bm->cells[ci];
             const int kind = (int)BIOCELL_KIND(cell), hue = (int)BIOCELL_PAL(cell);
-            if (kind < BIO_KIND_MAT || kind > BIO_KIND_TREE || hue < 1 || hue > NH) continue;
-            SheetPick* p = &pick[kind - 1][hue - 1];
-            const int cov = (int)BIOCELL_COVER(cell);
+            int row = kind - 1, col = hue - 1, cov = (int)BIOCELL_COVER(cell);
+            if (v2) {                                       /* trees by crown class and aspect bin, the tallest first */
+                const uint32_t m = bm->morph[ci];
+                if (kind != BIO_KIND_TREE || !(m & BIOMORPH_VALID) || BIOMORPH_CROWN(m) >= (uint32_t)NK) continue;
+                row = (int)BIOMORPH_CROWN(m);
+                col = (int)BIOMORPH_ASPECT(m);
+                cov += 256 * (int)BIOCELL_HEIGHT(cell);
+            } else if (kind < BIO_KIND_MAT || kind > BIO_KIND_TREE || hue < 1 || hue > NH) {
+                continue;
+            }
+            SheetPick* p = &pick[row][col];
             const double d2 = (double)(bi - nb / 2) * (bi - nb / 2) + (double)(bj - nb / 2) * (bj - nb / 2);
             const int top = kind == BIO_KIND_KELP ? 2 * 1024 : 0;   /* the best suitability term this kind can add */
             if (p->found && (top + cov * 4 + 3 < p->score || (top + cov * 4 + 3 == p->score && d2 >= p->d2))) continue;   /* cannot win */
@@ -1634,14 +1705,16 @@ static int run_sheet(World* w, const Options* o, const HomePlanet* hp, Renderer*
     RenderSky sky_base, sky;
     build_sky(hp, &sky_base);
     sky_at_time(&sky_base, o->time_set ? o->time_h : 14.0, &sky);
-    static const char* kn[NK] = { "mat", "kelp", "cover", "shrub", "tree" };
+    static const char* kn1[NK] = { "mat", "kelp", "cover", "shrub", "tree" };
+    static const char* kn2[NK] = { "ellipsoid", "cone", "umbrella", "column", "dome" };
+    const char* const* kn = v2 ? kn2 : kn1;
     const int32_t sea = pl->sea_level;
     int shots = 0;
     for (int k = 0; k < NK; ++k)
         for (int h = 0; h < NH; ++h) {
             const SheetPick* p = &pick[k][h];
-            if (!p->found) { printf("sheet: %s hue %d: no block on suitable terrain\n", kn[k], h + 1); continue; }
-            const int kind = k + 1;
+            if (!p->found) { printf("sheet: %s %s %d: no block on suitable terrain\n", kn[k], v2 ? "aspect bin" : "hue", h + (v2 ? 0 : 1)); continue; }
+            const int kind = v2 ? BIO_KIND_TREE : k + 1;
             const double az = 0.785398;                     /* the camera looks north-east at the block */
             double dist = 16, eye = 0;
             float cy;
@@ -1666,6 +1739,7 @@ static int run_sheet(World* w, const Options* o, const HomePlanet* hp, Renderer*
             else {
                 eye = kind == BIO_KIND_MAT || kind == BIO_KIND_COVER ? 7 : (kind == BIO_KIND_SHRUB ? 6 : 16);
                 if (kind == BIO_KIND_TREE) dist = 30;
+                if (v2) { eye = 12; dist = 38; }            /* whole trees in view, seen from the side */
                 cy = (float)p->h + 1 + (float)eye;
             }
             const double cxw = p->x - dist * cos(az), czw = p->z - dist * sin(az);
@@ -1675,7 +1749,7 @@ static int run_sheet(World* w, const Options* o, const HomePlanet* hp, Renderer*
                 for (int up = 0; up < 24 && sheet_in_crown(cxw, cy, czw, seed, pl, &bv); ++up) cy += 1.5f;
             }
             const float ty = kind == BIO_KIND_KELP ? (kelp_top <= (float)sea - 4.f ? kelp_top + 2.5f : 0.5f * ((float)p->h + 1 + kelp_top))
-                           : (kind >= BIO_KIND_SHRUB ? (float)p->h + 2.5f : (float)p->h + 1);
+                           : (v2 ? (float)p->h + 9.f : (kind >= BIO_KIND_SHRUB ? (float)p->h + 2.5f : (float)p->h + 1));
             WorldPos cam;
             memset(&cam, 0, sizeof cam);
             cam.lx = (float)cxw; cam.lz = (float)czw; cam.ly = cy;
@@ -1707,13 +1781,21 @@ static int run_sheet(World* w, const Options* o, const HomePlanet* hp, Renderer*
                     sheet[(size_t)(k * TH + y) * SW + (size_t)(h * TW + x)] = edge ? 0xFF101010u : px[(size_t)y * TW + x];
                 }
             ++shots;
-            printf("sheet: %-5s hue %2d: block centre (%d, %d), ground %d (sea %d), cover %d, camera (%.0f, %.1f, %.0f)%s\n", kn[k], h + 1,
-                   p->x, p->z, p->h, sea, p->cov, cxw, cy, czw, loaded ? "" : " (not fully loaded)");
+            if (v2)
+                printf("sheet: %-9s aspect bin %d (%.2f): block centre (%d, %d), ground %d, cell height %d m, camera (%.0f, %.1f, %.0f)%s\n",
+                       kn[k], h, BIOMORPH_ASPECT_Q8(h) / 256.0, p->x, p->z, p->h, p->cov / 256, cxw, cy, czw, loaded ? "" : " (not fully loaded)");
+            else
+                printf("sheet: %-5s hue %2d: block centre (%d, %d), ground %d (sea %d), cover %d, camera (%.0f, %.1f, %.0f)%s\n", kn[k], h + 1,
+                       p->x, p->z, p->h, sea, p->cov, cxw, cy, czw, loaded ? "" : " (not fully loaded)");
             fflush(stdout);
         }
     const int rc = write_png(o->sheet, sheet, SW, SHT);
-    if (!rc) printf("saved %s (%dx%d: rows mat, kelp, cover, shrub, tree; columns hue bins 1..15; %d of %d tiles)\n", o->sheet, SW, SHT,
-                    shots, NK * NH);
+    if (!rc && v2)
+        printf("saved %s (%dx%d: rows ellipsoid, cone, umbrella, column, dome; columns aspect bins 0..7 = height : width 0.5 .. 3; "
+               "%d of %d tiles)\n", o->sheet, SW, SHT, shots, NK * NH);
+    else if (!rc)
+        printf("saved %s (%dx%d: rows mat, kelp, cover, shrub, tree; columns hue bins 1..15; %d of %d tiles)\n", o->sheet, SW, SHT,
+               shots, NK * NH);
     free(sheet);
     return rc ? 1 : 0;
 }
@@ -2056,6 +2138,124 @@ static int selftest_d2(uint32_t seed, const GmePlanet* plin) {
                     }
             }
         }
+    /* version 2 (spec 5.3): every crown class x aspect bin x height of both kinds, every trunk position: gme_voxel
+     * against the class's float twin at every voxel centre of the slot. The columns around the slot must stay
+     * free (the crown is inscribed in its slot), every leaf row lies in tbase + 1 .. tbase + ht (the tile bound),
+     * and the crown is never empty. */
+    uint64_t v2vox = 0, v2bad = 0, v2out = 0, v2rows = 0, v2empty = 0, v2shapes = 0, v2leaf[BIO_CROWN_N] = { 0 };
+    uint8_t seen[BIO_CROWN_N][4][GME_FLORA_TREE_MAX + 1];           /* (class, r, rows) combinations met */
+    memset(seen, 0, sizeof seen);
+    for (uint32_t cls = 0; cls < (uint32_t)BIO_CROWN_N; ++cls)
+        for (uint32_t ab = 0; ab < 8; ++ab)
+            for (int kind = BIO_KIND_SHRUB; kind <= BIO_KIND_TREE; ++kind)
+                for (int32_t ht = (kind == BIO_KIND_TREE ? 4 : 2); ht <= (kind == BIO_KIND_TREE ? GME_FLORA_TREE_MAX : 4); ++ht) {
+                    int32_t rn = ht / 4;
+                    rn = rn < 1 ? 1 : (rn > 3 ? 3 : rn);
+                    const uint32_t sw = gme_shape_word(BIOMORPH(cls, ab, ab & 3u, (ab >> 1) & 3u, 200u, ab));
+                    for (int32_t off = 0; off < 8 - 2 * rn; ++off) {
+                        GmeSlot s;
+                        memset(&s, 0, sizeof s);
+                        s.cell = BIOCELL(kind, 1, 255, ht, 0);
+                        gme_slot_tree(&s, sw, ab, ht, rn, rn + off, 7 - rn - off, H0);
+                        if (s.trad < 1 || s.trad > rn || s.tvr < 1 || s.tvr > (ht > 3 ? ht : 3) || GME_SHAPE_HT(s.theight) != ht ||
+                            !GME_SHAPE_IS_V2(s.theight) || GME_SHAPE_CLASS(s.theight) != cls) { ++v2bad; continue; }
+                        seen[cls][s.trad][s.tvr] = 1;
+                        ++v2shapes;
+                        uint64_t leaf = 0;
+                        for (int32_t z = -1; z <= 8; ++z)
+                            for (int32_t x = -1; x <= 8; ++x) {
+                                const int in_slot = x >= 0 && x < 8 && z >= 0 && z < 8;
+                                GmeColumn col;
+                                if (in_slot) gme_column_in_slot(x, z, H0, seed, &s, &col);
+                                for (int32_t y = H0 + 1; y <= H0 + GME_FLORA_TREE_MAX + 4; ++y) {
+                                    const float dx = (float)(x - s.tx), dz = (float)(z - s.tz);
+                                    const uint8_t a = gme_trunk_inside_f(dx, (float)y + 0.5f, dz, &s) ? MAT_WOOD
+                                                    : gme_crown2_inside_slot_f(&s, dx, (float)y + 0.5f, dz) ? MAT_LEAF : MAT_AIR;
+                                    if (!in_slot) { v2out += a != MAT_AIR; continue; }
+                                    const uint8_t m = gme_voxel(x, y, z, &col, seed, &pl);
+                                    ++v2vox;
+                                    v2bad += a != m;
+                                    if (m == MAT_LEAF) { ++leaf; v2rows += y > H0 + ht; }
+                                }
+                            }
+                        v2leaf[cls] += leaf;
+                        v2empty += leaf == 0;
+                    }
+                }
+    /* a valid morphology word of the ellipsoid class at aspect bin 2 (1 : 1; every gene at 0) is the version 1
+     * plant: the same voxels as the slot version 1 builds, for every height and trunk position */
+    uint64_t v1vox = 0, v1diff = 0;
+    for (int kind = BIO_KIND_SHRUB; kind <= BIO_KIND_TREE; ++kind)
+        for (int32_t ht = (kind == BIO_KIND_TREE ? 4 : 2); ht <= (kind == BIO_KIND_TREE ? GME_FLORA_TREE_MAX : 4); ++ht) {
+            int32_t rn = ht / 4;
+            rn = rn < 1 ? 1 : (rn > 3 ? 3 : rn);
+            for (int32_t off = 0; off < 8 - 2 * rn; ++off) {
+                GmeSlot s1, s2;
+                memset(&s1, 0, sizeof s1);
+                memset(&s2, 0, sizeof s2);
+                s1.cell = s2.cell = BIOCELL(kind, 1, 255, ht, 0);
+                gme_slot_tree(&s1, 0u, 0u, ht, rn, rn + off, 7 - rn - off, H0);
+                gme_slot_tree(&s2, gme_shape_word(BIOMORPH(BIO_CROWN_ELLIPSOID, 2, 2, 0, 200, 3)), 2u, ht, rn, rn + off, 7 - rn - off, H0);
+                for (int32_t z = 0; z < 8; ++z)
+                    for (int32_t x = 0; x < 8; ++x) {
+                        GmeColumn c1, c2;
+                        gme_column_in_slot(x, z, H0, seed, &s1, &c1);
+                        gme_column_in_slot(x, z, H0, seed, &s2, &c2);
+                        for (int32_t y = H0 - 2; y <= H0 + GME_FLORA_TREE_MAX + 4; ++y) {
+                            ++v1vox;
+                            v1diff += gme_voxel(x, y, z, &c1, seed, &pl) != gme_voxel(x, y, z, &c2, seed, &pl);
+                        }
+                    }
+            }
+        }
+    /* the drawn solids (gme_crown_quadric: the tracer's intersectors): the normalised quadric against the twin on
+     * a 1/4 m lattice (points within 1 mm of the surface aside), and the chord of random rays against a 5 mm march */
+    uint64_t qpts = 0, qbad = 0, qrays = 0, qray_bad = 0, qcombos = 0;
+    double qerr = 0;
+    {
+        uint32_t rng = 0xC0FFEEu ^ seed;
+        for (uint32_t cls = 0; cls < (uint32_t)BIO_CROWN_N; ++cls)
+            for (int32_t r = 1; r <= 3; ++r)
+                for (int32_t ch = 1; ch <= GME_FLORA_TREE_MAX; ++ch) {
+                    if (!seen[cls][r][ch]) continue;
+                    ++qcombos;
+                    GmeCrownQ q;
+                    gme_crown_quadric(cls, r, ch, &q);
+                    for (int32_t k = -4; k <= 4 * ch + 4; ++k)
+                        for (int32_t j = -16; j <= 16; ++j)
+                            for (int32_t i = -16; i <= 16; ++i) {
+                                const float dx = 0.25f * (float)i, dz = 0.25f * (float)j, u = 0.25f * (float)k + 0.125f;
+                                if (fabsf(gme_crown_q_de(&q, dx, u, dz, NULL)) < 1e-3f) continue;
+                                ++qpts;
+                                qbad += gme_crown_q_inside(&q, dx, u, dz) != gme_crown2_inside_f(cls, dx, u, dz, r, ch);
+                            }
+                    for (int n = 0; n < 256; ++n) {
+                        float v[6];
+                        for (int c = 0; c < 6; ++c) { rng = rng * 1664525u + 1013904223u; v[c] = (float)(rng >> 8) * (1.f / 16777216.f); }
+                        /* from a point on a box around the crown toward a point inside its bounding box */
+                        const float R = (float)r + 2.f, H = (float)ch;
+                        const float px = (2.f * v[0] - 1.f) * R, pz = (2.f * v[1] - 1.f) * R, pu = n & 1 ? -1.5f - v[2] : H + 1.5f + v[2];
+                        const float tx = (2.f * v[3] - 1.f) * ((float)r + 0.4f), tz = (2.f * v[4] - 1.f) * ((float)r + 0.4f), tu = v[5] * H;
+                        float dx = tx - px, dy = tu - pu, dz = tz - pz;
+                        const float il = 1.f / sqrtf(dx * dx + dy * dy + dz * dz);
+                        dx *= il; dy *= il; dz *= il;
+                        if (n % 7 == 3) { dx = 0.f; dz = 0.f; dy = dy > 0.f ? 1.f : -1.f; }    /* straight down / up the axis region */
+                        float t0 = 0.f, t1 = 0.f;
+                        const int hit = gme_crown_q_chord(&q, px, pu, pz, dx, dy, dz, &t0, &t1);
+                        double m0 = -1, m1 = -1;                       /* march: first and last inside sample */
+                        for (int st = 0; st < 12000; ++st) {
+                            const double t = 0.005 * st;
+                            if (gme_crown_q_inside(&q, px + dx * (float)t, pu + dy * (float)t, pz + dz * (float)t)) { if (m0 < 0) m0 = t; m1 = t; }
+                        }
+                        ++qrays;
+                        if (m0 < 0) { qray_bad += hit && t1 - t0 > 0.02f && t1 > 0.02f; continue; }
+                        if (!hit) { qray_bad += m1 - m0 > 0.02; continue; }
+                        const double e = fmax(fabs(fmax((double)t0, 0.0) - m0), fabs((double)t1 - m1));
+                        qerr = fmax(qerr, e);
+                        qray_bad += e > 0.02;
+                    }
+                }
+    }
     /* kelp: strand length 1..40 m, deep and shallow water, 64 columns each */
     const int32_t depths[3] = { 45, 12, 3 };
     for (int32_t len = 1; len <= 40; ++len)
@@ -2110,11 +2310,27 @@ static int selftest_d2(uint32_t seed, const GmePlanet* plin) {
         nmax = fmax(nmax, v);
     }
     const int shapes_ok = kmax < 0.49 + 1e-6 && nmin >= 0.0 && nmax <= 1.0;
-    const int ok = !tbad && !kbad && shapes_ok;
+    int v2classes = 1;
+    for (int k = 0; k < BIO_CROWN_N; ++k) v2classes &= v2leaf[k] > 0;
+    const int v2ok = v2vox > 0 && !v2bad && !v2out && !v2rows && !v2empty && v2classes && qpts > 0 && !qbad && qrays > 0 && !qray_bad &&
+                     v1vox > 0 && !v1diff;
+    const int ok = !tbad && !kbad && shapes_ok && v2ok;
     printf("D2 flora: trunks + crowns (ht 2..%d, every trunk position) %llu voxel centres, %llu mismatches; "
            "kelp (len 1..40, 3 depths, %llu strands) %llu voxel centres, %llu mismatches\n",
            GME_FLORA_TREE_MAX, (unsigned long long)tvox, (unsigned long long)tbad, (unsigned long long)strands,
            (unsigned long long)kvox, (unsigned long long)kbad);
+    printf("   version 2: %d crown classes x 8 aspect bins x ht 2..%d (shrubs and trees, every trunk position; %llu plants) "
+           "%llu voxel centres, %llu mismatches; analytic points outside the slot %llu, leaf voxels above tbase + ht %llu, "
+           "empty crowns %llu; leaf voxels per class", BIO_CROWN_N, GME_FLORA_TREE_MAX, (unsigned long long)v2shapes,
+           (unsigned long long)v2vox, (unsigned long long)v2bad, (unsigned long long)v2out, (unsigned long long)v2rows,
+           (unsigned long long)v2empty);
+    for (int k = 0; k < BIO_CROWN_N; ++k) printf(" %llu", (unsigned long long)v2leaf[k]);
+    printf("\n   version 2 ellipsoid at aspect bin 2 (1 : 1) against the version 1 plant (ht 2..%d, every trunk position): %llu voxels, "
+           "%llu differ", GME_FLORA_TREE_MAX, (unsigned long long)v1vox, (unsigned long long)v1diff);
+    printf("\n   version 2 drawn solids: %llu (class, radius, rows) combinations; quadric vs twin at %llu points, %llu "
+           "mismatches; %llu ray chords vs a 5 mm march, %llu off by more than 2 cm (largest error %.4f m): %s\n",
+           (unsigned long long)qcombos, (unsigned long long)qpts, (unsigned long long)qbad, (unsigned long long)qrays,
+           (unsigned long long)qray_bad, qerr, v2ok ? "ok" : "FAIL");
     printf("   M5 drawn shapes: kelp stipe + %llu blades at full sway reach %.4f m from the column centre (gate < 0.49: inside "
            "its 1 m column); clump noise in [%.4f, %.4f] (inward only)\nD2 %s\n",
            (unsigned long long)blades, kmax, nmin, nmax, ok ? "PASS" : "FAIL");
@@ -2305,17 +2521,6 @@ int main(int argc, char** argv) {
         platform_shutdown();
         return rc;
     }
-    /* a classic session builds the light only when the smooth path is first selected (key V / K) */
-    if (!o.bench && !o.selftest && (o.quality != RQ_CLASSIC || o.pigment_table)) atmo_get(&lazy, NULL);
-    else if (!o.bench && !o.selftest) printf("Light: --quality classic: the spectral LUTs are built when the smooth path is first selected\n");
-    if (o.pigment_table) {                  /* M5: spec 5.1's table, then exit */
-        const int rc = lazy.a ? print_pigment_table(lazy.a) : 1;
-        if (lazy.a) spectral_free(lazy.a);
-        free(lazy.a);
-        jobs_shutdown();
-        platform_shutdown();
-        return rc;
-    }
 
     /* ---- spawn without life (also the centre of --biomap-test) ---- */
     Spawn sp;
@@ -2330,9 +2535,13 @@ int main(int argc, char** argv) {
     if (o.no_life) {
         printf("Life : off (--no-life)\n");
     } else if (o.biomap_test) {
-        if (biomap_make_test(&bm, phash, o.seed, sp.x, sp.z)) { fprintf(stderr, "cannot build the test biomap\n"); return 1; }
+        if ((o.biomap_test == 2 ? biomap_make_test2 : biomap_make_test)(&bm, phash, o.seed, sp.x, sp.z)) {
+            fprintf(stderr, "cannot build the test biomap\n");
+            return 1;
+        }
         have_life = 1;
-        print_biomap("built-in test pattern (--biomap-test, not saved)", &bm);
+        print_biomap(o.biomap_test == 2 ? "built-in test pattern, version 2: every crown class x aspect bin (--biomap-test2, not saved)"
+                                        : "built-in test pattern (--biomap-test, not saved)", &bm);
     } else {
         const char* bpath = o.biomap ? o.biomap : (file_exists(DEFAULT_BIOMAP) ? DEFAULT_BIOMAP : NULL);
         if (!bpath) {
@@ -2341,7 +2550,7 @@ int main(int argc, char** argv) {
             const int rc = biomap_load(bpath, &bm);
             char why[192] = "";
             if (rc == -1) snprintf(why, sizeof why, "cannot read it");
-            else if (rc == -2) snprintf(why, sizeof why, "not a valid GMEBMAP1 file");
+            else if (rc == -2) snprintf(why, sizeof why, "not a valid GMEBMAP1 / GMEBMAP2 file");
             else if (rc == -3) snprintf(why, sizeof why, "CRC mismatch (corrupt)");
             else if (rc) snprintf(why, sizeof why, "load error %d", rc);
             else if (bm.planet_hash != phash)
@@ -2359,6 +2568,52 @@ int main(int argc, char** argv) {
                 print_biomap(bpath, &bm);
             }
         }
+    }
+
+    /* ---- spectral light (spec 4; not needed by the bench): the sky follows the atmosphere life has made
+     * when the biomap carries it (version 2, spec 5.3), else the planet file's mix; --sky-planet forces
+     * the planet file's. Only the light changes: the world, the planet hash and the classic sky do not.
+     * The light is built on first need (LazyAtmo) from the sky's planet; its hash covers the atmosphere
+     * mix, so the LUT cache keeps the sky of a biomap apart from the planet file's. ---- */
+    HomePlanet hp_sky = hp;
+    int sky_life = 0;
+    if (have_life && bm.atm_known && !o.sky_planet) {
+        double sum = 0;
+        for (int g = 0; g < ATM_N && g < BIOMAP_ATM; ++g) sum += bm.atm_ppm[g] > 0 ? (double)bm.atm_ppm[g] : 0.0;
+        if (sum > 0) {
+            for (int g = 0; g < ATM_N; ++g) hp_sky.atm_mix[g] = g < BIOMAP_ATM && bm.atm_ppm[g] > 0 ? (double)bm.atm_ppm[g] / sum : 0.0;
+            hp_sky.atm_known = 1;
+            sky_life = 1;
+        }
+    }
+    lazy.hp = &hp_sky;
+    if (sky_life) {                         /* the cache key of this sky: the planet's hash and the exact mix (the hash rounds it to 1e-4) */
+        uint64_t h = planet_hash(&hp_sky);
+        const unsigned char* mb = (const unsigned char*)hp_sky.atm_mix;
+        for (size_t i = 0; i < sizeof hp_sky.atm_mix; ++i) { h ^= mb[i]; h *= 0x100000001B3ull; }
+        lazy.phash = h;
+    }
+    if (!o.bench && !o.selftest) {
+        if (sky_life)
+            printf("Sky  : atmosphere from the biomap (life at sim year %u): H2S %.4f CH4 %.4f NH3 %.4f CO2 %.4f O2 %.4f N2 %.4f H2 %.4f "
+                   "(--sky-planet: the planet file's)\n", bm.sim_year, hp_sky.atm_mix[ATM_H2S], hp_sky.atm_mix[ATM_CH4],
+                   hp_sky.atm_mix[ATM_NH3], hp_sky.atm_mix[ATM_CO2], hp_sky.atm_mix[ATM_O2], hp_sky.atm_mix[ATM_N2], hp_sky.atm_mix[ATM_H2]);
+        else
+            printf("Sky  : atmosphere from the planet file%s\n",
+                   o.sky_planet && have_life && bm.atm_known ? " (--sky-planet; the biomap carries the one life has made)"
+                   : (have_life && bm.atm_known ? " (the biomap's atmosphere is empty)" : (have_life ? " (the biomap carries none)" : "")));
+        /* a classic session builds the light only when the smooth path is first selected (key V / K) */
+        if (o.quality != RQ_CLASSIC || o.pigment_table) atmo_get(&lazy, NULL);
+        else printf("Light: --quality classic: the spectral LUTs are built when the smooth path is first selected\n");
+    }
+    if (o.pigment_table) {                  /* M5: spec 5.1's table, then exit */
+        const int rc = lazy.a ? print_pigment_table(lazy.a) : 1;
+        if (lazy.a) spectral_free(lazy.a);
+        free(lazy.a);
+        biomap_free(&bm);
+        jobs_shutdown();
+        platform_shutdown();
+        return rc;
     }
     /* with life, start where it lives: the coast nearest the centre of region K (default 0) */
     const char* where = "";
@@ -2445,6 +2700,61 @@ int main(int argc, char** argv) {
         return fails;
     }
 
+    /* ---- creatures: the motile organisms of the life simulation, frozen (fauna.h). Drawn only (never
+     * voxels), so the bench does not load them. ---- */
+    Fauna fauna;
+    FaunaScene fscene;
+    memset(&fauna, 0, sizeof fauna);
+    memset(&fscene, 0, sizeof fscene);
+    int have_fauna = 0;
+    if (!o.bench) {
+        char fwhat[256] = "";
+        if (o.no_life || o.no_fauna) {
+            printf("Fauna: off (%s)\n", o.no_fauna ? "--no-fauna" : "--no-life");
+        } else if (o.fauna_test) {
+            if (fauna_make_test(&fauna, phash, o.seed, sp.x, sp.z, (uint32_t)o.fauna_test, 6)) { fprintf(stderr, "cannot build the test herd\n"); return 1; }
+            biomap_default_palette(fauna.palette);
+            have_fauna = 1;
+            snprintf(fwhat, sizeof fwhat, "built-in test herd (--fauna-test, not saved) on a 6 m grid around (%d, %d)", sp.x, sp.z);
+        } else {
+            const char* fpath = o.fauna ? o.fauna : (file_exists(DEFAULT_FAUNA) ? DEFAULT_FAUNA : NULL);
+            if (!fpath) {
+                printf("Fauna: none (no %s)\n", DEFAULT_FAUNA);
+            } else {
+                const int rc = fauna_load(fpath, &fauna);
+                char why[192] = "";
+                if (rc == -1) snprintf(why, sizeof why, "cannot read it");
+                else if (rc == -2) snprintf(why, sizeof why, "not a valid GMEFAUN1 file");
+                else if (rc == -3) snprintf(why, sizeof why, "CRC mismatch (corrupt)");
+                else if (rc) snprintf(why, sizeof why, "load error %d", rc);
+                else if (fauna.planet_hash != phash)
+                    snprintf(why, sizeof why, "made for planet hash %016llx, this planet is %016llx",
+                             (unsigned long long)fauna.planet_hash, (unsigned long long)phash);
+                else if (fauna.seed != o.seed)
+                    snprintf(why, sizeof why, "made for world seed %u, this world is seed %u", fauna.seed, o.seed);
+                if (why[0]) {
+                    fprintf(stderr, "fauna %s rejected: %s\n", fpath, why);
+                    fauna_free(&fauna);
+                    if (o.fauna) return 1;      /* asked for explicitly: do not run without it */
+                    printf("Fauna: none (%s rejected)\n", fpath);
+                } else {
+                    have_fauna = 1;
+                    snprintf(fwhat, sizeof fwhat, "%s - sim year %u", fpath, fauna.sim_year);
+                }
+            }
+        }
+        if (have_fauna) {
+            if (fauna_scene_build(&fauna, o.seed, &hp.gen, &fscene)) { fprintf(stderr, "fauna: out of memory\n"); return 1; }
+            printf("Fauna: %s: %u creatures in the file (%u motile agents alive)\n", fwhat, fauna.count, fauna.total);
+            printf("       placed %u (%u walkers on the ground, %u swimmers, %u of them swarms; %u spheres in %u cells of 32 m), "
+                   "dropped %u (%u swimmers over land, %u walkers over water, %u outside the world)\n",
+                   fscene.kept, fscene.walkers, fscene.swimmers, fscene.swarms, fscene.nsph, fscene.used_cells,
+                   fscene.drop_swim_land + fscene.drop_walk_water + fscene.drop_range, fscene.drop_swim_land, fscene.drop_walk_water,
+                   fscene.drop_range);
+            if (!fscene.nsph) have_fauna = 0;
+        }
+    }
+
     /* ---- renderer first, so the pool is sized from the VRAM really left ---- */
     Renderer* rd = NULL;
     if (!o.bench && gi.available) {
@@ -2453,6 +2763,10 @@ int main(int argc, char** argv) {
         const RendererConfig rc = { (int)(o.width * sc) + 1, (int)(o.height * sc) + 1, o.quality, (float)o.scale };
         rd = renderer_create(&rc);
         if (rd && lazy.a && renderer_set_atmo(rd, lazy.a)) fprintf(stderr, "renderer: the spectral LUTs could not be uploaded\n");
+        if (rd && have_fauna && renderer_set_fauna(rd, fscene.grid, fscene.ngrid, fscene.cells, fscene.ncells, fauna.palette)) {
+            fprintf(stderr, "renderer: the creatures could not be uploaded\n");
+            have_fauna = 0;
+        }
         if (rd) gpu_query(&gi);
     }
 
@@ -2489,6 +2803,10 @@ int main(int argc, char** argv) {
     if (s.tiles_total)
         printf("       column tiles: %u x %u B = %.0f MiB VRAM (smooth surface, counted in the pool budget)\n",
                s.tiles_total, (unsigned)sizeof(GmeColTile), (double)s.tile_bytes / 1048576.0);
+    if (have_fauna)
+        printf("Fauna: %u creatures within the max view radius (%d m) of the start, %u within their draw distance (%.0f m)\n",
+               fauna_scene_within(&fscene, sp.x + 0.5, sp.z + 0.5, (double)s.radius_max * GME_CHUNK_DIM), s.radius_max * GME_CHUNK_DIM,
+               fauna_scene_within(&fscene, sp.x + 0.5, sp.z + 0.5, (double)FAUNA_FAR), (double)FAUNA_FAR);
     printf("\n");
 
     WorldPos cam;
@@ -2504,6 +2822,8 @@ int main(int argc, char** argv) {
         if (lazy.a) spectral_free(lazy.a);
         free(lazy.a);
         biomap_free(&bm);
+        fauna_scene_free(&fscene);
+        fauna_free(&fauna);
         jobs_shutdown();
         platform_shutdown();
         return rc;

@@ -25,6 +25,10 @@
 //                 rays a leaf-area medium (e^-(sigma chord) per crown, FM_LAD),
 //                 the rest the plain ellipsoid. Kelp strands are a thin stipe
 //                 carrying flat blades (tr_kelp_strand), all inside the column.
+//   version 2     crowns of a biomap with morphology (flora.h): ellipsoid,
+//                 cone, umbrella, column or dome by the slot's shape word, the
+//                 float solids of density.h (GmeCrownQ) in every flora mode
+//                 (tr_flora2); porosity and leaf angle shape the leaf medium.
 //
 // Coordinates are relative to the camera chunk, as in the classic renderer.
 // Included by render.cu after its float3 helpers; it does not touch the
@@ -40,7 +44,8 @@
 // hit kinds (4 bits in the hit record and the G-buffer). LOD: the 4 m lattice
 // of a published tile; FAR: the far-field clipmap; DIST: below the geometric
 // horizon beyond the far field (shaded with the sky-view LUT's ground).
-enum { HK_NONE = 0, HK_TERRAIN, HK_CROWN, HK_TRUNK, HK_KELP, HK_VOXEL, HK_ICE, HK_LOD, HK_FAR, HK_DIST };
+// HK_FAUNA: a creature's sphere (render.cu k_fauna_primary; never produced by the walk itself).
+enum { HK_NONE = 0, HK_TERRAIN, HK_CROWN, HK_TRUNK, HK_KELP, HK_VOXEL, HK_ICE, HK_LOD, HK_FAR, HK_DIST, HK_FAUNA };
 enum { VX_END = 0, VX_HIT = 1, VX_EXIT = 2 };
 
 // One far-field clipmap level (spec 3.8): GME_FAR_N^2 packed samples
@@ -457,14 +462,77 @@ __device__ __noinline__ float tr_kelp_strand(float3 p0, float3 d, float tmax, fl
 }
 
 // ---- M5 crowns: geometry of a slot's crown, the clumped surface, the leaf medium ----
+// Version 2 (spec 5.3): a slot whose shape word says so (flora.h GME_SHAPE_*) carries one of five crown
+// classes. Its ellipsoid goes through the same ellipsoid code as version 1 (centre and vertical radius
+// from the crown's rows); cone, umbrella, column and dome are quadrics of revolution clipped to the
+// crown's rows (density.h GmeCrownQ), with the chord, exit, distance estimate and normal below, so
+// every ray type treats them as it treats the ellipsoid. The shape word's porosity bin thins the
+// leaf-area medium, its leaf angle bin turns G into Goudriaan's G(theta) = phi1 + phi2 |cos theta|.
+// CrownG keeps its version 1 size (the kernels' registers): a version 2 crown packs its class, rows and
+// leaf angle into the high bits of trad, and the quadric is rebuilt from them where it is needed.
 struct CrownG {
-    float3   ce;                    // centre (relative to the camera chunk), shifted onto T like the drawn tree
+    float3   ce;                    // centre (relative to the camera chunk), shifted onto T like the drawn tree;
+                                    // a quadric class: on the trunk axis at the bottom face of the crown's lowest row
     float    ia, ib;                // inverse radii: horizontal sqrt(trad^2 + trad), vertical sqrt(tvr^2 + tvr)
-    float    sigma;                 // leaf-area extinction G LAD = G 3 LAI / (4 b), 1/m
-    int32_t  trad;
+    float    sigma;                 // leaf-area extinction G LAD = G 3 LAI / (4 b), 1/m (G = 1/2, x the porosity factor)
+    int32_t  trad;                  // bits 0-7 the radius. Version 2: bits 8-10 the crown class, bit 11 set,
+                                    // bits 12-19 the crown's rows, bits 22-23 the leaf angle bin (the shape word's)
     uint32_t cs;                    // clump noise seed of the tree
 };
+#define CROWN_R(c)     ((c).trad & 255)
+#define CROWN_QUAD(c)  ((c).trad & 0x700)          // != 0: cone, umbrella, column or dome (a quadric about ce)
+#define CROWN_V2(c)    ((c).trad & 0x800)
+#define CROWN_CLS(c)   ((uint32_t)((c).trad >> 8) & 7u)
 __device__ __forceinline__ float crown_sigma(float ib) { return SPEC_LEAF_G * 0.75f * SPEC_CROWN_LAI * ib; }
+// Leaf angle (version 2): the factor on sigma along a direction of vertical cosine mu. Goudriaan's
+// G(theta) = phi1 + phi2 mu, phi1 = 0.5 - 0.633 chi - 0.33 chi^2, phi2 = 0.877 (1 - 2 phi1), chi =
+// -0.4 + (bin + 0.5) / 4, taken relative to the mid bin 2, which is the version 1 crown (random
+// leaves, G = 1/2: factor exactly 1): 1 + 2 (phi1 - phi1_mid) (1 - 1.754 mu). Erect leaves (bins 0, 1)
+// catch more of a low sun, flat ones (bin 3) more of a high one.
+__device__ __forceinline__ float tr_leaf_g2(int32_t packed, float mu) {
+    const int bin = (packed >> 22) & 3;
+    if (bin == 2) return 1.f;
+    const float chi = -0.4f + ((float)bin + 0.5f) * 0.25f;
+    const float d1 = (0.5f - 0.633f * chi - 0.33f * chi * chi) - 0.340869f;   // phi1 - phi1 of bin 2 (chi 0.225)
+    return 1.f + 2.f * d1 * (1.f - 1.754f * mu);
+}
+// the crown's extinction along d, and its mean over directions (version 1: sigma, random leaves)
+__device__ __forceinline__ float tr_crown_sigma(const CrownG& c, float3 d) {
+    return CROWN_V2(c) ? c.sigma * tr_leaf_g2(c.trad, fabsf(d.y)) : c.sigma;
+}
+__device__ __forceinline__ float tr_crown_sigma_mean(const CrownG& c) { return CROWN_V2(c) ? c.sigma * tr_leaf_g2(c.trad, 0.5f) : c.sigma; }
+// clump amplitude factor: thin shapes keep their outline
+__device__ __forceinline__ float tr_crown_ampk(const CrownG& c) {
+    const uint32_t cls = CROWN_CLS(c);
+    return (cls == BIO_CROWN_ELLIPSOID || cls == BIO_CROWN_DOME) ? 1.f : (cls == BIO_CROWN_UMBRELLA ? 0.5f : 0.6f);
+}
+__device__ __forceinline__ void tr_crown_quadric(int32_t packed, GmeCrownQ& q) {
+    gme_crown_quadric((uint32_t)(packed >> 8) & 7u, packed & 255, (packed >> 12) & 255, &q);
+}
+// Version 2 crown from the slot's shape word sw, radius r and rows ch: (ax, az) the trunk axis, yfoot the
+// plant's foot (tbase, relative, shifted onto T). Out of line and by value, like every version 2 branch
+// below: the version 1 paths of the kernels keep their code and registers.
+__device__ __noinline__ CrownG tr_crown_v2(int32_t sw, int32_t r, int32_t ch, float ax, float yfoot, float az) {
+    CrownG c;
+    c.cs = 0u;
+    const uint32_t cls = GME_SHAPE_CLASS(sw);
+    const float H = (float)ch, yb = yfoot + (float)(GME_SHAPE_HT(sw) - ch + 1);   // bottom face of the crown's lowest row
+    float lad;
+    c.trad = r | (sw & 0x00C00F00) | (ch << 12);
+    c.ia = rsqrtf((float)(r * r + r));
+    if (cls == BIO_CROWN_ELLIPSOID) {
+        c.ce = f3(ax, yb + 0.5f * H, az);
+        c.ib = rsqrtf(0.25f * (float)(ch * ch - 1));
+        lad = 0.75f * SPEC_CROWN_LAI * c.ib;
+    } else {
+        c.ce = f3(ax, yb, az);
+        c.ib = 1.f / H;
+        lad = SPEC_CROWN_LAI / (H * gme_crown_fill(cls));       // LAI over the footprint / the crown's volume
+    }
+    const uint32_t pb = GME_SHAPE_POROSITY(sw);                  // closed .. open crown
+    c.sigma = SPEC_LEAF_G * lad * (pb == 0u ? 1.f : (pb == 1u ? 0.7f : (pb == 2u ? 0.45f : 0.25f)));
+    return c;
+}
 // the crown of block b of the tile (rcx, rcz); false = no shrub / tree there
 __device__ __forceinline__ bool tr_crown_of(const GmeColTile* t, int b, int rcx, int rcz, CrownG& c) {
     const GmeSlot* s = &t->slot[b];
@@ -474,12 +542,18 @@ __device__ __forceinline__ bool tr_crown_of(const GmeColTile* t, int b, int rcx,
     const int32_t lx = tx - (g_tc.cx + rcx) * 32, lz = tz - (g_tc.cz + rcz) * 32;
     const float dl = (float)((int32_t)((__ldg(&t->col[(lz + GME_TILE_APRON) * GME_TILE_N + lx + GME_TILE_APRON]) >> 8) ^ 0x80u) - 0x80) *
                      (1.f / GME_DEV_UNIT);
+    const int32_t sw = __ldg(&s->theight);
+    if (GME_SHAPE_IS_V2(sw)) {
+        c = tr_crown_v2(sw, trad, tvr, (float)(rcx * 32 + lx) + 0.5f, (float)(__ldg(&s->tbase) - 32 * g_tc.cy) + dl, (float)(rcz * 32 + lz) + 0.5f);
+        c.cs = gme_clump_seed(tx, tz, g_tc.seed);
+        return true;
+    }
+    c.cs = gme_clump_seed(tx, tz, g_tc.seed);
     c.ce = f3((float)(rcx * 32 + lx) + 0.5f, (float)(tcy - 32 * g_tc.cy) + 0.5f + dl, (float)(rcz * 32 + lz) + 0.5f);
     c.ia = rsqrtf((float)(trad * trad + trad));
     c.ib = rsqrtf((float)(tvr * tvr + tvr));
     c.sigma = crown_sigma(c.ib);
     c.trad = trad;
-    c.cs = gme_clump_seed(tx, tz, g_tc.seed);
     return true;
 }
 // the crown of the slot holding relative point p (a crown lies inside its slot)
@@ -490,8 +564,45 @@ __device__ __forceinline__ bool tr_crown_at(float3 p, CrownG& c) {
     const int bx = min(max((int)floorf((p.x - (float)(rcx * 32)) * 0.125f), 0), 3), bz = min(max((int)floorf((p.z - (float)(rcz * 32)) * 0.125f), 0), 3);
     return tr_crown_of(t, bz * 4 + bx, rcx, rcz, c);
 }
-// distance from p along unit d to where the ray leaves the crown ellipsoid (0 if it never is inside ahead)
+// the part of the ray p + d t inside the crown's solid: [t0, t1]; false = it misses
+__device__ __forceinline__ bool tr_crown_chord(const CrownG& c, float3 p, float3 d, float& t0, float& t1) {
+    if (CROWN_QUAD(c)) {
+        GmeCrownQ q;
+        tr_crown_quadric(c.trad, q);
+        return gme_crown_q_chord(&q, p.x - c.ce.x, p.y - c.ce.y, p.z - c.ce.z, d.x, d.y, d.z, &t0, &t1) != 0;
+    }
+    const float px = (p.x - c.ce.x) * c.ia, py = (p.y - c.ce.y) * c.ib, pz = (p.z - c.ce.z) * c.ia;
+    const float qx = d.x * c.ia, qy = d.y * c.ib, qz = d.z * c.ia;
+    const float qq = qx * qx + qy * qy + qz * qz, pq = px * qx + py * qy + pz * qz, pp = px * px + py * py + pz * pz - 1.f;
+    const float disc = pq * pq - qq * pp;
+    if (disc <= 0.f) return false;
+    const float sq = sqrtf(disc);
+    t0 = (-pq - sq) / qq;
+    t1 = (-pq + sq) / qq;
+    return true;
+}
+// version 2 quadrics, out of line (packed = CrownG.trad): the exit distance from crown-local p, the
+// outward normal at crown-local p
+__device__ __noinline__ float tr_crown_exit2(int32_t packed, float3 p, float3 d) {
+    GmeCrownQ q;
+    tr_crown_quadric(packed, q);
+    float t0, t1;
+    return gme_crown_q_chord(&q, p.x, p.y, p.z, d.x, d.y, d.z, &t0, &t1) ? fmaxf(t1, 0.f) : 0.f;
+}
+__device__ __noinline__ float3 tr_crown_normal2(int32_t packed, float3 p) {
+    GmeCrownQ q;
+    tr_crown_quadric(packed, q);
+    int face;
+    gme_crown_q_de(&q, p.x, p.y, p.z, &face);
+    if (face) return f3(0.f, (float)face, 0.f);           // a flat cap
+    const float w = p.y - q.uc;
+    const float3 g = f3(2.f * q.ia2 * p.x, 2.f * q.k2 * w + q.k1, 2.f * q.ia2 * p.z);
+    const float l2 = dot3(g, g);
+    return l2 > 1e-12f ? g * rsqrtf(l2) : f3(0.f, 1.f, 0.f);
+}
+// distance from p along unit d to where the ray leaves the crown's solid (0 if it never is inside ahead)
 __device__ __forceinline__ float tr_crown_exit(const CrownG& c, float3 p, float3 d) {
+    if (CROWN_QUAD(c)) return tr_crown_exit2(c.trad, p - c.ce, d);
     const float px = (p.x - c.ce.x) * c.ia, py = (p.y - c.ce.y) * c.ib, pz = (p.z - c.ce.z) * c.ia;
     const float qx = d.x * c.ia, qy = d.y * c.ib, qz = d.z * c.ia;
     const float qq = qx * qx + qy * qy + qz * qz, pq = px * qx + py * qy + pz * qz, pp = px * px + py * py + pz * pz - 1.f;
@@ -509,7 +620,7 @@ __device__ __forceinline__ float tr_clump_fade(float t, float cell) { return sat
 // are smaller than a few pixels (no shimmering under the jittered TAA).
 #define CLUMP_O2 2.37f
 __device__ __forceinline__ float tr_clump_delta(const CrownG& c, float3 q, float amp, float fp, float3* grad) {
-    const float ic = 1.f / gme_clump_cell(c.trad), ic2 = ic * CLUMP_O2;
+    const float ic = 1.f / gme_clump_cell(CROWN_R(c)), ic2 = ic * CLUMP_O2;
     const float w1 = 1.5f * fp * ic, w2 = 1.5f * fp * ic2;
     float g[3], g2[3];
     const float n = gme_clump_noise(q.x * ic, q.y * ic, q.z * ic, c.cs, grad ? g : NULL);
@@ -535,20 +646,27 @@ __device__ __forceinline__ float tr_ellipsoid_de(const CrownG& c, float3 q) {
     const float k1 = sqrtf(kx * kx * c.ia * c.ia + ky * ky * c.ib * c.ib + kz * kz * c.ia * c.ia);
     return k0 * (k0 - 1.f) / fmaxf(k1, 1e-6f);
 }
-// Clumped crown along p0 + d t' entering the ellipsoid at tin: sphere tracing of
-// d_ellipsoid + delta = 0 inside the shell, at most 12 steps; -1 if the ray leaves
-// the ellipsoid through the gaps. tabs: distance of p0 along the primary ray (fade).
+// the crown's outward normal at crown-local q
+__device__ __forceinline__ float3 tr_crown_normal(const CrownG& c, float3 q) {
+    if (CROWN_QUAD(c)) return tr_crown_normal2(c.trad, q);
+    return norm3(f3(q.x * c.ia * c.ia, q.y * c.ib * c.ib, q.z * c.ia * c.ia));
+}
+// Clumped crown along p0 + d t' entering the solid at tin: sphere tracing of
+// d_solid + delta = 0 inside the shell, at most 12 steps; -1 if the ray leaves
+// the solid through the gaps. tabs: distance of p0 along the primary ray (fade).
 __device__ __noinline__ float tr_clump(float3 p0, float3 d, const CrownG& c, float tin, float tabs) {
-    const float cell = gme_clump_cell(c.trad);
-    const float amp = gme_clump_amp(c.trad) * tr_clump_fade(tabs + tin, cell);
+    const float cell = gme_clump_cell(CROWN_R(c));
+    const float amp = gme_clump_amp(CROWN_R(c)) * tr_crown_ampk(c) * tr_clump_fade(tabs + tin, cell);
     if (amp <= 0.f) return tin;
+    GmeCrownQ cq;                                        // version 2 quadric classes: the solid's distance estimate
+    if (CROWN_QUAD(c)) tr_crown_quadric(c.trad, cq);
     const float tout = tin + tr_crown_exit(c, p0 + d * tin, d);
     const float lip = 1.f + 3.5f * amp / cell;           // |grad delta| <= ~14 amp / cell at worst; typical far less
     const float fp = (tabs + tin) * g_tc.pix;            // pixel footprint at the crown (band limit of the billows)
     float t = tin;
     for (int i = 0; i < 12; ++i) {
         const float3 q = p0 + d * t - c.ce;
-        const float F = tr_ellipsoid_de(c, q) + tr_clump_delta(c, q, amp, fp, NULL);
+        const float F = (CROWN_QUAD(c) ? gme_crown_q_de(&cq, q.x, q.y, q.z, NULL) : tr_ellipsoid_de(c, q)) + tr_clump_delta(c, q, amp, fp, NULL);
         if (F < 2e-3f) return t;
         t += F / lip;
         if (t > tout) return -1.f;
@@ -669,10 +787,59 @@ __device__ __forceinline__ float tr_exit(int i, float S, float off, float oo, fl
 // the clumped crown (primary rays; a ray may pass through its gaps); FM_LAD the
 // crown as a leaf-area medium: h.tau += sigma x chord, blocking only once the
 // optical depth passes TR_LAD_OPAQUE (High's shadow rays). Trunks are opaque.
+// Version 2 crown (any class) of block b over [tb, tend], as tr_flora below: the hit's kind, the new
+// tend, the LAD ray's optical depth. Out of line and by value: the walk's registers (and its tend, its
+// hit record) stay those of the version 1 path.
+struct FloraHit { int kind; float tend, tau; };
+template <int kMode>
+__device__ __noinline__ FloraHit tr_flora2(const GmeColTile* tile, int b, int rcx, int rcz,
+                                           float ox, float oy, float oz, float3 d, float tb, float tend, float tau) {
+    const GmeSlot* s = &tile->slot[b];
+    const int32_t trad = __ldg(&s->trad), tcy = __ldg(&s->tcy), tbase = __ldg(&s->tbase);
+    const int32_t tx = __ldg(&s->tx), tz = __ldg(&s->tz);
+    const int32_t lx = tx - (g_tc.cx + rcx) * 32, lz = tz - (g_tc.cz + rcz) * 32;
+    const float dl = (float)((int32_t)((__ldg(&tile->col[(lz + GME_TILE_APRON) * GME_TILE_N + lx + GME_TILE_APRON]) >> 8) ^ 0x80u) - 0x80) *
+                     (1.f / GME_DEV_UNIT);
+    const float3 pb0 = f3(ox + d.x * tb, oy + d.y * tb, oz + d.z * tb);
+    // tile-local, like the ray
+    CrownG c = tr_crown_v2(__ldg(&s->theight), trad, __ldg(&s->tvr), (float)lx + 0.5f, (float)(tbase - 32 * g_tc.cy) + dl, (float)lz + 0.5f);
+    int fk = HK_NONE;
+    float t0, t1;
+    if (tr_crown_chord(c, pb0, d, t0, t1) && t1 > 0.f && t0 <= tend - tb) {
+        const float tin = fmaxf(t0, 0.f);
+        if (kMode == FM_LAD) {                           // the chord through the crown, clipped to the segment
+            const float tout = fminf(t1, tend - tb);
+            if (tout > tin) {
+                tau += tr_crown_sigma(c, d) * (tout - tin);
+                if (tau > TR_LAD_OPAQUE) { tend = tb + tin; fk = HK_CROWN; }
+            }
+        } else {
+            float tf = tin;
+            if (kMode == FM_CLUMP) {
+                c.cs = gme_clump_seed(tx, tz, g_tc.seed);
+                tf = tr_clump(pb0, d, c, tin, tb);
+            }
+            if (tf >= 0.f) { tend = tb + tf; fk = HK_CROWN; }
+        }
+    }
+    const float y0 = (float)(tbase + 1 - 32 * g_tc.cy) + dl, y1 = (float)(tcy + 1 - 32 * g_tc.cy) + dl;
+    const float tt = tr_hit_cylinder(pb0, d, (float)lx + 0.5f, (float)lz + 0.5f, gme_trunk_radius(trad), y0, y1, tend - tb);
+    if (tt >= 0.f) { tend = tb + tt; fk = HK_TRUNK; }
+    FloraHit r;
+    r.kind = fk; r.tend = tend; r.tau = tau;
+    return r;
+}
+
 template <int kMode>
 __device__ __forceinline__ int tr_flora(const GmeColTile* tile, int b, int rcx, int rcz,
                                         float ox, float oy, float oz, float3 d, float tb, float& tend, THit& h) {
     const GmeSlot* s = &tile->slot[b];
+    if (GME_SHAPE_IS_V2(__ldg(&s->theight))) {          // version 2 classes
+        const FloraHit r = tr_flora2<kMode>(tile, b, rcx, rcz, ox, oy, oz, d, tb, tend, kMode == FM_LAD ? h.tau : 0.f);
+        if (kMode == FM_LAD) h.tau = r.tau;
+        tend = r.tend;
+        return r.kind;
+    }
     const int32_t trad = __ldg(&s->trad), tcy = __ldg(&s->tcy), tvr = __ldg(&s->tvr);
     const int32_t lx = __ldg(&s->tx) - (g_tc.cx + rcx) * 32, lz = __ldg(&s->tz) - (g_tc.cz + rcz) * 32;   // 0..31
     const float dl = (float)((int32_t)((__ldg(&tile->col[(lz + GME_TILE_APRON) * GME_TILE_N + lx + GME_TILE_APRON]) >> 8) ^ 0x80u) - 0x80) *

@@ -728,6 +728,16 @@ typedef struct SpectrumFile {
 
 ### 5.2 Phase B, bio core later (M7; integer only, flag-gated)
 
+> **Built.** The life side is described as built in [biosphere-spec.md](biosphere-spec.md) 10.5. What differs from the plan below:
+> - **Switch and CRC:** the two reserved words are now `BioParams.light_mode` and `BioParams.spectrum_crc`. A new run takes `life/spectrum.bin` when it exists (`--spectrum FILE`, `--no-spectrum`); `life --resume --enable spectral` switches a running world over, logged as an intervention.
+> - **Water:** each band uses its transmittance table at 0–32 m (interpolated), and the band's attenuation only below 32 m. A band average of exponentials is not an exponential, and the table is what the renderer computes.
+> - **Canopy:** grey (phase 1). The per-band leaf area index (phase 2) is not built.
+> - **Energy scale:** exact, not ±5%. The two efficiencies are computed when the run is created so that the reference leaf (pigment 200, hue bin 8, at the surface, over a day at the present haze) gains what the scalar model gave it. T13a (the test planet): 10176 against 10192 eu per day (−0.2%, integer rounding). Switching it on in the evolved island 1 moved plant production by +4% in a sim-year and left the vegetation where it was.
+> - **Leaf area** no longer scales with the pigment gene when light comes in bands: the pigment acts through its absorptance.
+> - **`BG_QWIDTH`** (gene 41) mixes in the neighbouring hue bins' pigment shapes (up to half of each) and up to doubles the pigment cost.
+> - **T13** as built has four parts: calibration, the depth profile against the band sum (within 1.7%), selection (two clones on a shelf of 2 m and 12 m: the red one wins the shallows, the blue-green one the deep, and nothing separates them with scalar light), and CPU ≡ GPU with every feature plus the resume rules. The Spearman criterion of the plan was replaced: a saturated population of one pigment shows no shift within a test's time.
+> - **T12:** see biosphere-spec 10.11.
+
 **Switch:** `BioParams.reserved[0] = BIO_LIGHT_SPECTRAL`.
 - `BioParams` is stored in `GMEBIO02` checkpoints. Every existing checkpoint therefore loads with 0 and keeps today's scalar `bio_light` path bit for bit.
 - New runs opt in with `life --spectrum life/spectrum.bin`. Its CRC goes into `reserved[1]`, and a resume with a different file is refused.
@@ -768,6 +778,11 @@ typedef struct SpectrumFile {
 
 ### 5.3 Phase C, shapes to evolve into (M8)
 
+> **Built.** Life side: [biosphere-spec.md](biosphere-spec.md) 10.6. Engine side: 5.5 below. What differs from the plan below:
+> - **Gene value 0 is the plant as it was.** The shape genes sat unused through every evolved world's history and are still near 0, so `BG_ASPECT` and `BG_LEAFANG` wrap around their range: gene 0 is height : width 1 and the mid leaf angle (`BIOMORPH_ASPECT_OF`, `BIOMORPH_LEAFCLASS_OF` in `biomap.h`). Aspect has 8 steps: 0.5, 0.75, 1, 1.4, 1.8, 2.2, 2.6, 3.
+> - **Selection** is a crown model, not only "light caught against a cost": the crown's top area (width² × class factor), interception `1 − e^(−κ·L)` with Goudriaan's projection per leaf-angle class and hour (never more than falls on the top), saturation of the lit leaves of every land plant, shading by what a plant intercepts, overtopping through height, and a structure cost per class. In weak light a thin all-zero shape gains what the plant gained before; an evolved vegetation is nevertheless re-sorted when the feature is switched on (biosphere-spec 10.6).
+> - **Biomap v2** as planned; the shape word also carries a valid bit (`BIOMORPH_VALID`), and the header's atmosphere is `atm_ppm[7]` with a flag saying whether it is known.
+
 **Genes in reserved body slots** (`BG_STORE` = 36, so 37–47 are free; `BG_NEUTRAL0` = 48):
 
 | Gene | Meaning |
@@ -795,6 +810,34 @@ typedef struct SpectrumFile {
 | **A** (M1–M6, now) | density.h, trace.cuh, spectral.*, atmo.cu, gi.cu, spectrum_file.h; gpu.*, world.*, render.*, main.c; the `gme` target in CMakeLists | None of these is a `gme_genesis` or `gme_biotest` source (those are genesis_main.c, cosmos.c, chem.c, planetfile.c, biomap.c, bio_env.c, bio_main.c, the bio core, rtcuda.c, platform.c, jobs.c and image.c). Every rig build uses `-DGME_BUILD_ENGINE=OFF`, so the `gme` block is skipped even when `src/` is redeployed. Gates: SHA-256 of all protected files is unchanged, and `gme_genesis env --island k --crc-only` equals `life/env_crc.txt` for k = 0..4 (fb0adde3, 92e3947f, 9b5d80f8, d6b757ad, 03277b3b). |
 | **B** (M7, after the integration builder lands and the islands are stable) | bio_types.h, bio_core.h, bio_kernels.cu, bio_sim.c, bio_cpu.c, bio_api.h, bio_main.c, bio_test.c, the bio spec | Flag off is bit-identical (T14). Old checkpoints carry `reserved[0]` = 0. Env CRCs are untouched, since bio_env.c only uses gme_height, gme_material and gme_env_bin. Rigs change only through `bio_launch.ps1 -Deploy` after T1–T14 pass on the PC. Flagged runs are new runs only. |
 | **C** (M8) | as B, plus bio_io.c (export v2), biomap.h/.c, flora.h, density.h, trace.cuh | v1 biomaps take the unchanged code path, so `ref_hash` is identical for `--no-life`, `--biomap-test` and the v1 home biomap. `gme_env_bin`, `gme_height` and `gme_material` are untouched, so env CRCs hold. |
+
+### 5.5 Crown shapes and creatures in the engine (as built)
+
+**Crown shapes (phase C, engine side).** A version 2 biomap gives every cell a shape word (`BIOMORPH`, `biomap.h`). A shrub or tree of a cell whose word is valid takes its crown class and aspect bin; a cell without a valid word, and every cell of a version 1 biomap, keeps the version 1 plant, voxel for voxel.
+
+- **Voxel truth (`flora.h`).** Radius `r` = the version 1 radius (1..3; a column one less), so every crown stays inside its 8 m slot. Crown rows `ch` from the aspect: the ellipsoid is the version 1 crown stretched by the aspect (at 1 : 1 it is the version 1 plant), cone, column and dome have `ch = round(aspect × (2r + 1))`, the umbrella is a cap of half those rows on a bare trunk. With `X = dx² + dz²`, `a² = r² + r` and `u` the height of a voxel centre above the crown's bottom face, a voxel is leaf when
+
+  | Class | Inside when |
+  |---|---|
+  | ellipsoid | `X/a² + (u − ch/2)² / ((ch² − 1)/4) ≤ 1` |
+  | cone | `X/a² ≤ ((ch − u)/ch)²` |
+  | umbrella | `X/a² ≤ u/ch` |
+  | column | `X ≤ a²` |
+  | dome | `X/a² + (u/ch)² ≤ 1` |
+
+  all in integers (`gme_crown_v2_inside`). Porosity, leaf angle, pigment amount and Q band width never change a voxel; they are carried in the slot's shape word for the renderer.
+- **Smooth surface (`density.h`, `trace.cuh`).** The same solids as quadrics for the column tracer. Self-test D2 covers version 2: 5 classes × 8 aspect bins × heights 2..32 m at every trunk position, 9.2 M voxel centres against the analytic solids with 0 mismatches; the ellipsoid at 1 : 1 against the version 1 plant, 249,600 voxels, 0 differ; ray chords within 2 cm of a 5 mm march.
+- **Sky.** A version 2 biomap carries the atmosphere life has made; the sky uses it (`--sky-planet` keeps the planet file's).
+- **Test pattern.** `--biomap-test2` is the version 1 pattern with every crown class × aspect bin; with `--sheet FILE` it renders one close-up per class and aspect.
+
+**Creatures (`fauna_scene.*`, `render.cu`).** The creatures of a GMEFAUN1 file (`--fauna file`, default `life/home.fauna`; `--no-fauna`; `--fauna-test [N]` for a built-in herd) are drawn as spheres. They never touch the chunk pool or the tiles, so generation, validation and every hash are unaffected.
+
+- **Placement** (the file carries no heights). A walker stands on the drawn ground: the bilinear patch of the smooth surface under it, its centre one radius along the slope's normal above it. A swimmer hangs at its depth below the water plane, kept between the seabed and the surface. A walker whose ground is under water and a swimmer over land are dropped. Radius = half the record's diameter, clamped to 0.2..6 m. A swarm is 6 smaller spheres on a jittered ring.
+- **Motion.** An idle sway and hop (walkers) or drift (swimmers), amplitude and speed from the motor gene; `--still` holds it. The snapshot is frozen: creatures do not travel.
+- **Tracing.** The spheres are binned into a hash grid of 32 m cells (one per chunk column; a sphere reaching into a neighbour is listed in both, with the cell's height range). The kernels walk the grid along each ray up to 1024 m, and along the sun ray up to 128 m for shadows. Colour: the palette index (pigment hue bin) with a per-creature brightness.
+- **Classic view.** A walker stands on the top face of its column's ground voxel.
+
+**Gates, as run on the PC before render tests moved to the cluster:** `ref_hash` and `dens_hash` of `--bench` are unchanged against the first build for `--no-life` (GPU and `--cpu`), `--biomap-test` and the version 1 home biomap; `--biomap-test2` gives the same hashes on GPU and CPU; D2, D5 and D6 pass. **Not yet done:** the headless Linux build of these changes and a frame-time measurement on a quiet GPU (the timings taken so far ran beside other jobs and say nothing).
 
 ---
 

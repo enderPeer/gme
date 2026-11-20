@@ -13,8 +13,9 @@
 #endif
 
 #define CKPT_MAGIC "GMEBIO02"
-#define CKPT_VERSION 2u
+#define CKPT_VERSION 3u       /* 2: the first release. 3 adds the AUX_ section and a longer GLOB; both load. */
 #define CKPT_HDR 512
+#define CKPT_AUX 12           /* per agent: eco u32, expl u64 */
 
 /* ---- little-endian helpers ---------------------------------------------------- */
 static void put32(uint8_t* p, uint32_t v) { for (int k = 0; k < 4; ++k) p[k] = (uint8_t)(v >> (8 * k)); }
@@ -80,7 +81,7 @@ int bio_sim_save(BioSim* s, const char* path) {
     uint32_t n = 0;
     int rc = -1;
     int64_t* fl = NULL;
-    uint8_t* hot = NULL; uint8_t* cold = NULL;
+    uint8_t* hot = NULL; uint8_t* cold = NULL; uint8_t* aux = NULL;
     BioGenome* gt = NULL; uint32_t* gidx = NULL; GKey* keys = NULL;
     FILE* f = NULL;
     char tmp[1024];
@@ -89,10 +90,11 @@ int bio_sim_save(BioSim* s, const char* path) {
     fl = (int64_t*)malloc((size_t)w->n_cells * BF_N * 8);
     hot = (uint8_t*)malloc((size_t)(n ? n : 1) * 72);
     cold = (uint8_t*)malloc((size_t)(n ? n : 1) * 76);
+    aux = (uint8_t*)malloc((size_t)(n ? n : 1) * CKPT_AUX);
     gt = (BioGenome*)malloc(sizeof(BioGenome) * (n ? n : 1));
     gidx = (uint32_t*)malloc((size_t)(n ? n : 1) * 4);
     keys = (GKey*)malloc(sizeof(GKey) * (n ? n : 1));
-    if (!fl || !hot || !cold || !gt || !gidx || !keys) { bio_set_error("out of memory"); goto done; }
+    if (!fl || !hot || !cold || !aux || !gt || !gidx || !keys) { bio_set_error("out of memory"); goto done; }
     if (bio_fields_get(s, fl)) goto done;
     /* agents */
     for (uint32_t i = 0; i < n; ++i) {
@@ -106,6 +108,7 @@ int bio_sim_save(BioSim* s, const char* path) {
         uint8_t* q = cold + (size_t)i * 76;
         for (int k = 0; k < BIO_OUT; ++k) put64(q + 8 * k, r->dW[k]);
         put32(q + 64, r->lineage); put32(q + 68, r->parent); put32(q + 72, r->bstep);
+        put32(aux + (size_t)i * CKPT_AUX, r->eco); put64(aux + (size_t)i * CKPT_AUX + 4, r->expl);
         keys[i].h = bio_fnv64(BIO_FNV_INIT, &r->g, sizeof r->g);
         keys[i].idx = i;
     }
@@ -146,9 +149,10 @@ int bio_sim_save(BioSim* s, const char* path) {
     put64(hdr + 152, (uint64_t)s->Gh.acc[BACC_SED_FE]); put64(hdr + 160, (uint64_t)s->Gh.acc[BACC_IMPORT_C]);
     put64(hdr + 168, (uint64_t)s->Gh.acc[BACC_VENT_C]);
     put64(hdr + 176, s->births); put64(hdr + 184, s->deaths);
-    put32(hdr + 192, s->gates); put32(hdr + 196, 0);   /* last hub epoch applied (hub: M3) */
+    put32(hdr + 192, s->gates); put32(hdr + 196, (uint32_t)s->hub_epoch);   /* last hub epoch applied */
     for (int k = 0; k < 5; ++k) put64(hdr + 200 + 8 * k, (uint64_t)s->init_total[k]);
     put32(hdr + 240, s->env->seed);
+    put32(hdr + 244, (uint32_t)w->P.feat); put32(hdr + 248, (uint32_t)w->P.light_mode); put32(hdr + 252, (uint32_t)w->P.spectrum_crc);
     put32(hdr + 508, bio_crc32(0, hdr, 508));
     /* sim state */
     int64_t sims[16];
@@ -157,6 +161,7 @@ int bio_sim_save(BioSim* s, const char* path) {
     sims[4] = (int64_t)s->g1_prev_step; sims[5] = s->g2_prev_oxy; sims[6] = s->gates;
     sims[7] = (int64_t)s->births; sims[8] = (int64_t)s->deaths;
     for (int k = 0; k < 5; ++k) sims[9 + k] = s->init_total[k];
+    sims[14] = (int64_t)s->g4_since; sims[15] = (int64_t)s->hub_epoch;
     f = fopen(tmp, "wb");
     if (!f) { bio_set_error("cannot write %s", tmp); goto done; }
     if (fwrite(hdr, 1, CKPT_HDR, f) != CKPT_HDR ||
@@ -166,6 +171,7 @@ int bio_sim_save(BioSim* s, const char* path) {
         write_section(f, "FLDS", fl, (uint64_t)w->n_cells * BF_N * 8) ||
         write_section(f, "HOT_", hot, (uint64_t)n * 72) ||
         write_section(f, "COLD", cold, (uint64_t)n * 76) ||
+        write_section(f, "AUX_", aux, (uint64_t)n * CKPT_AUX) ||
         write_section(f, "GTAB", gt, (uint64_t)ng * sizeof(BioGenome)) ||
         write_section(f, "GIDX", gidx, (uint64_t)n * 4) ||
         write_section(f, "END_", NULL, 0)) {
@@ -176,7 +182,7 @@ int bio_sim_save(BioSim* s, const char* path) {
     rc = commit_file(f, tmp, path);
     f = NULL;
 done:
-    free(a); free(fl); free(hot); free(cold); free(gt); free(gidx); free(keys);
+    free(a); free(fl); free(hot); free(cold); free(aux); free(gt); free(gidx); free(keys);
     return rc;
 }
 
@@ -215,13 +221,16 @@ BioSim* bio_sim_load(const char* path, const BioEnv* env, const BioConfig* cfg) 
     }
     fclose(f); f = NULL;
 #define SEC(name, var, sz) do { var = NULL; for (int _k = 0; _k < nsec; ++_k) if (!strcmp(tags[_k], name)) { var = sec[_k]; sz = secn[_k]; } } while (0)
-    void *parm, *glob, *sims, *flds, *hot, *cold, *gtab, *gidx;
-    uint64_t nparm = 0, nglob = 0, nsims = 0, nflds = 0, nhot = 0, ncold = 0, ngtab = 0, ngidx = 0;
+    void *parm, *glob, *sims, *flds, *hot, *cold, *gtab, *gidx, *aux;
+    uint64_t nparm = 0, nglob = 0, nsims = 0, nflds = 0, nhot = 0, ncold = 0, ngtab = 0, ngidx = 0, naux = 0;
     SEC("PARM", parm, nparm); SEC("GLOB", glob, nglob); SEC("SIMS", sims, nsims); SEC("FLDS", flds, nflds);
     SEC("HOT_", hot, nhot); SEC("COLD", cold, ncold); SEC("GTAB", gtab, ngtab); SEC("GIDX", gidx, ngidx);
+    SEC("AUX_", aux, naux);
 #undef SEC
     const uint32_t n = get32(hdr + 48);
-    if (!glob || nglob != sizeof(BioGlobals) || !sims || nsims != 16 * 8 || !flds ||
+    /* GLOB of the first release is shorter: the fields added since load as zero */
+    if (!glob || (nglob != sizeof(BioGlobals) && nglob != BIO_GLOBALS_V2_BYTES) || !sims || nsims != 16 * 8 || !flds ||
+        (aux && naux != (uint64_t)n * CKPT_AUX) ||
         nflds != (uint64_t)env->w * env->h * BF_N * 8 || !hot || nhot != (uint64_t)n * 72 || !cold || ncold != (uint64_t)n * 76 ||
         !gtab || ngtab % sizeof(BioGenome) || !gidx || ngidx != (uint64_t)n * 4) {
         bio_set_error("%s: missing or malformed sections", path); goto fail;
@@ -233,13 +242,31 @@ BioSim* bio_sim_load(const char* path, const BioEnv* env, const BioConfig* cfg) 
     c2.atm_scale_ppm = (int32_t)get32(hdr + 68);
     c2.barrier_q8 = (int32_t)get32(hdr + 72);
     c2.closed_box = (int32_t)get32(hdr + 76);
+    c2.features = 0; c2.enable = 0; c2.spectrum = NULL;      /* the checkpoint decides; cfg adds below */
     s = bio_sim_create(env, &c2);
     if (!s) goto fail;
     BioWorld* w = &s->w;
     if (parm && nparm == sizeof(BioParams)) memcpy(&w->P, parm, sizeof(BioParams));
     w->salt = c2.salt;
     w->step = get64(hdr + 40);
-    memcpy(&s->Gh, glob, sizeof(BioGlobals));
+    memset(&s->Gh, 0, sizeof(BioGlobals));
+    memcpy(&s->Gh, glob, (size_t)nglob);
+    bio_features_init(s);     /* parameters a checkpoint from before a feature does not have (needs the haze) */
+    /* features: the checkpoint's, plus what the caller switches on now */
+    s->feat_loaded = bio_sim_features(s);
+    w->P.feat = (int32_t)(((uint32_t)w->P.feat | cfg->enable) & BIO_F_ALL);
+    if (w->P.light_mode == BIO_LIGHT_SPECTRAL) {
+        if (!cfg->spectrum) { bio_set_error("%s: this run uses light in bands; give its spectrum file (crc %08x)", path, (uint32_t)w->P.spectrum_crc); goto fail; }
+        if (bio_spectrum_crc(cfg->spectrum) != (uint32_t)w->P.spectrum_crc) {
+            bio_set_error("%s: the run was made with spectrum crc %08x, this file has %08x; a resume with another light file is refused",
+                          path, (uint32_t)w->P.spectrum_crc, bio_spectrum_crc(cfg->spectrum));
+            goto fail;
+        }
+        if (bio_set_spectrum(s, cfg->spectrum)) goto fail;
+    } else if (cfg->enable & BIO_F_SPECTRAL) {
+        if (!cfg->spectrum) { bio_set_error("%s: switching to light in bands needs a spectrum file", path); goto fail; }
+        if (bio_set_spectrum(s, cfg->spectrum)) goto fail;
+    }
     if (bio_g_put(s) || bio_fields_put(s, (const int64_t*)flds)) goto fail;
     {
         const int64_t* sm = (const int64_t*)sims;
@@ -247,6 +274,9 @@ BioSim* bio_sim_load(const char* path, const BioEnv* env, const BioConfig* cfg) 
         s->g1_prev_step = (uint64_t)sm[4]; s->g2_prev_oxy = sm[5]; s->gates = (uint32_t)sm[6];
         s->births = (uint64_t)sm[7]; s->deaths = (uint64_t)sm[8];
         for (int k = 0; k < 5; ++k) s->init_total[k] = sm[9 + k];
+        /* a first-release checkpoint has zeros here: "never" for the gate timer */
+        s->g4_since = get32(hdr + 8) >= 3u ? (uint64_t)sm[14] : UINT64_MAX;
+        s->hub_epoch = get32(hdr + 8) >= 3u ? (uint64_t)sm[15] : 0;
     }
     const uint32_t ng = (uint32_t)(ngtab / sizeof(BioGenome));
     a = (BioAgentRec*)calloc(n ? n : 1, sizeof(BioAgentRec));
@@ -261,6 +291,10 @@ BioSim* bio_sim_load(const char* path, const BioEnv* env, const BioConfig* cfg) 
         const uint8_t* q = (const uint8_t*)cold + (size_t)i * 76;
         for (int k = 0; k < BIO_OUT; ++k) r->dW[k] = get64(q + 8 * k);
         r->lineage = get32(q + 64); r->parent = get32(q + 68); r->bstep = get32(q + 72);
+        if (aux) {
+            const uint8_t* x = (const uint8_t*)aux + (size_t)i * CKPT_AUX;
+            r->eco = get32(x); r->expl = get64(x + 4);
+        }
         const uint32_t gi = ((const uint32_t*)gidx)[i];
         if (gi >= ng) { bio_set_error("%s: genome index out of range", path); goto fail; }
         r->g = ((const BioGenome*)gtab)[gi];
@@ -311,11 +345,36 @@ static int ckey_cmp(const void* a, const void* b) {
     return x->idx < y->idx ? -1 : (x->idx > y->idx ? 1 : 0);
 }
 
+/* biomass per bin of one morphology gene, and the bin holding the most */
+typedef struct MorphAcc { int64_t crown[5], aspect[8], leafang[4], poros[4], qw[16], pig, mass; } MorphAcc;
+static void morph_add(MorphAcc* m, const uint8_t* g, int64_t b) {
+    m->crown[BIOMORPH_CROWN_OF(g[BG_CROWN])] += b; m->aspect[BIOMORPH_ASPECT_OF(g[BG_ASPECT])] += b;
+    m->leafang[BIOMORPH_LEAFANG_OF(g[BG_LEAFANG])] += b; m->poros[BIOMORPH_POROSITY_OF(g[BG_POROSITY])] += b;
+    m->qw[BIOMORPH_QWIDTH_OF(g[BG_QWIDTH])] += b;
+    m->pig += b * g[BG_PIGMENT]; m->mass += b;
+}
+static uint32_t mode_of(const int64_t* v, int n) {
+    int best = 0;
+    for (int q = 1; q < n; ++q) if (v[q] > v[best]) best = q;
+    return (uint32_t)best;
+}
+static uint32_t morph_word(const MorphAcc* m) {
+    if (m->mass <= 0) return 0u;
+    return BIOMORPH(mode_of(m->crown, 5), mode_of(m->aspect, 8), mode_of(m->leafang, 4), mode_of(m->poros, 4),
+                    (uint32_t)(m->pig / m->mass), mode_of(m->qw, 16));
+}
+
 int bio_sim_vegetation(BioSim* s, uint32_t* cells_out, uint32_t fallback_out[64], uint8_t palette[16][3]) {
+    return bio_sim_vegetation2(s, cells_out, NULL, fallback_out, NULL, palette);
+}
+
+int bio_sim_vegetation2(BioSim* s, uint32_t* cells_out, uint32_t* morph_out, uint32_t fallback_out[64],
+                        uint32_t fallback_morph_out[64], uint8_t palette[16][3]) {
     if (!s || !cells_out) return -1;
     const BioEnv* e = s->env;
     const BioWorld* w = &s->w;
     const int32_t nc = w->n_cells;
+    const int morph_on = (w->P.feat & BIO_FEAT_MORPH) != 0;      /* else every word stays 0: version 1 shapes */
     BioAgentRec* a = NULL;
     uint32_t n = 0;
     if (bio_download_agents(s, &a, &n)) return -1;
@@ -326,12 +385,14 @@ int bio_sim_vegetation(BioSim* s, uint32_t* cells_out, uint32_t fallback_out[64]
         const uint8_t* g = a[i].g.body;
         if (g[BG_HOLDFAST] <= 64 || (g[BG_E_ANOX] < 32 && g[BG_E_OXY] < 32)) continue;
         if (a[i].C + a[i].S <= 0) continue;
+        if ((w->P.feat & BIO_FEAT_PRED) && bio_creature(g, a[i].eco)) continue;      /* it walks and grazes: the creature export has it */
         keys[m].cell = (uint32_t)bio_cell_at(w, a[i].x, a[i].z);
         keys[m].idx = i;
         ++m;
     }
     qsort(keys, m, sizeof(CellKey), ckey_cmp);
     memset(cells_out, 0, sizeof(uint32_t) * (size_t)nc);
+    if (morph_out) memset(morph_out, 0, sizeof(uint32_t) * (size_t)nc);
     const int64_t cell_m2 = (int64_t)1 << (2 * w->shift);
     const int64_t ref = 4167;   /* 50 g C per m^2 in mmol */
     for (uint32_t k = 0; k < m;) {
@@ -344,7 +405,7 @@ int bio_sim_vegetation(BioSim* s, uint32_t* cells_out, uint32_t fallback_out[64]
         for (; j < m && keys[j].cell == c; ++j) {
             const BioAgentRec* r = &a[keys[j].idx];
             const int64_t b = (int64_t)r->C + r->S;
-            const int32_t hq4 = bio_height_q4(r->S);     /* 1/16 m */
+            const int32_t hq4 = bio_plant_hq4(w, r->S, bio_traits2(&r->g));     /* 1/16 m; the plain height while shapes are off */
             int cl;
             if (water) cl = hq4 >= 16 ? 1 : 0;          /* kelp from 1 m, else mat */
             else cl = hq4 < 8 ? 2 : (hq4 < 64 ? 3 : 4); /* cover < 0.5 m, shrub < 4 m, tree */
@@ -362,6 +423,17 @@ int bio_sim_vegetation(BioSim* s, uint32_t* cells_out, uint32_t fallback_out[64]
         uint32_t pi = 1;
         for (uint32_t q = 2; q < 16; ++q) if (hue[q] > hue[pi]) pi = q;
         cells_out[c] = BIOCELL(kind_of[best], pi, (uint32_t)cover, (uint32_t)hm, 0u);
+        if (morph_out && morph_on) {      /* the shape of the cell's plants of that kind: dominant classes, mean pigment */
+            MorphAcc ma;
+            memset(&ma, 0, sizeof ma);
+            for (uint32_t q = k; q < j; ++q) {
+                const BioAgentRec* r = &a[keys[q].idx];
+                const int32_t hq4 = bio_plant_hq4(w, r->S, bio_traits2(&r->g));
+                const int cl = water ? (hq4 >= 16 ? 1 : 0) : (hq4 < 8 ? 2 : (hq4 < 64 ? 3 : 4));
+                if (cl == best) morph_add(&ma, r->g.body, (int64_t)r->C + r->S);
+            }
+            morph_out[c] = morph_word(&ma);
+        }
         k = j;
     }
     free(keys);
@@ -380,12 +452,26 @@ int bio_sim_vegetation(BioSim* s, uint32_t* cells_out, uint32_t fallback_out[64]
             }
             int best = 0;
             for (int q = 1; q <= 5; ++q) if (kcnt[q] > kcnt[best]) best = q;
+            if (fallback_morph_out) fallback_morph_out[b] = 0u;
             if (!best || !ncell) { fallback_out[b] = 0; continue; }
             uint32_t pi = 0;
             for (uint32_t q = 1; q < 16; ++q) if (kpal[best][q] > kpal[best][pi]) pi = q;
             const int64_t cov = kcov[best] / ncell;      /* mean cover x share of cells with this kind */
             const int64_t hgt = khgt[best] / kcnt[best];
             fallback_out[b] = cov > 0 ? BIOCELL((uint32_t)best, pi, (uint32_t)cov, (uint32_t)hgt, 0u) : 0u;
+            if (fallback_morph_out && morph_out && morph_on && fallback_out[b]) {
+                /* the commonest shape among this class's cells of that kind (cells count once each) */
+                MorphAcc ma;
+                memset(&ma, 0, sizeof ma);
+                for (int32_t c = 0; c < nc; ++c) {
+                    if ((e->env_bin[c] & 63) != b || BIOCELL_KIND(cells_out[c]) != (uint32_t)best) continue;
+                    const uint32_t mw = morph_out[c];
+                    if (!(mw & BIOMORPH_VALID)) continue;
+                    ma.crown[BIOMORPH_CROWN(mw)]++; ma.aspect[BIOMORPH_ASPECT(mw)]++; ma.leafang[BIOMORPH_LEAFANG(mw)]++;
+                    ma.poros[BIOMORPH_POROSITY(mw)]++; ma.qw[BIOMORPH_QWIDTH(mw)]++; ma.pig += BIOMORPH_PIG(mw); ma.mass++;
+                }
+                fallback_morph_out[b] = morph_word(&ma);
+            }
         }
     }
     if (palette) veg_palette(palette);
@@ -393,8 +479,6 @@ int bio_sim_vegetation(BioSim* s, uint32_t* cells_out, uint32_t fallback_out[64]
 }
 
 /* ---- migrants (spec 6.4) -------------------------------------------------------------- */
-#define MIG_MAGIC "GMEMIG01"
-#define MIG_REC (4 + 4 + 8 + (int)sizeof(BioGenome))
 
 typedef struct { int32_t cls; uint32_t lineage; int64_t mass; uint32_t rep; int64_t repmass; } LinAgg;
 typedef struct { uint64_t key; uint32_t idx; } LKey;

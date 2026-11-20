@@ -1,5 +1,7 @@
 # GME Biosphere: final implementation spec ("Seedbank on integer rails")
 
+**Status:** sections 1–9 are the plan of the first release. Animals, sexual reproduction, learning, light in wavelength bands, plant shapes, the island hub, seed banks and the creature export were built after it and are described as built in **section 10**, which is the reference wherever it differs from the plan.
+
 **Base design:** integration-delivery, the top-ranked design. It is all-integer, ships genesis stages, and does engine and validation work first.
 
 **Grafted from ecology-emergence:**
@@ -362,7 +364,7 @@ Sessile autotrophs use outputs 3, 4 and 6, so plant behaviour (allocation, timin
 
 **Brain cost** per think: `0.05 eu × popcount(G_NEURONS) + 0.01 eu × G_SENSE/255`. Combined with `G_THINK`, cheap slow brains evolve for sessile life and fast ones for hunters. This is also the main throughput lever.
 
-**Learning: neuromodulated Hebbian, Baldwinian.**
+**Learning: neuromodulated Hebbian, Baldwinian.** (This rule failed test T9 and is kept only for worlds that have not switched the `learn` feature on; the rule that replaced it is in 10.4.)
 - Reward: `m = clamp(((E_now − E_lastthink) − rbase)·128 / (1 + C/64), −127, 127)`, then `rbase += (r − rbase) >> 3`.
 - For each plastic row o and active hidden j: `dW[o][j] += SR((ETA·m·out_o·hid_j) >> 21) − SR((dW·DECAY) >> 8)`, clamped to ±32.
 - SR is stochastic rounding with `bio_hash(uid, step, o·8+j, salt)`.
@@ -443,6 +445,8 @@ An agent dies when any of these holds:
 On death, C goes to DET and N to NH4 by atomic add, and the genome slot is freed.
 
 ### 3.8 Predation (`k_claim` → `k_predate`)
+
+*The plan. Predation was built differently (per-cell slots instead of ordered lists, edibility by individual size, a refuge, hunger): see 10.1.*
 
 - An attacker needs `out[2] > 0`, `MOTOR > 0` and `MOUTH > 0`. It picks the best prey among the first 16 agents of its ordered cell list with `C_prey ≤ C_self·MOUTH/32`, then does `atomicMin(&prey.claim, (bio_hash(att,step)<<32) | att_uid)`. This is deterministic and gives one winner per prey. Each attacker claims at most one prey.
 - The prey thread resolves the claim. Success probability is `p = SIGMOID_Q16[(MOTOR_att − MOTOR_prey)/8]·(300 − ARMOR)/300`, rolled with a hash.
@@ -595,6 +599,8 @@ The star search keeps all 11 `gme-search*` slots.
 
 ### 6.4 Migration and hub (PC-centred; no rig-to-rig SSH assumed)
 
+*As built: 10.7.*
+
 - **Island side.** Each epoch, an island writes `outbox/mig_<k>_<epoch>.bin`: 256 genomes per habitat class (marine, coastal, land), chosen as the top lineages by biomass (deterministic), with lineage IDs. At the next epoch it imports `inbox/*` sorted by name. Each migrant goes into a random matching-habitat cell with C = m_r and E = REPRO_E. Imported carbon is logged in `IMPORT_C`, and the files move to `imported/`.
 - **`cluster/bio_hub.ps1`** (PC loop, every 10 min):
   - scp each island's outbox to `life/hub/in/`
@@ -620,6 +626,8 @@ The star search keeps all 11 `gme-search*` slots.
   - `-Fetch`: runs `gme_genesis bioexport --run …` on each rig, which writes `biopart_k.bin`. It scp's the parts, metrics and PNGs into `life/islands/k/`, then runs `gme_genesis bioexport --merge life/islands --out life/home.biomap` locally.
 
 ### 6.6 Better planet found ("let the cards keep running")
+
+*As built: 10.8.*
 
 1. `status.ps1 -Fetch`, then `chem` and `finish` produce a new `home.planet` with a new hash.
 2. `gme_genesis life-seedbank --runs runs/bio_<old>` produces `seedbank.bin`: the top 2000 genomes per guild × habitat, deduplicated.
@@ -746,6 +754,8 @@ GME_HD int      gme_is_standing_flora(uint32_t m);
 
 ### 7.5 Creatures (M7)
 
+*As built: the file is GMEFAUN1 (`src/fauna.h`, 10.9); the engine side is in render-upgrade-spec 5.5.*
+
 - `bioexport --fauna` writes `life/home.fauna`: up to 64K motile agents `{x, y, z, size_m, palette}`. y is ground + 1 on land, or `sea_level − z` in water.
 - `k_render` tests a coarse 32 m hash grid of spheres after the voxel hit. This does not touch the chunk pool, so validation is unaffected.
 - Later: live biomap refresh via `world_set_biomap`, which flushes and regenerates resident chunks in the affected regions.
@@ -846,3 +856,213 @@ Run with `gme_genesis life-test [--cpu|--device d]`; also wired into ctest `bio_
 - **Material enum growth.** Grep every `MAT_COUNT`-sized table in M1 (`genesis_main.c` `mats[]`, `render.cu` `albedo`).
 - **Losing outputs.** `status.ps1 -Fetch` wipes `genesis/`, so every biosphere artefact lives in `life/` and `runs/`.
 
+---
+
+## 10. After the first release: animals, sex, learning, light in bands, shapes, the hub, seed banks
+
+Sections 1–9 are the plan the first release was built from. This section describes what was built on top of it, as built. Where it differs from the plan (3.4 learning, 3.8 predation, 6.4 hub, 6.6 seed bank, 7.5 creatures), this section is the reference.
+
+### 10.0 Features and the rule that protects running worlds
+
+Each addition is a **feature**, a bit in `BioParams.feat` (or `BioParams.light_mode` for light in bands). `BioParams` is stored in every checkpoint.
+
+| Feature (`life --features`, `--enable`) | Bit | What it switches on |
+|---|---|---|
+| `animals` | `BIO_FEAT_PRED` | predation and grazing, gut, trophic level, predator and prey senses, gate G4 (10.1) |
+| `sex` | `BIO_FEAT_SEX` | crossover with a compatible cellmate (10.2) |
+| `learn` | `BIO_FEAT_LEARN` | learning by exploration, replacing the plain Hebbian rule (10.4) |
+| `morph` | `BIO_FEAT_MORPH` | crown shapes: genes 37–41 (10.6) |
+| `hub` | `BIO_FEAT_HUB` | gas uptake ledgers by realm, the island's outbox and inbox (10.7) |
+| `spectral` | `light_mode` | light in 9 wavelength bands from a GMESPEC1 file (10.5) |
+
+- **A new run** gets all of them by default, `spectral` only when `life/spectrum.bin` exists. Named explicitly (`--features all` or a list with `spectral`), light in bands requires the file and the run refuses to start without it.
+- **A resumed run keeps the features of its checkpoint.** A checkpoint of the first release carries none, so a new build alone changes nothing on a running island.
+- **`life --resume --enable LIST`** switches features on in a living world. It is an intervention: it is logged in `stages.log` (`INTERVENTION enable ...`) once, and passing it again later is a no-op.
+- **With every feature off the simulation is the first release, bit for bit.** Test T14 reruns the T2, T2b and T4 scenarios with `features = 0` and compares their state hashes with the ones the first release printed. On real data: the 2.85 M-agent checkpoint of island 1 (sim year 2751) resumed for two sim-days gives state hash `320b1cf0b31758e2` with the first release's binary and with the new one.
+- State that only the features use (the ecology word and the exploration of each agent, the second accumulator block) is part of the state hash only while a feature is on.
+
+**What switching a feature on does to an evolved world.** Island 1 (2.85 M agents, 89% O2), resumed from its year-2751 checkpoint for one sim-year with one feature switched on at a time, without a hub:
+
+| Switched on | Plant production (mol C / day) | Land carbon (mol) | Cells of ground cover / shrub / tree | |
+|---|---|---|---|---|
+| nothing | 4.14e5 | 1.42e8 | 55.1% / 23.0% / 0.10% | |
+| `animals` | 4.24e5 | 1.42e8 | 55.1% / 23.1% / 0.10% | 149 agents live mostly on prey; 20 kills and 1,170 bites a day move 4,500 mol C (10.1) |
+| `sex,learn` | 4.17e5 | 1.42e8 | 55.1% / 23.1% / 0.10% | 143,500 sexual agents, 3.6 births a day with two parents |
+| `spectral` | 4.32e5 | 1.42e8 | 55.1% / 23.0% / 0.10% | |
+| `morph` | 5.36e5 | 1.38e8 | 66.8% / 11.2% / 0.15% | the vegetation re-sorts itself (10.6) |
+| all | 5.48e5 | 1.38e8 | 67.2% / 10.9% / 0.14% | 119 agents live mostly on prey |
+
+Animals, sex, learning and light in bands leave an evolved vegetation where it was. Crown shapes do not. In every run the population (2.85 M), the atmosphere and the vegetated area stayed put and the ledgers stayed exact.
+
+Parameters of the features live in what used to be `BioParams.reserved[16]`. They are zero in an old checkpoint and are filled in with their defaults whenever a run is created or loaded (`bio_params_features`, `bio_features_init`).
+
+**Checkpoint version 3** (magic still `GMEBIO02`): a new `AUX_` section (12 B per agent: ecology word, exploration) and a longer `GLOB` section. Version 2 files load: the missing parts are zero.
+
+### 10.1 Animals (replaces 3.8)
+
+The plan's per-cell ordered lists would have cost about 0.6 ms per step at 1 M agents (a tenth of the step). Predation is built on per-cell **slots** instead: no sort, every write is a commutative atomic or touches only the writer's own agent, and the CPU reference and every GPU agree to the bit.
+
+**Per step** (`k_summary` → `k_pre` → `k_metab` → `k_feed`):
+
+1. **Offer** (`k_summary`). An agent attacks when `MOUTH > 0`, `MOTOR > 0`, its attack output `out[2] > 0` and its gut is less than half full (`2·gut ≤ C`; a full animal does not hunt). It offers itself in one of the cell's 4 slots (chosen by hash). A slot keeps the highest key: a 7-bit hash priority, then the agent index scrambled per cell and step, so neither array order nor uid order is favoured.
+2. **Claim** (`k_pre`, before anyone moves). Every agent looks at one slot of its cell (by hash). If an attacker stands there, the agent offers itself as prey when
+   - it can be **found**: movers (a real motor, `MOTOR ≥ 16`, and no photosynthesis) always can; of the cell's `nn` others each is found with probability `1 − 1/nn`, and the last one never. This is the **refuge**: a cell hides one of its anchored or drifting inhabitants, so predation thins a cell but does not empty it (`pred_refuge1`, tuned);
+   - and it is **edible**: an anchored colony (`HOLDFAST ≥ 128`) can always be grazed; anything else only if one of its individuals fits the attacker's gape: `m_r(prey) ≤ 2^(SIZE_att/10) · MOUTH_att / 32`. Edibility compares individual sizes (the reproduction mass, a gene), not colony biomass: a colony cannot escape by growing, only its lineage can by evolving larger individuals;
+   - and the attacker can **reach** it: an attacker slower than a metre an hour (`MOTOR < 16`) cannot go to its food. It takes only what comes to it: prey that walks or swims at that speed, or that floats free in water. Grazing what stands still is for those that move. (Evolved forests carry mouths and motor genes of 1 or 2 that drifted in while the genes did nothing; without this rule the plants eat each other where they stand.)
+   The attacker takes the claim with the lowest key (`atomicMin`): one prey per attacker and step.
+3. **Outcome** (`k_metab`, the prey's thread). Success probability `SIGMOID[(MOTOR_att − MOTOR_prey)/4] · (300 − ARMOR)/300` (the plan's `/8` was too flat to select for speed; tuned). With `b0 = C_att · MOUTH/255 / 4`:
+   - a free body of at most `4·b0` is **eaten whole**: 70% of `C + S + gut` goes to the attacker, 30% to the cell's DOC, its N and P to NH4 and PO4;
+   - otherwise it loses a **bite**: `min(C/2, b0)` of its reserve carbon. A colony keeps at least half of its reserve per bite.
+4. **Feed** (`k_feed`, the attacker's thread). The attacker adds what its prey gave up to its `gut`. An attacker that died in the same step passes the meal on to the detritus.
+
+**Gut.** Gut carbon is the animal's private organic carbon. Its FERM, SULFRED and AERO pathways and its assimilation use it before the cell's DOC (the demand on the pool shrinks by what the gut covers), with half saturation at `gut = C/8`. An aerobic animal gets 5 eu per mmol, a fermenting one 0.5, as in 3.5.
+
+**Space.** With animals in the world, the crowding maintenance and the 64-per-cell birth cap of a mover (`MOTOR ≥ 16` and no photosynthesis) count only the movers. A grazer in a meadow of 64 plants would otherwise pay five times its maintenance and never reproduce there. A phototroph needs its place in the light whatever its motor gene: an unused motor gene costs nothing and must not buy a plant room.
+
+**Diet record** (one word per agent, inherited): the share of its organic carbon that came from its gut (moving average), its trophic level (moving average of prey level + 1; a meal of its own kin bucket does not count, or cannibals would climb without end), the share of its meals that were producers on dry land, and how many generations in a row were born to a land animal. A **consumer** is an agent with gut share above one half. A **creature** is what the engine is given to draw as an animal (10.9).
+
+**Senses** (brain inputs 11–14, with `G_SENSE ≥ 128`): the gradient in x and z of the largest gape that fits an individual of the agent's size (danger), and of the number of agents (the crowd, i.e. food).
+
+**Gate G4** (land animals): at least 1000 creatures (10.9) for one sim-year that are fast (`MOTOR > 128`), on dry land, consumers, with more than half of their meals land producers, and at least 5 generations in a row born to such a parent.
+
+**What it does in an evolved world.** Island 1 at sim year 2751 (2.85 M agents, 89% O2), one sim-year after `animals` was switched on: 149 agents live mostly on prey at trophic level 2.6, 106 that go to it and 43 anchored ones that take what drifts past, with about 20 kills and 1,170 bites per day moving 4,500 mol C per day (1% of the plant production). The island has 102 creatures. Most of them still photosynthesise and carry a holdfast gene: plants by descent that have begun to walk and graze. No land animal in the sense of gate G4 yet. The population, the carbon by realm, the atmosphere and the vegetation stay where they were, and the ledgers stay exact. The raw material was there already, drifted in while the genes did nothing: about 160,000 anchored plants carry a motor gene of 1 or 2, and many a mouth. Without the reach rule they ate their anchored neighbours where they stood (10,400 consumers within a year, 10,363 of them anchored plants, 99 creatures); with it, grazing has to be earned by moving, and animals start small.
+
+### 10.2 Sexual reproduction (as 3.6, with slots)
+
+An agent with `G_SEX ≥ 128` offers itself as a mate in one of its cell's 2 mate slots (same key as above). A reproducing parent with `G_SEX ≥ 128` takes the first slot holder that is alive, is not itself and whose `mate_tag` differs from its own in at most 3 bits. The child gets each of the genome's 24 blocks of 16 bytes from one parent or the other by hash bits (a block is 16 body genes, one hidden neuron's input weights, two neurons' recurrent weights, ...), then mutates as usual. Without a compatible mate in the cell the parent reproduces alone: sex is facultative, so switching it on cannot strand a lineage. Species still come only from geography and tag drift.
+
+### 10.3 Counting species (8.3, as built: `bio_stats.c`)
+
+Each epoch, and on `biostat --species`: 4096 genomes sampled by a hash of their uid (the same agents on every device), distance = L1 of body genes 0–41 / 255 + 0.25 × L1 of the expressed brain bytes / 127 + 0.5 when the mate tags differ in more than 3 bits, single linkage at 0.08 × 42. Only the weights of hidden neurons that are switched on in both genomes count: the weights of a neuron that is off drift freely and say nothing about kinship. Output: clusters, clusters of two or more, Shannon H, Simpson, share of the largest (`census.csv`, console). Island 1 at year 2751: 169 clusters in the sample, 85 of them with two or more members, the largest 88%.
+
+### 10.4 Learning by exploration (replaces the rule of 3.4)
+
+**Why the plain rule failed T9.** `dW += η·m·out·hid` strengthens whatever the agent did whenever the reward beat its running average. It cannot tell a good action from a bad one, and over time its updates cancel. On the foraging test it was 4% worse than no learning.
+
+**The rule** (node perturbation). At every think, each plastic output of a learner (`ETA > 0`) is nudged by a random amount of up to ±`explore_q7`/127 (default 40: ±0.31) and keeps that nudge until its next think. At the next think the weights of the row follow `ETA · m · nudge · hid >> 21`, minus the decay, clamped to ±32. A nudge that paid is made more likely in that situation, one that cost less likely. Offspring still start with `dW = 0` (Baldwinian).
+
+**T9 as it now reads** (motile fermenters chasing a food patch that jumps every 2 days; intake per day over days 10–40; `ETA` 64):
+
+| Run | Intake | |
+|---|---|---|
+| learning | 3470 | |
+| no learning (`ETA` forced to 0) | 2757 | learning is +26% |
+| exploring exactly as a learner does, weights frozen | 3184 | learning is +9% |
+| brain zeroed | 1724 | worse than all |
+
+The third row is a control the test did not have before. About 60% of the gain over "no learning" is the exploration itself (a wanderer finds food patches); the rest is learning proper. The test requires learning to beat no learning by more than 10% **and** the frozen-weights control by more than 5%. Over eight seeds learning beat no learning by 23–44% and the control by 7–15%. With random instead of pre-wired weights, learning more than doubles the intake of the control (1962–2125 against 930): chemotaxis learned from scratch within a lifetime. Too high a learning rate hurts (at eight times the best step learning falls behind the control), so `ETA` has an optimum for selection to find.
+
+### 10.5 Light in wavelength bands (render-upgrade-spec 5.2, as built)
+
+- **File.** `gme --export-spectrum life/spectrum.bin` writes GMESPEC1 from the renderer's atmosphere and water model: band irradiance at the surface for 8 haze bins × 24 hours × 9 bands (8 of 45 nm over 380–740 nm, plus 740–900 nm), water transmittance per band at 0–32 m, photons per joule, the share of a band's photons each reaction centre can use, and the pigment shape per hue bin. Integers only; the rigs never call libm.
+- **Per step.** The surface light of each band is the table value at the hour, interpolated between the two haze bins around the island's present haze. The 45% PAR share of the scalar model is gone (the real share on the home planet is 33.6%), and the methane the island makes now colours its light.
+- **Per agent.** Each band is attenuated by the water above the agent (the band's own transmittance table, the band's attenuation below 32 m) or by the grey canopy above it. The pigment absorbs `1 − 10^(−OD)` of a band, `OD = PIG/255 × 4 × ε(hue bin, band)`: a Soret band at 435 nm, a Q band at 383 + 34 × bin nm, and a little background. Absorbed light is counted in photons, and a photon counts only if the pathway's reaction centre can use it: oxygenic photosynthesis gets nothing beyond about 720 nm, anoxygenic uses the near infrared as well.
+- **Energy scale.** The two efficiencies (eu per µmol of usable photons per second) are set when the run is created so that a reference leaf (pigment 200, Q band at 656 nm, at the surface, summed over a day at the present haze) yields exactly what the scalar model gave it. The world keeps its energy scale; what changes is which light a pigment can catch. The values belong to the run, because they are fitted at the island's haze of that moment: on the home planet a new run gets 1.030 (oxygenic) and 0.612 (anoxygenic), island 1 switched over under its clear air of year 2751 gets 1.227 and 0.653.
+- **Leaf area.** With bands the leaf area no longer scales with the pigment gene; the pigment acts through its absorptance, which saturates. Canopy shading stays grey (the leaf area index of 2.5.1), and a plant shades its neighbours with the same whole leaf it harvests with.
+- **Resume.** The CRC of the file's payload is stored in the checkpoint; a resume with another light file is refused. Settle the file (it comes from the engine's atmosphere model) before switching light in bands on in a running island: after that the island is tied to it.
+
+**T13:** the reference leaf gains 10176 eu per day with bands and 10192 with the scalar model (−0.2%); the same leaf with its Q band in the near infrared gains 14% less; the gain of benthic phototrophs at 2–17 m follows the band sum within 1.7%; and of two clones that differ only in pigment colour (Q band at 656 nm and at 485 nm), started in equal numbers on a shelf that is 2 m deep on one side and 12 m on the other, the red one wins in the shallows and the blue-green one at depth (mean Q band 589 nm against 565 nm after 5000 steps, against 570 / 573 nm with scalar light, where the clones are the same organism).
+
+### 10.6 Plant shapes (render-upgrade-spec 5.3, as built)
+
+Five body genes that were neutral until now:
+
+| Gene | Meaning | Gene value 0 |
+|---|---|---|
+| 37 `G_CROWN` | crown class: ellipsoid, cone, umbrella, column, dome (`g·5 >> 8`) | ellipsoid |
+| 38 `G_ASPECT` | height : width, 8 steps: 0.5, 0.75, 1, 1.4, 1.8, 2.2, 2.6, 3 | 1 : 1 |
+| 39 `G_LEAFANG` | leaf angle, 16 classes from erect to flat | the mid angle |
+| 40 `G_POROSITY` | open crown: lets up to half the light through | closed |
+| 41 `G_QWIDTH` | width of the pigment's Q band (with light in bands) | narrow |
+
+**Gene value 0 is the shape the plant had.** These genes sat unused through every evolved world's history, and with the low mutation rates that evolved they are still near 0 (island 1, year 2751: means 11–24 of 255). The aspect and leaf angle genes therefore wrap around their range so that 0 is height : width 1 and the mid leaf angle, and the crowns of an evolved forest keep their form when shapes are switched on (how much light each plant then gets is another matter, see below), with a few percent of odd crowns as raw material (island 1: 91% ellipsoid, 1.3% cone, 2.5% umbrella, 3.8% column, 1.5% dome).
+
+**What a shape does** (with shapes on; a land plant of 0.5 m and more has a crown):
+- **Height.** The same structure builds a taller, narrower or a lower, wider plant: `H = cbrt(S/4000 × aspect²)`. Tall plants overtop their neighbours (the canopy bands of 2.5.1).
+- **Crown.** The crown's top area `A` is a disc of the crown's width (`H/aspect`) times a class factor (ellipsoid 1, cone 0.6, umbrella 1.6, column 0.4, dome 1.2). The world's light is horizontal flux per unit of leaf area, as if every leaf lay flat; that stays the unit. With leaf projection `κ` and crown leaf area index `Lc` = leaf area / `A`, the crown intercepts the light falling on `A × (1 − e^(−κ·Lc))`: `κ ×` its leaf area while it is thin, never more than falls on its top however much leaf it holds. A tall narrow crown is high but small.
+- **Leaf angle.** `κ = G(θ)/cos θ × clumping × gain`, Goudriaan's `G = φ1 + φ2·cos θ` at the hour's sun elevation as an integer table of 16 classes × 24 hours; an open crown (porosity) lowers it by up to half. The gain is a constant of the planet that gives the reference foliage (mid angle, ellipsoid) a light-weighted mean `κ` of 1 over the day. Flat leaves catch more per leaf when the sun is high; erect ones spread the light over more leaf.
+- **Saturation.** With shapes on, the lit leaf of every land plant saturates: `harvest = cap × (1 − e^(−L/cap))`, `cap` = 720 eu per step per m² of lit leaf (200 W/m², about 25 µmol C/m²/s). The lit leaf is the whole leaf of ground cover and of a thin crown, `A/κ` of a full one. Alone in full sun a flat leaf keeps 45% of what the linear rule gave it over a day; where the light is shared or dimmed, little is lost. Erect leaves spread the noon light over more leaf and win in a full crown.
+- **Shade.** A plant shades its neighbours with what it intercepts (a small full crown shades little ground, however much leaf it holds), and under a band of crowns exactly what they intercepted is missing. By night the bands hold the plain leaf area again, which is what the count of vegetated cells and gate G3 are taken from at the end of each day.
+- **Cost.** Structure maintenance times a class factor (cone 0.85, umbrella 1.35, column 0.75, dome 1.1); a wide Q band up to doubles the pigment cost.
+- **Calibration.** In light too weak to saturate a leaf, a thin crown with every shape gene at 0 gains over a day what its leaf area gained before the feature, and so does ground cover.
+
+**What it does to an evolved world.** It is not neutral, and cannot be: until now a plant was a quantity of leaf sharing its cell's light, and plants evolved to carry far more leaf than a crown of their height can light. Island 1, one sim-year after `morph` was switched on: cells dominated by shrubs fall from 23.0% to 11.2%, ground cover rises from 55.1% to 66.8%, trees from 0.10% to 0.15%. Plant production rises by 29% (ground cover gets the light the over-leafed crowns no longer take), land carbon falls by 3%; the population, the atmosphere and the vegetated area do not move. With every feature and the hub the same island stands at 6.7% shrub cells and 0.07% trees after three sim-years: the over-leafed shrubs die back faster than new ones grow. From then on shapes are under selection (wider crowns, more structure per leaf), and whether a forest of the new kind grows back is for the islands to show. Switch `morph` on in a new or rebased world; in a running one expect this re-sorting, try it on one island first and keep a checkpoint.
+
+**T16** checks it through the simulation, one plant and one day: in weak light a thin crown and ground cover gain what they gained without the feature (−5.8% and −2.8%); in full sun both keep about 45% (crown 46%, cover 44%: no step at the 0.5 m where a crown begins); a full crown gains under half as much per unit leaf carbon as a thin one, and no more than its top area would gain as bare leaf; flat leaves beat erect ones in a thin crown and lose in a full one; a squat crown beats a tall narrow one when nothing shades it; an open crown catches less than a closed one.
+
+**Export.** A run with any feature writes **biomap version 2** (`GMEBMAP2`): per cell one more word with the dominant crown class, aspect, leaf angle and porosity bins, the mean pigment and the Q width of the cell's plants of the exported kind; the same per fallback class; and the island's atmosphere in ppm, so the rendered sky can follow the air life has made. A first-release run keeps writing version 1, byte for byte. `biomap_load` reads both.
+
+### 10.7 The island hub (2.5.7 and 6.4, as built)
+
+**Island side** (`bio_hub.c`, with the `hub` feature; once per sim-year, before anything of that step is reported or saved):
+- writes `outbox/atm_<k>_<epoch>.txt` (its box, and its cumulative gas uptake from the atmosphere by all cells and by land cells) and `outbox/mig_<k>_<epoch>.bin`: its emigrants, up to 64 genomes of each guild in each habitat (marine, coastal, land). They are the distinct genomes with the most living biomass, one per species-like cluster first (no genome within the species distance of 10.3 of one already chosen), then the next heaviest. The plan chose by founder lineage; an old world descends from a handful of founders (island 1 at year 2751: three), so that sent nine genomes a year;
+- imports what waits in `inbox/`: migrants into random cells of their habitat (the import ledger keeps the totals exact), and the planet's atmosphere: the box moves a quarter of the way to it (the hub-edit ledger keeps the totals exact);
+- moves what it applied to `imported/e<epoch>_<name>` and notes the last epoch at which it read its inbox (`imported/last_live.txt`). **An island resumed from an older checkpoint applies the same files at the same epochs again**, and nothing at the epochs where nothing was applied, so its history repeats exactly (T17: identical state hash); what arrived in the meantime waits in `inbox/` until the island is past its old history. This folder is the plan's `INPT` log; it keeps the records of the last 1024 epochs (a checkpoint older than that replays without them).
+- Of a backlog in `inbox/` (the island was away) only the newest planet atmosphere and each sender's two newest emigrant files are taken; the rest is dropped.
+- An island never waits. Without a hub it runs closed.
+
+**Hub side** (`gme_genesis life-hub --dir life/hub --islands 0,1,...`; integer arithmetic, plain files):
+- The planet's atmosphere is one column per m², kept at the islands' box scale (`atm_scale`). It starts as the mean of the islands' columns.
+- Each pass takes the newest figures of each island and turns the change since its last report into uptake per m² of ocean and per m² of land, weighted by the planet's ocean cover (10% on the home planet; the islands are coasts with far more sea). The planet is the mean of the islands taking part: every island-year counts for 1/n of a planet-year whenever it is reported, so the column and the clock do not depend on how the reports fall into passes. The column moves by that uptake, then by the same photochemistry as an island box.
+- The islands run at different speeds. The hub's clock is the mean of the years they have reported.
+- **One hub folder serves one planet.** The island files carry their planet; a file of another planet stops the pass, and an island refuses the air of another planet. An island whose epoch has gone backwards was founded anew (`life-rebase`): it is taken in again from where it now stands.
+- Each island's emigrants go to the next island of the ring and to one more, chosen by hash.
+- It prints the planet's air and the **titration**: sim-years until the air's reductants are used up at the present net oxidant supply, or that there is no O2 rise at the present fluxes.
+- `--runs DIR,DIR,...` handles islands whose run folders are on the same machine (the hub carries the files itself). For rigs, `cluster/bio_hub.ps1` makes `life/hub/in` hold what each island's outbox holds before each pass, and copies `life/hub/out/<k>` into the inboxes after it, under another name first so an island never reads half a file.
+
+**T17:** two islands, six epochs: migrants both ways, exact ledgers, the islands' O2 shares pulled together (gap 0.0000 against 0.0298 without the hub), and the replay from an older checkpoint identical. **T17b**, on hand-written island files: the same island-years reported in one pass or in two give the same column and the same clock; an island founded anew is taken in from its new epoch; a file of another planet is refused.
+
+### 10.8 Seed bank, rebase, inoculation (6.6, as built: `bio_bank.c`)
+
+**Guilds here are read from the genes, not from what an agent has eaten:** a `producer` can photosynthesise (pigment, and ANOX or OXY of 32 and more); a `chemotroph` leans to lithotrophy (METH, FEOX or METHOX at least as strong as FERM, SULFRED and AERO); of the other heterotrophs those with a motor are `consumer`, the rest `decomposer`. `land_animal` is `consumer@land`. These are not the consumer (gut share) and the land animal (gate G4) of 10.1: a motile heterotroph that never ate prey is a `consumer` here.
+
+- **`life-seedbank --runs DIR [--out life/seedbank.bin] [--n 2000]`** reads the newest checkpoint of every `island_*` run under DIR (each on its own authority: `env.bin` says which planet it is, no planet file needed) and writes GMESEED1: one record per distinct genome and habitat with its guild, habitat (marine, coastal, land) and living biomass, the best `n` of each guild × habitat. Island 1 at year 2751: 790,392 distinct genome × habitat records, 6 s.
+- **`life-rebase --bank FILE --island K [--n 20000]`** creates a run on the present planet founded from the bank instead of protocells: each founder goes into a cell of its genome's habitat with its reproduction mass, the energy to reproduce once and the nutrients for its body. With fewer founders than banked genomes the founders are spread evenly over the bank, so every guild and habitat gets its part. It writes the first checkpoint and stops; `life --island K --resume` takes it from there. `life --bank FILE` does the same and keeps running. Genomes carry no planet state. A resume with a wrong planet hash is refused as before (T4).
+- **`life-inoculate --from RUN --to RUN --guild G [--n 500]`** copies evolved genomes of one guild (`producer`, `chemotroph`, `decomposer`, `consumer`, `any`, optionally `@marine`, `@coastal`, `@land`; `land_plant`, `land_animal`) from one run's newest checkpoint into the other's, into cells of their habitat. It keeps the replaced checkpoint in `before_inoculate/` and logs `INTERVENTION inoculate` in `stages.log`. It never writes behaviour. Stop the target island first.
+
+**T18:** bank of an evolved test island, file round trip, rebase onto another planet (3000 founders, each in a cell of its habitat, exact ledger), inoculation of land producers only.
+
+### 10.9 Creatures for the engine (7.5, as built)
+
+`bioexport --run DIR` writes `fauna_<K>.bin` beside the biomap part, and `bioexport --merge` writes `home.fauna` beside the biomap (GMEFAUN1, `src/fauna.h`): the creatures, the largest bodies first, at most 65,536.
+
+A **creature** is an agent with a motor that moves at 1 m per hour or more at full effort (`MOTOR ≥ 16`) or lives mostly on prey. A phototroph with a holdfast is a plant whatever its motor gene (evolved forests carry motor genes of 1 or 2 that drifted in) and is drawn as vegetation, unless it does both, walks and lives on prey: then it is a creature and is left out of the vegetation. The same rule counts `creatures` in the statistics and decides who can be a land animal (gate G4).
+
+Per record: world position in 1/16 m, depth below the water plane for swimmers, body size (the diameter of a sphere of the body's volume at 0.12 cm³ per mmol C), palette index (pigment hue bin), trophic level, motor gene, and flags: swims, hunter (trophic level 2.5 and up), armoured, swarm (a body of 64 or more individuals). Positions carry no height: the engine puts a walker on its own ground. `bioexport` also prints who carries a motor gene. Island 1 one sim-year after `animals` was switched on: 160,301 agents carry one; 102 are creatures (the largest 0.94 m), 157,660 are plants with a holdfast, and 2,539 are free but slower than 1 m per hour and do not live on prey.
+
+### 10.10 Tests added
+
+| # | Test | Pass criterion |
+|---|---|---|
+| T2c | CPU ≡ GPU, every feature | plants with crowns, grazers, hunters, sex; 1500 steps; equal hashes; kills, bites and two-parent births all above 0; exact ledger |
+| T3b | conservation with animals | closed box, 4000 steps, C N S Fe exactly constant with kills and bites |
+| T4b | resume with animals and sex | grazers, hunters and sexual plants: 517 steps, a checkpoint, 150 more steps on the running island and on one loaded from the checkpoint give the same state hash (the save is off the 64-step compaction grid, so the running island has holes in its arrays that the loaded one has not) |
+| T9 | learning | as 10.4 |
+| T10 | predator and prey | plankton and hunters, fixed genomes, 200 days: both persist, the cross-correlation of the two biomass series peaks at a positive lag with r > 0.3 (measured: lag +6 days, r 0.99) |
+| T13 | light in bands | as 10.5; CPU ≡ GPU with bands and every feature; resume rules |
+| T14 | features off = first release | recorded hashes reproduced |
+| T15 | sex | two clones with markers in two genome blocks, no mutation: recombinants with compatible tags (7107 of 18,189), none with tags 16 bits apart, none with the feature off |
+| T16 | crown shapes | as 10.6 |
+| T17, T17b | hub | as 10.7 |
+| T18 | seed bank | as 10.8 |
+| T19 | species, creatures, vegetation with shapes | cluster counts of known populations; creature file sorted, inside the island, round trip, no anchored plant in it; a shape word on every vegetated cell |
+
+T6 of the first release (light profile under water) now takes its reference at 2 m: the 1 m cell falls dry at low tide, and a leaf in the air is not under water.
+
+`GME_BIOFEAT=<bits>` replaces the default features of the tests that do not choose their own (for experiments; with 0 the tests of the features report failures by construction). That a build with every feature off is the first release is what T14 checks.
+
+### 10.11 Cost
+
+Per step on the RTX 3060 at 1 M agents (T12, protocells; three runs each; the gate is 150 steps/s): the first release 176 to 180 steps/s, this build 183 to 203 with the features off and 187 to 194 with all of them on. Protocells exercise the features little; the evolved island is the fairer measure.
+On the evolved island 1 (2.85 M agents, 3060): 80 steps/s with the features off, 62 to 76 with one or all of them on (all: 62).
+
+### 10.12 Known limits
+
+- **Kin sharing, spore timing, wind-directed spores and `G_STORE`** are still genes without behaviour.
+- **Canopy shading is grey** with light in bands (the plan's phase 2, a leaf area index per band, is not built).
+- **Predation is local to a 16 m cell** and at most 4 attackers feed per cell and hour. Dense herds interfere with each other; that is the model's only predator self-limitation besides hunger.
+- **The hub's global clock is a mean** of island epochs; islands far apart in sim time exchange fluxes as if they were contemporaries.
+- **Switching features on changes a world's future** and cannot be undone except from an older checkpoint. Keep one (`milestones/`).
+- **Animals start from very little.** In a world of the first release the only raw material is what drifted in while the genes were silent. One sim-year after switching on, island 1 has about 100 creatures and no land animal; whether and how fast grazers spread is for the islands to show (gate G4).
+- **Switching crown shapes on re-sorts an evolved vegetation** within a sim-year (10.6).
+- **Leaf saturation uses the mean light of the leaves that share it**, not the sunlit and shaded leaves separately: a closed stand loses little to saturation.

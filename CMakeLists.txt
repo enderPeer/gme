@@ -41,6 +41,9 @@ set(BIO_CORE_SRC
   src/bio/bio_sim.c
   src/bio/bio_cpu.c
   src/bio/bio_io.c
+  src/bio/bio_bank.c
+  src/bio/bio_hub.c
+  src/bio/bio_stats.c
   src/bio/bio_test.c
 )
 set(COMMON_SRC
@@ -106,6 +109,7 @@ if(GME_BUILD_ENGINE AND CMAKE_CUDA_COMPILER)
     src/atmo.cu
     src/gi.cu
     src/spectral.c
+    src/fauna_scene.c
     ${GME_WINDOW_SRC}
   )
   target_include_directories(gme PRIVATE src)

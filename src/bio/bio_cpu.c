@@ -12,17 +12,22 @@ typedef struct CpuCtx { BioWorld* w; int stage; int arg; int64_t* out; } CpuCtx;
 static void flush_acc(int64_t* dst, const int64_t* acc, int n) {
     for (int k = 0; k < n; ++k) if (acc[k]) BIO_ADD64(&dst[k], acc[k]);
 }
+/* both accumulator blocks of the globals (kernels index them as one: BACC_X) */
+static void flush_globals(BioWorld* w, const int64_t* acc) {
+    flush_acc(w->G->acc, acc, BACC_N);
+    flush_acc(w->G->acc2, acc + BACC_N, BACC2_N);
+}
 
 static void job_stage(void* vctx, uint32_t b, uint32_t e, uint32_t worker) {
     (void)worker;
     CpuCtx* x = (CpuCtx*)vctx;
     BioWorld* w = x->w;
-    int64_t acc[BIO_STAT_N + BACC_N];   /* large enough for either use */
+    int64_t acc[BIO_STAT_N + BACC_TOT];   /* large enough for either use */
     memset(acc, 0, sizeof acc);
     switch (x->stage) {
     case BK_ENV:
         for (uint32_t c = b; c < e; ++c) bio_cell_env(w, (int32_t)c, acc);
-        flush_acc(w->G->acc, acc, BACC_N);
+        flush_globals(w, acc);
         break;
     case BK_SUMMARY: for (uint32_t i = b; i < e; ++i) bio_agent_summary(w, (int32_t)i); break;
     case BK_THINK:   for (uint32_t i = b; i < e; ++i) if (bio_think_due(w, (int32_t)i)) bio_think_run(w, (int32_t)i); break;
@@ -30,7 +35,11 @@ static void job_stage(void* vctx, uint32_t b, uint32_t e, uint32_t worker) {
     case BK_SUPPLY:  for (uint32_t c = b; c < e; ++c) bio_cell_supply(w, (int32_t)c); break;
     case BK_METAB:
         for (uint32_t i = b; i < e; ++i) bio_agent_metab(w, (int32_t)i, acc);
-        flush_acc(w->G->acc, acc, BACC_N);
+        flush_globals(w, acc);
+        break;
+    case BK_FEED:
+        for (uint32_t i = b; i < e; ++i) bio_agent_feed(w, (int32_t)i, acc);
+        flush_globals(w, acc);
         break;
     case BK_BIRTH:   for (uint32_t i = b; i < e; ++i) bio_agent_birth(w, (int32_t)i); break;
     case BK_FREE:    for (uint32_t i = b; i < e; ++i) bio_agent_free(w, (int32_t)i); break;
@@ -96,7 +105,7 @@ void bio_cpu_stage(BioWorld* w, int stage, int arg) {
     case BK_ENV: case BK_SUPPLY:
         jobs_parallel_for((uint32_t)w->n_cells, 0, job_stage, &x);
         break;
-    case BK_SUMMARY: case BK_THINK: case BK_PRE: case BK_METAB: case BK_BIRTH: case BK_FREE:
+    case BK_SUMMARY: case BK_THINK: case BK_PRE: case BK_METAB: case BK_FEED: case BK_BIRTH: case BK_FREE:
         jobs_parallel_for(w->n_slots, 0, job_stage, &x);
         break;
     case BK_THINK_LIST: break;    /* the CPU tests due agents inside BK_THINK */
