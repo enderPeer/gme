@@ -246,6 +246,7 @@ extern "C" GpuWorld* gpu_world_create(uint32_t slots, uint32_t max_batch, uint32
     const size_t bjobs = (size_t)max_batch * sizeof(GmeGenJob);
     const size_t btile = (size_t)max_batch * sizeof(GmeTileJob);
     const size_t tiles = (size_t)tile_count * sizeof(GmeColTile);
+    int prio_least = 0, prio_greatest = 0;   // declared before the first CK: goto fail must not skip it
 
     CK(cudaSetDevice(0));
     // Mapped pinned memory is implicit with UVA (all 64-bit targets); the flag
@@ -261,7 +262,6 @@ extern "C" GpuWorld* gpu_world_create(uint32_t slots, uint32_t max_batch, uint32
     }
     // generation streams get the least priority: the renderer's stream (greatest)
     // then wins the SMs whenever both have work queued (spec 6.1)
-    int prio_least = 0, prio_greatest = 0;
     CK(cudaDeviceGetStreamPriorityRange(&prio_least, &prio_greatest));
     for (int i = 0; i < GPU_BUFFERS; ++i) {
         Buf* b = &g->b[i];

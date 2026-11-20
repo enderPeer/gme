@@ -86,6 +86,12 @@ if(GME_BUILD_ENGINE AND CMAKE_CUDA_COMPILER)
     set(CMAKE_CUDA_ARCHITECTURES native)
   endif()
   enable_language(CUDA)
+  # native window on Windows; headless (render to PNG, no display) elsewhere
+  if(WIN32)
+    set(GME_WINDOW_SRC src/window_win32.c)
+  else()
+    set(GME_WINDOW_SRC src/window_headless.c)
+  endif()
   set(CMAKE_CUDA_STANDARD 17)
   add_executable(gme
     src/main.c
@@ -100,7 +106,7 @@ if(GME_BUILD_ENGINE AND CMAKE_CUDA_COMPILER)
     src/atmo.cu
     src/gi.cu
     src/spectral.c
-    src/window_win32.c
+    ${GME_WINDOW_SRC}
   )
   target_include_directories(gme PRIVATE src)
   target_compile_options(gme PRIVATE $<$<COMPILE_LANGUAGE:C>:${GME_C_FLAGS}>)
@@ -108,7 +114,11 @@ if(GME_BUILD_ENGINE AND CMAKE_CUDA_COMPILER)
     target_compile_options(gme PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/O2>)
   endif()
   target_compile_options(gme PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3 -lineinfo>)
-  set_target_properties(gme PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+  if(WIN32)
+    set_target_properties(gme PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+  else()
+    set_target_properties(gme PROPERTIES CUDA_RUNTIME_LIBRARY Shared)   # pip CUDA runtimes ship libcudart.so only
+  endif()
   if(WIN32)
     target_link_libraries(gme PRIVATE user32 gdi32 winmm)
   else()

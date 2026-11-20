@@ -25,3 +25,6 @@ Thumbs.db
 
 # perf captures written by gme --perf
 /perf_*.csv
+
+# saved simulation milestones (large, local)
+/milestones/

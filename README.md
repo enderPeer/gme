@@ -95,7 +95,11 @@ pwsh cluster/status.ps1 [-Fetch]        # habitability ranking; -Fetch copies th
 pwsh cluster/bio_launch.ps1 -Deploy     # life islands: copy + build in ~/gme/build-bio, check env CRCs, start tmux bio-isl<k>
 pwsh cluster/bio_status.ps1 [-Fetch]    # per island progress; -Fetch exports and merges into life/home.biomap
 pwsh cluster/timeline.ps1               # every 30 min: fetch, screenshots of every island, charts; stops when "playable"
+pwsh cluster/render_remote.ps1 -Run "--frames 600 --screenshot {out}/view.png --perf" -Out status/render/x
+                                        # render tests on rig B: headless Linux build of gme, coolest free GPU
 ```
+
+Render tests run headless on a Linux rig: `gme` builds there without a display (`src/window_headless.c`, frames go to PNG). The CUDA compiler comes from NVIDIA's pip wheels in user space (`pip install --target ~/gme/toolchain "nvidia-cuda-nvcc==13.2.*" "nvidia-nvvm==13.2.*" "nvidia-cuda-crt==13.2.*" "nvidia-cuda-runtime==13.2.*" "nvidia-cuda-cccl==13.2.*"`, plus a `libcudart.so` symlink in its `lib`). Pin every wheel to the same version, or `ptxas` rejects the front end's PTX. The wrapper allows at most two jobs at a time and waits while a GPU is above 78 °C, because that rig's three GPUs sit close together.
 
 ## Layout
 
