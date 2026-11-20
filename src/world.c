@@ -14,6 +14,13 @@
  *   for missing chunks, fills a batch and hands it to the GPU. The view
  *   radius adapts: it grows while storage is left and shrinks under pressure,
  *   so the world always fills exactly the memory budget of this machine.
+ *   Every column the scan passed is present or pending, so when the viewer
+ *   crosses into another column the scan restarts at the edge of the disk
+ *   still covered around the new centre, not at the centre (a full rescan
+ *   through the hash on every chunk crossing used to cost several ms). With
+ *   cfg.stream_batch the batches shrink to that size while only the edge is
+ *   streaming (short, frequent GPU batches and host-mirror copies between the
+ *   viewer's frames); filling a new view still uses max_batch.
  *
  * Column tiles (GPU mode, density.h)
  *   One 3,456 B GmeColTile per chunk column holds the smooth surface T the
@@ -43,6 +50,7 @@
 #define CHUNK_BYTES   ((size_t)GME_CHUNK_VOXELS)
 #define NONE          0xFFFFFFFFu
 #define SCAN_WINDOW   4096u
+#define STREAM_COLS   4096u              /* stream_batch applies while fewer columns than this are left to scan */
 #define KEY_BIAS      (1 << 20)          /* chunk coords valid in [-2^20, 2^20) */
 #define COORD_LIMIT   ((1 << 20) - 2)
 #define UNIFORM_NONE  0xFFu
@@ -98,6 +106,7 @@ struct World {
     uint32_t* missing;
     uint8_t*  evict_mark;
     uint32_t  cursor;
+    uint32_t  batch_now;     /* chunk jobs per batch this update (max_batch, or stream_batch at the edge) */
     int32_t   vcx, vcy, vcz;
     int       have_viewer;
     int32_t   ref_cx, ref_cz;   /* first viewer column: anchor of the ref_hash block */
@@ -614,7 +623,7 @@ static void scan_fn(void* p, uint32_t b, uint32_t e, uint32_t wk) {
 
 static uint32_t build_batch(World* w, Batch* B) {
     const uint32_t ncols = col_count(w, w->radius);
-    const uint32_t max = w->cfg.max_batch;
+    const uint32_t max = w->batch_now ? w->batch_now : w->cfg.max_batch;
     uint32_t n = 0, nt = 0;
     while (n < max && nt < max && w->cursor < ncols) {
         const uint32_t base = w->cursor;
@@ -710,8 +719,22 @@ int world_update(World* w, const WorldPos* viewer) {
     if (vcy >= w->cfg.max_cy) vcy = w->cfg.max_cy - 1;
     if (!w->have_viewer) { w->ref_cx = vcx; w->ref_cz = vcz; }
     if (!w->have_viewer || vcx != w->vcx || vcz != w->vcz) {
+        /* Every column the scan passed (cols[0 .. cursor)) was present or pending: that covers the disk
+         * d2 <= rho^2 around the old centre (rho^2 = cols[cursor].d2 - 1, the d2 values being integers, or
+         * radius^2 once the scan is complete). After a move by delta chunks, every column within rho - delta of
+         * the new centre lies in that disk, eviction (beyond radius + 1 of the new centre) never touches it, and a
+         * tile job of it publishes on completion: the scan restarts at that disk's edge. */
+        uint32_t restart = 0;
+        if (w->have_viewer) {
+            const uint32_t nc = col_count(w, w->radius);
+            const uint32_t cur = w->cursor < nc ? w->cursor : nc;
+            const double rho2 = cur < nc ? (double)w->cols[cur].d2 - 1.0 : (double)w->radius * (double)w->radius;
+            const double dx = (double)vcx - (double)w->vcx, dz = (double)vcz - (double)w->vcz;
+            const double rs = (rho2 > 0.0 ? sqrt(rho2) : 0.0) - sqrt(dx * dx + dz * dz);
+            if (rs >= 1.0) restart = col_count(w, (int32_t)floor(rs));
+        }
         w->vcx = vcx; w->vcz = vcz;
-        w->cursor = 0;
+        w->cursor = restart;
         w->evict_needed = 1;
     }
     if (w->tile_deferred) {   /* a tile job waited for a busy cell: rescan for it */
@@ -737,8 +760,11 @@ int world_update(World* w, const WorldPos* viewer) {
     /* 4. widen the view if memory allows */
     try_grow(w);
 
-    /* 5. feed idle batch buffers */
+    /* 5. feed idle batch buffers: stream_batch while only the edge is left to scan */
     w->pressure = 0;
+    w->batch_now = w->cfg.max_batch;
+    if (w->cfg.stream_batch > 0 && w->cfg.stream_batch < w->cfg.max_batch && w->cursor + STREAM_COLS >= col_count(w, w->radius))
+        w->batch_now = w->cfg.stream_batch;
     for (int b = 0; b < w->nbuf; ++b) {
         Batch* B = &w->batch[b];
         if (B->inflight) continue;

@@ -132,11 +132,13 @@ k_commit(const GmeGenJob* __restrict__ jobs, const GmeChunkMeta* __restrict__ me
     }
 }
 
-// One block per tile job: the 36 x 36 columns (h, dev) in parallel, then the
-// same steps as gme_col_tile_finish (density.h) split over the threads: h range
-// by warp shuffles, packing by every thread, the 16 blocks (slot + bounds) by 16
-// threads and the 81 lod4 lattice points (M3) by 81 others, the header and the
-// lod bounds by one. All integer, so the bytes equal the CPU's
+// One block per tile job: the smoothing region's columns (h, t: the 36 x 36
+// columns plus a halo of GME_SMOOTH_HALO) in parallel, the band's corrections
+// smoothed (gme_corr_step, one pass per iteration), the 36 x 36 (h, dev); then
+// the same steps as gme_col_tile_finish (density.h) split over the threads: h
+// range by warp shuffles, packing by every thread, the 16 blocks (slot +
+// bounds) by 16 threads and the 81 lod4 lattice points (M3) by 81 others, the
+// header and the lod bounds by one. All integer, so the bytes equal the CPU's
 // gme_col_tile_build. direct != 0 writes tile k to out[k] instead of out[index].
 __global__ void __launch_bounds__(TILE_THREADS)
 k_col_tiles(const GmeTileJob* __restrict__ jobs, GmeColTile* __restrict__ out, int direct, uint32_t seed,
@@ -144,20 +146,37 @@ k_col_tiles(const GmeTileJob* __restrict__ jobs, GmeColTile* __restrict__ out, i
     __shared__ int32_t s_h[GME_TILE_COLS];
     __shared__ int32_t s_dev[GME_TILE_COLS];
     __shared__ __align__(16) GmeColTile s_t;
+    __shared__ int32_t s_rh[GME_TILE_RN * GME_TILE_RN], s_rt[GME_TILE_RN * GME_TILE_RN];
+    __shared__ int32_t s_c[2][GME_TILE_RN * GME_TILE_RN];
     __shared__ int32_t s_mn[TILE_THREADS / 32], s_mx[TILE_THREADS / 32];
     __shared__ uint32_t s_fl[16];
     __shared__ int s_sat;
     const GmeTileJob j = jobs[blockIdx.x];
     const int32_t x0 = j.cx * GME_CHUNK_DIM - GME_TILE_APRON, z0 = j.cz * GME_CHUNK_DIM - GME_TILE_APRON;
+    const int RN = GME_TILE_RN, H = GME_SMOOTH_HALO;
 
     uint32_t* tw = (uint32_t*)&s_t;                      // gme_col_tile_init, in parallel
     for (uint32_t i = threadIdx.x; i < sizeof(GmeColTile) / 4; i += TILE_THREADS) tw[i] = 0u;
+    for (int i = threadIdx.x; i < RN * RN; i += TILE_THREADS) {
+        int32_t h, t;
+        gme_surface_pair(x0 - H + i % RN, z0 - H + i / RN, seed, &planet, &h, &t);
+        s_rh[i] = h;
+        s_rt[i] = t;
+        s_c[0][i] = gme_t_band_q8(t, h, &planet) - t;
+    }
+    __syncthreads();
+    for (int it = 0; it < GME_SMOOTH_ITERS; ++it) {      // the band's corrections, smoothed (density.h)
+        for (int i = threadIdx.x; i < RN * RN; i += TILE_THREADS)
+            s_c[(it + 1) & 1][i] = gme_corr_step(s_rh, s_rt, s_c[it & 1], RN, i % RN, i / RN, &planet);
+        __syncthreads();
+    }
+    const int32_t* cf = s_c[GME_SMOOTH_ITERS & 1];
     int32_t mn = 0x7FFFFFFF, mx = -0x7FFFFFFF - 1;
     for (int i = threadIdx.x; i < GME_TILE_COLS; i += TILE_THREADS) {
-        int32_t h, dev;
-        gme_col_tile_build_column(x0 + i % GME_TILE_N, z0 + i / GME_TILE_N, seed, &planet, &h, &dev);
+        const int k = (i / GME_TILE_N + H) * RN + i % GME_TILE_N + H;
+        const int32_t h = s_rh[k];
         s_h[i] = h;
-        s_dev[i] = dev;
+        s_dev[i] = gme_tile_dev_q7(s_rt[k] + cf[k], h, &planet);
         mn = min(mn, h);
         mx = max(mx, h);
     }

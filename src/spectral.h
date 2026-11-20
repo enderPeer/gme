@@ -212,6 +212,10 @@ int  spectral_build_atmo(const HomePlanet* hp, double p_bar, SpectralAtmo* a);
 int  spectral_build_atmo_ex(const HomePlanet* hp, const SpectralOpts* o, SpectralAtmo* a);
 void spectral_print(const SpectralAtmo* a);
 void spectral_free(SpectralAtmo* a);       /* the host-side tables (not the struct) */
+/* spectral_build_atmo_ex through a disk cache ($GME_CACHE, else the temp directory; GME_CACHE=0 disables it):
+ * the bytes of an earlier build by this binary (the key holds its build stamp, the planet hash, the options and
+ * the CH4 table). *cached = 1 when loaded from the cache. 0 ok. */
+int  spectral_build_atmo_cached(const HomePlanet* hp, const SpectralOpts* o, uint64_t planet_hash, SpectralAtmo* a, int* cached);
 /* D3 physics self-test; gpu_sky: GPU sky-view radiance read back by the
  * renderer for the same sun/camera (NULL = skip that comparison). Returns the
  * number of failed checks. */

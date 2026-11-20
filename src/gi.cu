@@ -602,7 +602,7 @@ __global__ void __launch_bounds__(128) k_taa(const GiFrame f) {
     const int ci = min(max((int)floorf(sx), 0), w - 1), cj = min(max((int)floorf(sy), 0), h - 1);
     const size_t oidx = (size_t)Y * f.ow + X;
     const float4 c0 = f.color[(size_t)cj * w + ci];
-    if (c0.w < 0.f) { f.taa[oidx] = make_float4(c0.x, c0.y, c0.z, -1.f); return; }   // a debug view's display value
+    if (c0.w < 0.f) { taa_st(f.taa, oidx, make_float4(c0.x, c0.y, c0.z, -1.f)); return; }   // a debug view's display value
     const float k = __ldg(f.k);
     // current samples: neighbourhood statistics (YCoCg, exposed) and the reconstruction
     float3 m1 = make_float3(0.f, 0.f, 0.f), m2 = make_float3(0.f, 0.f, 0.f), cur = make_float3(0.f, 0.f, 0.f);
@@ -669,14 +669,14 @@ __global__ void __launch_bounds__(128) k_taa(const GiFrame f) {
                 for (int b = 0; b < 4; ++b)
                     for (int a = 0; a < 4; ++a) {
                         const int x = min(max(hi - 1 + a, 0), f.ow - 1), y = min(max(hj - 1 + b, 0), f.oh - 1);
-                        const float4 hv = f.taa_prev[(size_t)y * f.ow + x];
+                        const float4 hv = taa_ld(f.taa_prev, (size_t)y * f.ow + x);
                         if (hv.w < 0.f) continue;
                         const float wt = wx[a] * wy[b];
                         s.x += wt * hv.x; s.y += wt * hv.y; s.z += wt * hv.z;
                         ws += wt;
                     }
                 const int ni = min(max((int)floorf(hx + 0.5f), 0), f.ow - 1), nj = min(max((int)floorf(hy + 0.5f), 0), f.oh - 1);
-                const float4 hn = f.taa_prev[(size_t)nj * f.ow + ni];
+                const float4 hn = taa_ld(f.taa_prev, (size_t)nj * f.ow + ni);
                 if (ws > 0.2f && hn.w > 0.f) {
                     const float kh = __ldg(f.k_prev);
                     const float ek = kh > 0.f ? k / kh : 1.f;              // the history's exposure -> this frame's
@@ -721,7 +721,7 @@ __global__ void __launch_bounds__(128) k_taa(const GiFrame f) {
         o = make_float3(0.f, 0.f, 0.f);
         age = 1.f;
     }
-    f.taa[oidx] = make_float4(o.x, o.y, o.z, age);
+    taa_st(f.taa, oidx, make_float4(o.x, o.y, o.z, age));
 }
 
 // reference transport: the mean of the frames since the last reset (internal res == output res)
@@ -731,14 +731,14 @@ __global__ void __launch_bounds__(128) k_accum(const GiFrame f) {
     const int ci = min(x * f.cur.w / f.ow, f.cur.w - 1), cj = min(y * f.cur.h / f.oh, f.cur.h - 1);
     const size_t idx = (size_t)y * f.ow + x;
     const float4 c = f.color[(size_t)cj * f.cur.w + ci];
-    if (c.w < 0.f) { f.taa[idx] = make_float4(c.x, c.y, c.z, -1.f); return; }
+    if (c.w < 0.f) { taa_st(f.taa, idx, make_float4(c.x, c.y, c.z, -1.f)); return; }
     float3 v = make_float3(c.x, c.y, c.z);
     if (!(fabsf(v.x) + fabsf(v.y) + fabsf(v.z) < 1e30f)) { if (f.nan) atomicAdd(f.nan, 1u); v = make_float3(0.f, 0.f, 0.f); }
     float4 a = f.acc_n > 1 ? f.acc[idx] : make_float4(0.f, 0.f, 0.f, 0.f);
     a.x += v.x; a.y += v.y; a.z += v.z;
     f.acc[idx] = a;
     const float k = __ldg(f.k) / (float)f.acc_n;
-    f.taa[idx] = make_float4(a.x * k, a.y * k, a.z * k, (float)min(f.acc_n, 255u));
+    taa_st(f.taa, idx, make_float4(a.x * k, a.y * k, a.z * k, (float)min(f.acc_n, 255u)));
 }
 
 // ---- disocclusion check (renderer_disocc) ----------------------------------------------
@@ -747,7 +747,7 @@ __global__ void __launch_bounds__(128) k_accum(const GiFrame f) {
 // 45 deg, same class); such a pixel must have reset every history
 enum { DC_PIX, DC_DIS, DC_TAA_OLD, DC_VIS_OLD, DC_GI_PIX, DC_GI_DIS, DC_GI_OLD, DC_TAA_MAX, DC_GI_MAX, DC_N };
 static_assert(DC_N == GI_DISOCC_N, "render.h GI_DISOCC_N");
-__global__ void __launch_bounds__(128) k_disocc(const GiFrame f, const float4* __restrict__ taa, const unsigned char* __restrict__ vage,
+__global__ void __launch_bounds__(128) k_disocc(const GiFrame f, const TaaPx* __restrict__ taa, const unsigned char* __restrict__ vage,
                                                 unsigned long long* acc) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= f.cur.w || y >= f.cur.h) return;
@@ -770,7 +770,7 @@ __global__ void __launch_bounds__(128) k_disocc(const GiFrame f, const float4* _
     if (seen) return;
     atomicAdd(acc + DC_DIS, 1ull);
     const int ox = min(x * f.ow / f.cur.w, f.ow - 1), oy = min(y * f.oh / f.cur.h, f.oh - 1);
-    const float age = taa[(size_t)oy * f.ow + ox].w;
+    const float age = taa_ld(taa, (size_t)oy * f.ow + ox).w;
     if (age > 2.f) atomicAdd(acc + DC_TAA_OLD, 1ull);
     atomicMax(acc + DC_TAA_MAX, (unsigned long long)fmaxf(age, 0.f));
     if (vage && vage[idx] > 2) atomicAdd(acc + DC_VIS_OLD, 1ull);
@@ -885,7 +885,7 @@ int gi_resolve(const GiFrame& f, cudaStream_t s) {
     return gck(cudaGetLastError(), f.acc ? "accumulation" : "taa");
 }
 
-int gi_disocc(const GiFrame& f, const float4* taa_cur, const unsigned char* v_age, const float4* m_hist_cur, unsigned long long* acc,
+int gi_disocc(const GiFrame& f, const TaaPx* taa_cur, const unsigned char* v_age, const float4* m_hist_cur, unsigned long long* acc,
               cudaStream_t s) {
     const dim3 b(16, 8);
     cudaMemsetAsync(acc, 0, sizeof(unsigned long long) * DC_N, s);

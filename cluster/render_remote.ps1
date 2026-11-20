@@ -11,17 +11,23 @@
 #   -Root/-Name build another source tree in its own rig workspace, e.g. a reference build of
 #   the last commit: git worktree add ..\gme-ref HEAD; then -Root ..\gme-ref -Name gme-render-ref
 #
-# Thermal guard (the rig's three GPUs are stacked): at most -MaxJobs jobs at once, each on
-# the coolest free GPU at or below -MaxTemp degrees C; a job waits (up to 30 min) otherwise.
-# The peak temperature of every job is reported. Needs the user-space CUDA toolchain in
+# Thermal guard (the rig's three GPUs are stacked): at most -MaxJobs jobs at once, each on the
+# coolest free GPU of -Gpus (default 0,1: GPU 2 reached 87 C and throttled within 30 s under
+# load, so it runs only when pinned with -Gpu 2) at or below -MaxTemp C; a job waits (up to
+# 30 min) otherwise. While a job runs its GPU is sampled every 2 s: the job is stopped at
+# -KillTemp C (exit 76), and thermal throttling is reported. -Exclusive holds every job slot
+# for the whole job (no other job runs), for timing measurements. Needs the user-space CUDA toolchain in
 # ~/gme/toolchain on the rig (pip wheels nvidia-cuda-nvcc/nvvm/crt/runtime/cccl 13.2).
 param(
     [switch]$Sync,
     [string]$Run = '',
     [string]$Out = '',
     [int]$Gpu = -1,
+    [int[]]$Gpus = @(0, 1),
     [int]$MaxTemp = 78,
+    [int]$KillTemp = 83,
     [int]$MaxJobs = 2,
+    [switch]$Exclusive,
     [string]$Root = '',
     [string]$Name = 'gme-render'
 )
@@ -75,47 +81,70 @@ rm -rf $stage
 if (-not $Run) { exit 0 }
 if (-not $Out) { throw '-Out <local folder> is required with -Run' }
 
-# ---- run on the coolest free GPU, under the job-slot and per-GPU locks ----
+# ---- run on the coolest allowed, free GPU under the job-slot and per-GPU locks ----
 $job = "$(Get-Date -Format 'yyyyMMdd-HHmmss')-$([guid]::NewGuid().ToString('N').Substring(0, 6))"
 $args2 = $Run.Replace('{out}', "out/$job")
 if ($args2.Contains("'")) { throw 'gme arguments must not contain single quotes' }
-$runScript = @"
+$allowed = if ($Gpu -ge 0) { @($Gpu) } else { $Gpus }
+$runScript = @'
 set -u
-cd ~/$Name
-mkdir -p out/$job
-export LD_LIBRARY_PATH=~/gme/toolchain/nvidia/cu13/lib:`${LD_LIBRARY_PATH:-}
-start=`$(date +%s)
-while true; do
-  for s in `$(seq 0 $($MaxJobs - 1)); do
-    exec 8>/tmp/gme-render.slot`$s.lock
-    if flock -n 8; then
-      for g in `$(nvidia-smi --query-gpu=index,temperature.gpu --format=csv,noheader,nounits | sort -t, -k2 -n | awk -F', *' -v m=$MaxTemp '`$2+0 <= m {print `$1}'); do
-        if [ $Gpu -ge 0 ] && [ "`$g" -ne $Gpu ]; then continue; fi
-        exec 9>/tmp/gme-render.gpu`$g.lock
-        if flock -n 9; then
-          echo "render: job $job on rig B GPU `$g (`$(nvidia-smi -i `$g --query-gpu=temperature.gpu --format=csv,noheader) C at start)"
-          ( while sleep 2; do nvidia-smi -i `$g --query-gpu=temperature.gpu --format=csv,noheader,nounits; done ) > out/$job/.temps 2>/dev/null &
-          tp=`$!
-          CUDA_VISIBLE_DEVICES=`$g ./build/gme $args2 > out/$job/gme.log 2>&1
-          rc=`$?
-          kill `$tp 2>/dev/null; wait `$tp 2>/dev/null
-          peak=`$(sort -n out/$job/.temps 2>/dev/null | tail -n 1)
-          rm -f out/$job/.temps
-          echo "render: exit `$rc, peak GPU temperature `${peak:-?} C"
-          exit `$rc
-        fi
-        exec 9>&-
-      done
-      exec 8>&-
-    fi
+cd ~/__NAME__
+mkdir -p out/__JOB__
+export LD_LIBRARY_PATH=~/gme/toolchain/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}
+allowed=" __ALLOWED__ "
+start=$(date +%s)
+if [ __EXCL__ -eq 1 ]; then
+  for s in $(seq 0 $((__MAXJOBS__ - 1))); do
+    eval "exec $((20 + s))>/tmp/gme-render.slot$s.lock"
+    flock -w 1800 $((20 + s)) || { echo "render: could not get exclusive use of the rig in 30 min"; exit 75; }
   done
-  if [ `$(( `$(date +%s) - start )) -gt 1800 ]; then echo "render: no free GPU at or below $MaxTemp C for 30 min"; exit 75; fi
+  echo "render: exclusive (all __MAXJOBS__ job slots held)"
+fi
+while true; do
+  got=0
+  if [ __EXCL__ -eq 1 ]; then got=1; else
+    for s in $(seq 0 $((__MAXJOBS__ - 1))); do
+      exec 8>/tmp/gme-render.slot$s.lock
+      if flock -n 8; then got=1; break; fi
+      exec 8>&-
+    done
+  fi
+  if [ $got -eq 1 ]; then
+    for g in $(nvidia-smi --query-gpu=index,temperature.gpu --format=csv,noheader,nounits | sort -t, -k2 -n | awk -F', *' -v m=__MAXTEMP__ '$2+0 <= m {print $1}'); do
+      case "$allowed" in *" $g "*) ;; *) continue ;; esac
+      exec 9>/tmp/gme-render.gpu$g.lock
+      if flock -n 9; then
+        echo "render: job __JOB__ on rig B GPU $g ($(nvidia-smi -i $g --query-gpu=temperature.gpu --format=csv,noheader) C at start)"
+        CUDA_VISIBLE_DEVICES=$g ./build/gme __ARGS__ > out/__JOB__/gme.log 2>&1 &
+        gp=$!
+        peak=0; throttled=0; stopped=0
+        while kill -0 $gp 2>/dev/null; do
+          line=$(nvidia-smi -i $g --query-gpu=temperature.gpu,clocks_throttle_reasons.active --format=csv,noheader,nounits 2>/dev/null)
+          t=$(echo "$line" | cut -d, -f1 | tr -d ' '); r=$(echo "$line" | cut -d, -f2 | tr -d ' ')
+          case "$t" in ''|*[!0-9]*) t=0 ;; esac
+          [ "$t" -gt "$peak" ] && peak=$t
+          if [ -n "$r" ] && [ $(( r & 0x68 )) -ne 0 ]; then throttled=1; fi   # HW slowdown, SW or HW thermal
+          if [ "$t" -ge __KILLTEMP__ ]; then kill $gp 2>/dev/null; stopped=1; echo "render: STOPPED at $t C (limit __KILLTEMP__ C)"; break; fi
+          sleep 2
+        done
+        wait $gp; rc=$?
+        [ $stopped -eq 1 ] && rc=76
+        note=""; [ $throttled -eq 1 ] && note=", thermal throttling seen"
+        echo "render: exit $rc, peak GPU temperature $peak C$note"
+        exit $rc
+      fi
+      exec 9>&-
+    done
+    [ __EXCL__ -eq 1 ] || exec 8>&-
+  fi
+  if [ $(( $(date +%s) - start )) -gt 1800 ]; then echo "render: no allowed GPU (__ALLOWED__) free at or below __MAXTEMP__ C for 30 min"; exit 75; fi
   sleep 5
 done
-"@
+'@
+$runScript = $runScript.Replace('__NAME__', $Name).Replace('__JOB__', $job).Replace('__ARGS__', $args2).Replace('__ALLOWED__', ($allowed -join ' ')).Replace('__EXCL__', $(if ($Exclusive) { '1' } else { '0' })).Replace('__MAXJOBS__', "$MaxJobs").Replace('__MAXTEMP__', "$MaxTemp").Replace('__KILLTEMP__', "$KillTemp")
 Invoke-Rig $runScript
 $rc = $LASTEXITCODE
 New-Item -ItemType Directory -Force $OutAbs | Out-Null
 scp -q -r "${dst}:$Name/out/$job/*" "$OutAbs/"
-Write-Host "render: outputs of job $job copied to $Out (gme.log has gme's console output)"
+Write-Host "render: outputs of job $job copied to $Out (gme.log has the gme console output)"
 exit $rc

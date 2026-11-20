@@ -17,7 +17,11 @@ The heavy stages run headless on a small GPU cluster over SSH. The rigs need onl
 |---|---|
 | ![render](docs/images/m1_before_after.png) | ![vegetation](docs/images/vegetation_test_pattern.png) |
 
-**Status:** research prototype, Windows-first. Star system formation, chemistry and the integer life simulation work end to end, and life is evolving on cluster GPUs. The renderer is being upgraded to smooth density surfaces and spectral light transport (milestones M1–M5 in [docs/render-upgrade-spec.md](docs/render-upgrade-spec.md)): **M1 smooth terrain is done** (`--quality classic` keeps the old renderer); M2–M5 are in progress. Animals (predation), creature rendering and a walkable player are not built yet.
+| Evolved vegetation after ~3,000 simulated years (new renderer) | Sunset through the methane haze |
+|---|---|
+| ![evolved](docs/images/evolved_world.jpg) | ![sunset](docs/images/sunset.jpg) |
+
+**Status:** research prototype, Windows-first (headless Linux build for render nodes). Star system formation, chemistry and the integer life simulation work end to end. On the current planet, life has run for 3,000+ simulated years on two cluster GPUs: oxygenic photosynthesis took over, an oxidation event followed, and 70–78% of the islands are vegetated. The renderer upgrade (smooth density surfaces, 8-band spectral light, far field to 32 km, bounced light, pigment colours; [docs/render-upgrade-spec.md](docs/render-upgrade-spec.md)) is built, reviewed and fixed; `--quality classic|low|medium|high|ref` picks the renderer (classic = the original voxel ray tracer). Animals (predation), creature rendering and a walkable player are not built yet.
 
 ## Requirements
 
@@ -35,7 +39,7 @@ From PowerShell (the `.\` prefix is required there):
 .\build\gme.exe --bench --cpu           # CPU-only generation path
 ```
 
-3D view controls: hold the **right mouse button** to look around, **WASD** to move, **Space** / **C** to go up / down, **Shift** for 8× speed, **mouse wheel** to change base speed, **F** to toggle shadows, **P** to save a screenshot, **Esc** to quit.
+3D view controls: hold the **right mouse button** to look around, **WASD** to move, **Space** / **C** to go up / down, **Shift** for 8× speed, **mouse wheel** to change base speed, **F** to toggle shadows, **V** to switch classic / new renderer, **K** to cycle the quality preset, **P** to save a screenshot, **Esc** to quit.
 
 View options: `--width`, `--height`, `--scale 0.5` (render at a lower resolution), `--fps N` (0 means uncapped), `--spawn X Z [EYE]`, `--look YAW PITCH`, `--region K` (start at the coast of life island K), `--frames N --screenshot file.png` (render N frames, save, exit).
 

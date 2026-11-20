@@ -115,12 +115,17 @@ typedef struct RenderCamera {
     int      gi_off;           /* 1: no indirect light rays (sky SH x heightfield AO, as Low) */
     int      ref;              /* 1: reference transport (--accum; the Ref preset always): full-res 4-bounce paths, no
                                 * denoising, binary sun visibility, frames averaged while the camera stands still */
-    float    anim;             /* animation time of waves and kelp, seconds (main.c: frame / 60; --still holds it) */
+    float    anim;             /* animation time of waves and kelp, seconds (main.c: real time in the interactive
+                                * viewer, frame / 60 for --frames and the test modes; --still holds it) */
     int      reset;            /* 1: drop every temporal history (TAA, GI, V, accumulation) this frame */
     int      furnace;          /* D4 only (renderer_d4_furnace) */
 } RenderCamera;
 
-typedef struct RendererConfig { int max_w, max_h, quality; } RendererConfig;
+/* max_w x max_h: the largest output frame; quality: the starting preset (RQ_CLASSIC allocates nothing before
+ * world_create: a classic session sizes its pool as before the upgrade, and the first smooth frame allocates
+ * what it needs); scale: the starting --scale of the smooth path (0 = 1), whose internal buffers are sized
+ * from it (they grow when Ref or a larger scale is selected) */
+typedef struct RendererConfig { int max_w, max_h, quality; float scale; } RendererConfig;
 
 /* --metrics: counters of one frame (renderer_metrics). The new path is
  * traced with the frame's camera next to the classic voxel DDA. */
@@ -199,8 +204,9 @@ typedef struct RenderProbe {
 
 typedef struct Renderer Renderer;
 
-/* Allocates the fixed buffers for frames up to max_w x max_h now, so call it
- * before world_create (the pool is then sized from the VRAM really left). */
+/* Allocates the fixed buffers of the starting preset for frames up to max_w x
+ * max_h now (none for a classic start), so call it before world_create (the
+ * pool is then sized from the VRAM really left). */
 Renderer* renderer_create(const RendererConfig* cfg);
 void      renderer_destroy(Renderer* r);
 /* Spectral light of the planet (spectral_build_atmo): uploads the LUTs and
@@ -208,17 +214,20 @@ void      renderer_destroy(Renderer* r);
 int       renderer_set_atmo(Renderer* r, const SpectralAtmo* a);
 /* Queues a w x h BGRA frame and returns (*pixels, host memory valid until the
  * next call) the frame queued by the call before it, which the GPU finished
- * while this one was queued (M4 asynchronous readback, 2 pinned frames). The
- * first frame, and a frame whose size differs from the one before, are waited
- * for and returned themselves. renderer_finish waits for the last one. */
+ * while this one was queued (M4 asynchronous readback, 2 frames in flight:
+ * each frame's kernels write its own device frame, a copy stream reads it back
+ * while the next frame's kernels run). The first frame, a frame whose size
+ * differs from the one before, and every frame in sync mode are waited for and
+ * returned themselves. renderer_finish waits for the last one. */
 int       renderer_draw(Renderer* r, const RenderScene* s, const RenderCamera* c,
                         int w, int h, const uint32_t** pixels);
 /* M4: waits for the frame queued by the last renderer_draw and returns it
  * (screenshots, the end of a run). 0 ok. */
 int       renderer_finish(Renderer* r, const uint32_t** pixels);
-/* M4: the GPU event recorded after the last queued frame (a cudaEvent_t). The
- * world's generation streams wait for it before they write chunk slots or tile
- * records, which the frame may still be reading (world_set_render_fence). */
+/* M4: the GPU event recorded after the last queued frame's kernels (a
+ * cudaEvent_t). The world's generation streams wait for it before they write
+ * chunk slots or tile records, which the frame may still be reading
+ * (world_set_render_fence). */
 void*     renderer_fence(const Renderer* r);
 /* M4: drops every temporal history (TAA, GI, sun visibility, radiance cache, accumulation) */
 void      renderer_reset_history(Renderer* r);
@@ -235,8 +244,9 @@ float     renderer_gpu_ms(const Renderer* r);
 float     renderer_ev100(const Renderer* r);
 /* --metrics of the last frame drawn (runs both tracers once more). 0 ok. */
 int       renderer_metrics(Renderer* r, RenderMetrics* out);
-/* --perf statistics; per-frame samples are kept from renderer_create on.
- * renderer_perf_reset drops them (e.g. after --settle). */
+/* --perf statistics over the per-frame samples kept since renderer_create (a
+ * ring of the last 65,536 frames). renderer_perf_reset drops them (e.g. after
+ * --settle). */
 void      renderer_perf(const Renderer* r, RenderPerf* out);
 void      renderer_perf_reset(Renderer* r);
 /* last frame's per-stage GPU ms (RENDER_PERF_STAGES values) */
@@ -324,6 +334,26 @@ __device__ __forceinline__ void gg_oct_unpack(uint32_t v, float n[3]) {
     }
     const float il = rsqrtf(x * x + y * y + z * z);
     n[0] = x * il; n[1] = y * il; n[2] = z * il;
+}
+
+/* TAA history pixel (spec 6.3: RGBA16F): exposed linear sRGB + the history age in
+ * frames (w < 0: a debug view's display value). Values above fp16's range are
+ * clamped (AgX saturates at 2^4.03 anyway). */
+typedef uint2 TaaPx;
+__device__ __forceinline__ float4 taa_ld(const TaaPx* p, size_t i) {
+    const uint2 v = p[i];
+    const float2 a = __half22float2(*reinterpret_cast<const __half2*>(&v.x));
+    const float2 b = __half22float2(*reinterpret_cast<const __half2*>(&v.y));
+    return make_float4(a.x, a.y, b.x, b.y);
+}
+__device__ __forceinline__ void taa_st(TaaPx* p, size_t i, float4 c) {
+    const float m = 65504.f;
+    const __half2 a = __floats2half2_rn(fminf(fmaxf(c.x, -m), m), fminf(fmaxf(c.y, -m), m));
+    const __half2 b = __floats2half2_rn(fminf(fmaxf(c.z, -m), m), fminf(fmaxf(c.w, -m), m));
+    uint2 v;
+    v.x = *reinterpret_cast<const uint32_t*>(&a);
+    v.y = *reinterpret_cast<const uint32_t*>(&b);
+    p[i] = v;
 }
 
 /* The camera of one frame, for reprojection: position relative to its chunk,
@@ -434,7 +464,7 @@ struct GiFrame {
     unsigned char* v_age; const unsigned char* v_age_prev;
     /* TAA (internal colour -> output-res history) */
     const float4* color;               /* linear sRGB, unexposed; w < 0: a debug view's display value */
-    float4* taa; const float4* taa_prev;   /* exposed linear sRGB, w = history age (frames); -1: display value */
+    TaaPx* taa; const TaaPx* taa_prev; /* exposed linear sRGB, w = history age (frames); -1: display value (RGBA16F) */
     const float* k;                    /* device: this frame's exposure multiplier (FrameState.k) */
     const float* k_prev;               /* device: the exposure the history was resolved with (0 = unknown) */
     float ah_still, gamma_still;       /* history weight / clip width of a still pixel with a history >= 16 frames */
@@ -462,7 +492,7 @@ int     gi_denoise(GiPipe* g, const GiFrame& f, cudaStream_t s);    /* temporal,
 int     gi_vis_filter(const GiFrame& f, cudaStream_t s);             /* sun visibility: temporal + 3x3 a-trous */
 int     gi_refl_filter(const GiFrame& f, cudaStream_t s);            /* traced reflections: temporal (alpha 0.2), clamped */
 int     gi_resolve(const GiFrame& f, cudaStream_t s);                /* TAA / TAAU, or the reference accumulation (f.acc) */
-int     gi_disocc(const GiFrame& f, const float4* taa_cur, const unsigned char* v_age, const float4* m_hist_cur,
+int     gi_disocc(const GiFrame& f, const TaaPx* taa_cur, const unsigned char* v_age, const float4* m_hist_cur,
                   unsigned long long* acc, cudaStream_t s);          /* renderer_disocc's counters */
 #endif
 #endif

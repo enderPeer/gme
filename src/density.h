@@ -10,8 +10,11 @@
  *
  *   T(x, z)  the generator's own height expression without its intermediate
  *            floors, mean-shifted to h + 1, plus +-0.25 m micro relief, then
- *            clamped into [h, h + 2) and coast-locked: a column is drawn wet
+ *            kept in [h, h + 2) and coast-locked: a column is drawn wet
  *            (T < sea_level + 1) iff its voxel column is wet (h < sea_level).
+ *            The band's corrections are smoothed over the neighbouring columns
+ *            (gme_corr_step), so the surface does not follow the voxel
+ *            staircase where the band binds.
  *   storage  2 B per column: h - h_base (uint8) and the deviation
  *            T - (h + 1) in 1/128 m (int8), in one 3,456 B GmeColTile per
  *            chunk column with a 2-column apron (36 x 36 columns).
@@ -98,17 +101,76 @@ GME_HD int32_t gme_tile_dev_q7(int32_t t_q8, int32_t h, const GmePlanet* p) {
     return dev < lo ? lo : (dev > 127 ? 127 : dev);                   /* T in [h, h+2) */
 }
 
-/* What is drawn (and what walking should use): T in q8 m. */
-GME_HD int32_t gme_surface_q8(int32_t x, int32_t z, uint32_t seed, const GmePlanet* p) {
+/* T with the band applied column by column (q8 m): the far field's sub-samples (16 m / 64 m box averages, where
+ * the smoothing below changes nothing visible; CPU and GPU far samples use it alike). */
+GME_HD int32_t gme_surface_q8_point(int32_t x, int32_t z, uint32_t seed, const GmePlanet* p) {
     int32_t h, t;
     gme_surface_pair(x, z, seed, p, &h, &t);
     return 256 * (h + 1) + 2 * gme_tile_dev_q7(t, h, p);
 }
 
-GME_HD void gme_col_tile_build_column(int32_t x, int32_t z, uint32_t seed, const GmePlanet* p, int32_t* h, int32_t* dev) {
-    int32_t t;
-    gme_surface_pair(x, z, seed, p, h, &t);
-    *dev = gme_tile_dev_q7(t, *h, p);
+/* ---- the band's corrections, smoothed ------------------------------------------------------------------------
+ * T must lie in [lo, hi] (q8): [256 h, 256 (h + 1) + 254], dry columns at the coast >= 256 (sea + 1) + 2 (the coast
+ * lock). Clamping t column by column pins T to the voxel staircase where t leaves the band (~10 % of land): 1-2
+ * column bumps and pits of 0.3-0.4 m along h steps, slope kinks drawn as dark streaks. Instead the correction
+ * c = T - t is spread: GME_SMOOTH_ITERS times c <- band(t + blur(c)) - t, blur the 1-2-1 binomial over 3 x 3
+ * (integer, rounded): the projected Jacobi iteration of "T as close to t as the band allows, smooth". T stays in the
+ * band at every column, so |T - (h+1)| <= 1 m and the coast lock hold exactly; kinks |d2T| >= 0.5 m drop 3-4x
+ * (the rest are single-column h spikes, which the band itself forces). A column's T depends on the columns within
+ * GME_SMOOTH_HALO: tiles and regions compute that halo. Integer only: CPU and GPU agree bit for bit. */
+#define GME_SMOOTH_ITERS 4
+#define GME_SMOOTH_HALO  GME_SMOOTH_ITERS
+GME_HD int32_t gme_t_band_q8(int32_t T, int32_t h, const GmePlanet* p) {
+    int32_t lo = 256 * h;
+    if (h >= p->sea_level) { const int32_t c = 256 * (p->sea_level + 1) + 2; if (c > lo) lo = c; }
+    const int32_t hi = 256 * (h + 1) + 254;
+    return T < lo ? lo : (T > hi ? hi : T);
+}
+/* one step at (i, j) of an M x M region (h, t: gme_surface_pair; c: the corrections; edges replicate) */
+GME_HD int32_t gme_corr_step(const int32_t* h, const int32_t* t, const int32_t* c, int M, int i, int j, const GmePlanet* p) {
+    int32_t s = 0;
+    for (int b = -1; b <= 1; ++b) {
+        int jj = j + b;
+        jj = jj < 0 ? 0 : (jj >= M ? M - 1 : jj);
+        for (int a = -1; a <= 1; ++a) {
+            int ii = i + a;
+            ii = ii < 0 ? 0 : (ii >= M ? M - 1 : ii);
+            s += (2 - (a < 0 ? -a : a)) * (2 - (b < 0 ? -b : b)) * c[jj * M + ii];
+        }
+    }
+    const int k = j * M + i;
+    return gme_t_band_q8(t[k] + ((s + 8) >> 4), h[k], p) - t[k];
+}
+/* h and the stored deviation (q7) of the n x n columns at (x0, z0), smoothed. scratch: 4 (n + 2 GME_SMOOTH_HALO)^2
+ * int32. Serial (CPU tiles, single columns); the GPU runs the same steps in parallel (k_col_tiles). */
+GME_HD void gme_surface_region(int32_t x0, int32_t z0, int n, uint32_t seed, const GmePlanet* p, int32_t* h_out, int32_t* dev_out,
+                               int32_t* scratch) {
+    const int H = GME_SMOOTH_HALO, M = n + 2 * H;
+    int32_t* h = scratch, *t = scratch + M * M, *c = scratch + 2 * M * M, *c2 = scratch + 3 * M * M;
+    for (int j = 0; j < M; ++j)
+        for (int i = 0; i < M; ++i) {
+            const int k = j * M + i;
+            gme_surface_pair(x0 - H + i, z0 - H + j, seed, p, &h[k], &t[k]);
+            c[k] = gme_t_band_q8(t[k], h[k], p) - t[k];
+        }
+    for (int it = 0; it < GME_SMOOTH_ITERS; ++it) {
+        for (int j = 0; j < M; ++j)
+            for (int i = 0; i < M; ++i) c2[j * M + i] = gme_corr_step(h, t, c, M, i, j, p);
+        int32_t* q = c; c = c2; c2 = q;
+    }
+    for (int j = 0; j < n; ++j)
+        for (int i = 0; i < n; ++i) {
+            const int k = (j + H) * M + i + H;
+            h_out[j * n + i] = h[k];
+            dev_out[j * n + i] = gme_tile_dev_q7(t[k] + c[k], h[k], p);
+        }
+}
+
+/* What is drawn (and what walking should use): T in q8 m. */
+GME_HD int32_t gme_surface_q8(int32_t x, int32_t z, uint32_t seed, const GmePlanet* p) {
+    int32_t scratch[4 * (1 + 2 * GME_SMOOTH_HALO) * (1 + 2 * GME_SMOOTH_HALO)], h, dev;
+    gme_surface_region(x, z, 1, seed, p, &h, &dev, scratch);
+    return 256 * (h + 1) + 2 * dev;
 }
 
 /* ---- tile encoding -------------------------------------------------------- */
@@ -239,14 +301,13 @@ GME_HD void gme_col_tile_finish(GmeColTile* t, const int32_t* h36, const int32_t
 }
 
 /* The tile of chunk column (cx, cz), serially (CPU reference; the GPU builds
- * the same bytes in parallel in k_col_tiles). Uses ~10 KB of stack. */
+ * the same bytes in parallel in k_col_tiles). Uses ~41 KB of stack. */
+#define GME_TILE_RN (GME_TILE_N + 2 * GME_SMOOTH_HALO)   /* the smoothing region of a tile */
 GME_HD void gme_col_tile_build(GmeColTile* t, int32_t cx, int32_t cz, uint32_t seed, const GmePlanet* p,
                                const GmeBioView* b) {
-    int32_t h36[GME_TILE_COLS], dev36[GME_TILE_COLS];
+    int32_t h36[GME_TILE_COLS], dev36[GME_TILE_COLS], scratch[4 * GME_TILE_RN * GME_TILE_RN];
     const int32_t x0 = cx * GME_CHUNK_DIM - GME_TILE_APRON, z0 = cz * GME_CHUNK_DIM - GME_TILE_APRON;
-    for (int j = 0; j < GME_TILE_N; ++j)
-        for (int i = 0; i < GME_TILE_N; ++i)
-            gme_col_tile_build_column(x0 + i, z0 + j, seed, p, &h36[j * GME_TILE_N + i], &dev36[j * GME_TILE_N + i]);
+    gme_surface_region(x0, z0, GME_TILE_N, seed, p, h36, dev36, scratch);
     gme_col_tile_init(t, cx, cz);
     gme_col_tile_finish(t, h36, dev36, seed, p, b);
 }
@@ -256,7 +317,7 @@ GME_HD void gme_col_tile_build(GmeColTile* t, int32_t cx, int32_t cz, uint32_t s
  * GME_FAR_N^2 samples at 16 m (L1, +-8.2 km) and 64 m (L2, +-32.8 km). It is
  * computed from the generator alone (no world residency). Sample (X, Z)
  * (absolute metres, multiples of the spacing) packs:
- *   bits  0-15  int16 height, q4: T (gme_surface_q8's value) box-averaged over
+ *   bits  0-15  int16 height, q4: T (gme_surface_q8_point's value) box-averaged over
  *               4 x 4 sub-samples placed symmetrically about the point (column
  *               centres at +-1.5 / +-6.5 m for L1, +-6.5 / +-25.5 m for L2)
  *   bits 16-19  sub-samples whose ground voxel is the beach material, 0..15
@@ -280,7 +341,7 @@ GME_HD void gme_far_sub(int32_t X, int32_t Z, int level, int a, int b, uint32_t 
     const int32_t ob = level ? (b == 0 ? -26 : (b == 1 ? -7 : (b == 2 ? 6 : 25))) : (b == 0 ? -7 : (b == 1 ? -2 : (b == 2 ? 1 : 6)));
     int32_t h, t;
     gme_surface_pair(X + oa, Z + ob, seed, p, &h, &t);
-    *tq8 = 256 * (h + 1) + 2 * gme_tile_dev_q7(t, h, p);
+    *tq8 = 256 * (h + 1) + 2 * gme_tile_dev_q7(t, h, p);              /* = gme_surface_q8_point */
     *cls = (uint32_t)(h <= p->sea_level + 2 && h >= p->sea_level - 3) | ((uint32_t)(h > p->sea_level && gme_ground_mat(h, p) == p->surface_mat) << 1) |
            ((uint32_t)(h <= p->sea_level + 2) << 2);
 }

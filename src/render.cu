@@ -333,15 +333,25 @@ __global__ void __launch_bounds__(128) k_render(KParams p) {
 #include "trace.cuh"
 static_assert(HK_TERRAIN == RK_TERRAIN && HK_LOD == RK_LOD && HK_FAR == RK_FAR && HK_DIST == RK_DIST, "render.h RK_* = trace.cuh HK_*");
 
-#define WAVES   8
+// Gerstner normals only (no displacement), spec 3.6: a stochastic directional
+// spectrum of WAVES components (8 bands of 20 .. 0.3 m, WAVE_PER components per
+// band with jittered wavelengths and directions spread about a 5 m/s wind by a
+// cos^2s spreading function, random phases), sorted by wave number. Single
+// sinusoids per band drew a woven lattice in the sun glint and a grid in the
+// caustics; the band slope variances are unchanged (Cox & Munk budget).
+#define WAVE_BANDS 8
+#define WAVE_PER   8
+#define WAVES   (WAVE_BANDS * WAVE_PER)
 #define WATER_N 1.333f
 
-struct Waves {                  // Gerstner normals only (no displacement), spec 3.6
+struct Waves {
     float kx[WAVES], kz[WAVES]; // wave vector
     float dx[WAVES], dz[WAVES]; // unit direction
-    float k[WAVES];             // |k|
+    float k[WAVES];             // |k|, ascending
     float s[WAVES];             // slope amplitude k A
     float q[WAVES];             // crest steepness of the normal
+    float pm[WAVES];            // gain of the slow phase noise (decorrelates the components further)
+    float tail[WAVES];          // sum of 0.5 s^2 over components i.. (the variance faded out beyond i)
     float off[WAVES];           // phase at the camera chunk origin (host, double precision)
     float alpha0;               // roughness of the unresolved capillary waves
 };
@@ -377,6 +387,7 @@ struct FrameState {
     float esun0[SPEC_NG];       // sun beam irradiance at the water level (normal to the beam), W/m^2
     // M4
     float gsplit[SPEC_NG];      // each g-point's share of its band's sky irradiance (8-band GI -> g-points)
+    float gglob[SPEC_NG];       // ... of its band's global horizontal irradiance (sun + sky; band radiance -> XYZ)
     unsigned int nan;           // NaN pixels found so far (shaded colour, GI, TAA)
     float k_prev;               // the exposure of the previous frame (its TAA history), 0 = none
     unsigned long long cache_lookups, cache_hits;   // radiance cache lookups at GI / reflection hits so far, and hits
@@ -471,11 +482,14 @@ struct SParams {
     const uint4* refl_buf;          // reflected radiance (half or full res; band 0 = -1: none)
     const uint2* hg;                // half-res guide (refl == 1)
     GiCache cache;
-    const float4* taa;              // resolved output (k_tonemap, output res)
+    const TaaPx* taa;               // resolved output (k_tonemap, output res; RGBA16F)
     unsigned int* nan;              // NaN counter (FrameState.nan)
     // M5
     int     lad;                    // High: shadow rays (k_sun, k_sec_nee) treat crowns as a leaf-area medium
 };
+
+// every kernel takes SParams as a __grid_constant__ parameter (CUDA 12.1+: up to 32,764 bytes)
+static_assert(sizeof(SParams) <= 32000, "SParams must fit the kernel parameter space");
 
 // ---- small helpers -------------------------------------------------------------
 __device__ __forceinline__ float frc(float x) { return x - floorf(x); }
@@ -523,7 +537,7 @@ __device__ __forceinline__ int sm_voxel(int32_t ax, int32_t ay, int32_t az, int3
 __device__ __forceinline__ float vox_bright(int32_t ax, int32_t ay, int32_t az) {   // classic per-voxel brightness
     return 0.88f + 0.12f * (float)(gme_hash3(ax, ay, az, 0x5EEDu) & 255u) / 255.f;
 }
-__device__ __forceinline__ bool is_tissue(int m) { return m == MAT_GRASS || m == MAT_MAT || m == MAT_LEAF || m == MAT_KELP; }
+__device__ __forceinline__ bool is_tissue(int m) { return m == MAT_GRASS || m == MAT_MAT || m == MAT_LEAF || m == MAT_KELP || m == 15; }
 __device__ __forceinline__ bool p_has_bio(const SParams& sp) { return sp.k.bio_cells != NULL; }
 // M5: the biomap cell over absolute column (x, z) (its palette index = the pigment's hue bin, its
 // cover), looked up at the 8 m slot centre like generation; 0 outside the regions
@@ -569,13 +583,14 @@ __device__ float3 water_normal(const SParams& sp, float x, float z, float foot, 
     const int32_t bx = g_tc.cx >> 10, bz = g_tc.cz >> 10;
     const float pn = 2.6f * vnoise(ax * (1.f / 64.f), az * (1.f / 64.f), bx * 512, bz * 512) +
                      1.3f * vnoise(ax * (1.f / 16.f), az * (1.f / 16.f), bx * 2048 + 7919, bz * 2048);
-    const float pm[WAVES] = { 0.7f, -1.1f, 1.5f, -0.9f, 1.3f, -1.6f, 1.0f, -1.4f };
-#pragma unroll
+#pragma unroll 4
     for (int i = 0; i < WAVES; ++i) {
         const float f = sat(2.f - 0.63661977f * foot * sp.w.k[i]);
-        const float ph = sp.w.kx[i] * x + sp.w.kz[i] * z + sp.w.off[i] + pn * pm[i];
+        if (f <= 0.f) { lost += sp.w.tail[i]; break; }   // sorted by k: every shorter one is faded out too
+        float ph = sp.w.kx[i] * x + sp.w.kz[i] * z + sp.w.off[i] + pn * sp.w.pm[i];
+        ph -= 6.2831853f * rintf(ph * 0.15915494f);       // into [-pi, pi]: the hardware sine is accurate there
         float sn, cs;
-        sincosf(ph, &sn, &cs);
+        __sincosf(ph, &sn, &cs);
         const float amp = sp.w.s[i] * f;
         gx += sp.w.dx[i] * amp * cs;
         gz += sp.w.dz[i] * amp * cs;
@@ -823,8 +838,10 @@ __device__ __forceinline__ void hit_unpack(float4 a, uint2 b, THit& h) {
     }
 }
 
-// k_primary: the column tracer (traversal only) -> hit record per pixel
-__global__ void __launch_bounds__(128, 8) k_primary(const __grid_constant__ SParams sp, GBuf g) {
+// k_primary: the column tracer (traversal only) -> hit record per pixel. (128, 6) as spec 3.1 (80 registers):
+// measured on rig B against (128, 8) with 64 registers: -6 .. -9.5 % on near views and the streaming flight,
+// +2 .. +5 % on the far / peak views; the near ground views are the common case
+__global__ void __launch_bounds__(128, 6) k_primary(const __grid_constant__ SParams sp, GBuf g) {
     const KParams& p = sp.k;
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -874,11 +891,12 @@ __device__ float hf_ao(const SParams& sp, float3 p, float3 n) {
 }
 
 __device__ void sm_terrain_mat(const SParams& sp, const GmeColTile* t, int rcx, int rcz, int i, int j, float u, float v, float3 pos,
-                               SurfInfo& si);
+                               SurfInfo& si, float fp);
 // Terrain hit: shading normal (corner gradients by central differences, blended
-// bilinearly), geometric normal of the patch, and the depth-anchored material
-// ids of the 4 corner columns, weighted w^2 (spec 3.3, 3.4).
-__device__ void sm_terrain(const SParams& sp, const THit& h, float3 pos, SurfInfo& si, bool want_ao = true) {
+// bilinearly), geometric normal of the patch, and the depth-anchored materials
+// (spec 3.3, 3.4; sm_terrain_mat). fp: the pixel footprint at the hit (m; large
+// for secondary rays: the cheap material path).
+__device__ void sm_terrain(const SParams& sp, const THit& h, float3 pos, SurfInfo& si, bool want_ao = true, float fp = 1e3f) {
     const GmeColTile* t = g_tc.tiles + gme_page_index(g_tc.cx + h.rcx, 0, g_tc.cz + h.rcz, g_tc.n, 1);
     const int i = h.i, j = h.j;
     const float u = h.u, v = h.v;
@@ -898,61 +916,186 @@ __device__ void sm_terrain(const SParams& sp, const THit& h, float3 pos, SurfInf
     const float bb = (float)(q[1][2] - q[1][1]) * (1.f / 256.f), cc = (float)(q[2][1] - q[1][1]) * (1.f / 256.f);
     const float kk = (float)(q[1][1] - q[1][2] - q[2][1] + q[2][2]) * (1.f / 256.f);
     si.ng = norm3(f3(-(bb + kk * v), 1.f, -(cc + kk * u)));
-    sm_terrain_mat(sp, t, h.rcx, h.rcz, i, j, u, v, pos, si);
+    sm_terrain_mat(sp, t, h.rcx, h.rcz, i, j, u, v, pos, si, fp);
     si.ao = want_ao ? hf_ao(sp, pos, si.n) : 1.f;
 }
 
-// The depth-anchored materials of dual cell (i, j) (tile array index of its
-// lower corner) at patch point (u, v), height pos.y (spec 3.4).
+// ---- ground materials: border shapes and the coverage of life on the ground --------------------
+// A mat on sand (MAT_MAT) and a mat on soil (MATX_SOILMAT: the deeper seabed) differ only in the
+// ground they cover (mat_rho); the id fits the G-buffer's 4 bits (MAT_COUNT = 15).
+#define MATX_SOILMAT 15
+#define LEAFY 0.85f                 // leaf share of a fully grassed surface (the rest: its soil between the blades)
+// Visual coverage of a cell's ground tissue: 1 - e^(-6 cover). The voxel truth puts a grass / mat voxel on a
+// column with probability cover / 256, and the evolved islands' cells have cover ~0.1: drawn literally (and with
+// the cover again in the albedo) that read as bare soil and as dark 1 m squares. Tufts and mats spread beyond
+// their voxel's square metre: the coverage field draws them as organic patches of this mean coverage.
+__device__ __forceinline__ float vis_cover(float c) { return 1.f - __expf(-6.f * c); }
+// patch noise q in [0, 1] (world anchored, 2.3 m + 0.85 m value noise) and the quantiles of its distribution at
+// v = k / 16 (measured on 2M samples), so a threshold at quantile v covers the share v of the ground
+__constant__ float c_patch_q[17] = { 0.0100f, 0.2589f, 0.3144f, 0.3544f, 0.3882f, 0.4185f, 0.4467f, 0.4739f, 0.5005f,
+                                     0.5271f, 0.5544f, 0.5826f, 0.6129f, 0.6466f, 0.6867f, 0.7421f, 0.9890f };
+__device__ float patch_q(float3 pos) {
+    const float axw = pos.x + 32.f * (float)(g_tc.cx & 1023), azw = pos.z + 32.f * (float)(g_tc.cz & 1023);
+    const int32_t bx = g_tc.cx >> 10, bz = g_tc.cz >> 10;
+    return 0.5f + 0.5f * (0.62f * vnoise(axw * (1.f / 2.3f), azw * (1.f / 2.3f), bx * 14247 + 101, bz * 14247 + 7) +
+                          0.38f * vnoise(axw * (1.f / 0.85f) + 17.3f, azw * (1.f / 0.85f), bx * 38551 + 5, bz * 38551 + 77));
+}
+// coverage at the point of a patch field of mean v: 1 inside a patch (q below the v-quantile), soft edges; the mean
+// where patches are sub-pixel (fp: pixel footprint, m)
+__device__ float patch_cover(float3 pos, float v, float fp) {
+    const float fade = smooth01(0.35f, 1.4f, fp);
+    if (fade >= 1.f || v <= 0.f) return v;
+    const float x = sat(v) * 16.f;
+    const int k = min((int)x, 15);
+    const float th = c_patch_q[k] + (c_patch_q[k + 1] - c_patch_q[k]) * (x - (float)k);
+    const float e = 0.07f + 0.05f * fp;
+    const float g = smooth01(th + e, th - e, patch_q(pos));
+    return g + (v - g) * fade;
+}
+// cubic B-spline weights of the 4 taps around a fraction t (C2; sum 1)
+__device__ __forceinline__ void bspl_w(float t, float w[4]) {
+    const float t2 = t * t, t3 = t2 * t, s = 1.f - t;
+    w[0] = s * s * s * (1.f / 6.f);
+    w[1] = (3.f * t3 - 6.f * t2 + 4.f) * (1.f / 6.f);
+    w[2] = (-3.f * t3 + 3.f * t2 + 3.f * t + 1.f) * (1.f / 6.f);
+    w[3] = t3 * (1.f / 6.f);
+}
+
+// The depth-anchored materials of dual cell (i, j) (tile array index of its lower corner) at patch point (u, v),
+// height pos.y (spec 3.4). A column is eligible if T_i >= y_hit - 0.25 (drops low columns under a point high on a
+// cliff); its voxel is taken at the hit's depth below that column's surface, so cliffs show the grid's real layering.
+// Up close (fp < 1.5 m) the border between two ground materials is the 0.5 contour of their cubic B-spline
+// indicators over the 4 x 4 columns around the cell, moved by a 1.3 m noise (organic, not the voxels' 1 m
+// staircase that the corner weights w^2 drew), and the column nearest the hit keeps its own material within ~0.35 m
+// of its centre (single columns stay round spots instead of vanishing); farther, and for secondary rays, the 4
+// corners weighted w^2. Life on the ground (grass, mats) belongs to its ground material's area: where the cell of
+// the nearest column has ground cover / shrubs / trees (on soil) or mats / kelp (at most 2 m above the sea), that
+// ground becomes the tissue with the coverage of the patch field (vis_cover) and of the tissue voxels themselves.
 __device__ void sm_terrain_mat(const SParams& sp, const GmeColTile* t, int rcx, int rcz, int i, int j, float u, float v, float3 pos,
-                               SurfInfo& si) {
-    // materials: corner i is eligible if T_i >= y_hit - 0.25 (drops low columns
-    // under a point high on a cliff); its voxel is taken at the hit's depth below
-    // that column's surface, so cliffs show the grid's real layering
+                               SurfInfo& si, float fp) {
+    const GmePlanet& P = g_tc.planet;
     const int32_t hb = (int32_t)__ldg(&t->h_base);
     const float yabs = pos.y + (float)(32 * g_tc.cy);
     const int32_t ax0 = (g_tc.cx + rcx) * 32 - GME_TILE_APRON + i, az0 = (g_tc.cz + rcz) * 32 - GME_TILE_APRON + j;
-    int ids[4] = { 0, 0, 0, 0 };
-    float ws[4] = { 0.f, 0.f, 0.f, 0.f };
-    int nid = 0, dk = 0;
-    float wsum = 0.f, bsum = 0.f, dsum = 0.f, dw = -1.f;
-    for (int k = 0; k < 4; ++k) {
-        const int ci = k & 1, cj = k >> 1;
-        const float w = (ci ? u : 1.f - u) * (cj ? v : 1.f - v);
-        const uint32_t cv = __ldg(&t->col[(j + cj) * GME_TILE_N + i + ci]);
-        const int32_t hc = hb + (int32_t)(cv & 255u);
-        const int32_t dv = (int32_t)((cv >> 8) ^ 0x80u) - 0x80;
-        dsum += w * (float)dv * (1.f / GME_DEV_UNIT);
-        const float Tc = (float)(256 * (hc + 1) + 2 * dv) * (1.f / 256.f);
-        if (Tc < yabs - 0.25f) continue;
-        const int32_t iy = min(hc, (int32_t)floorf(yabs - (float)dv * (1.f / GME_DEV_UNIT)));
-        const int m = sm_voxel(ax0 + ci, iy, az0 + cj, hc);
-        if (m == MAT_AIR) continue;
-        const float w2 = w * w + 1e-4f;
-        wsum += w2;
-        bsum += w2 * vox_bright(ax0 + ci, iy, az0 + cj);
-        if (w2 > dw) { dw = w2; dk = k; }
-        int s = 0;
-        while (s < nid && ids[s] != m) ++s;
-        if (s == nid) { ids[nid++] = m; }
-        ws[s] += w2;
-    }
+    const bool fine = fp < 1.5f;
+    const int ru = u >= 0.5f ? 1 : 0, rv = v >= 0.5f ? 1 : 0;   // the column nearest the hit
+    float bu[4], bw[4];
+    if (fine) { bspl_w(u, bu); bspl_w(v, bw); }
+    int ids[6];
+    float ws[6];
+    int nid = 0, mnear = -1, cnear = -1;
+    float wsum = 0.f, bsum = 0.f, dsum = 0.f, wgr = 0.f, wmt = 0.f;
+    const int r0 = fine ? -1 : 0, r1 = fine ? 2 : 1;
+    for (int r = r0; r <= r1; ++r)
+        for (int s = r0; s <= r1; ++s) {
+            const uint32_t cv = __ldg(&t->col[(j + r) * GME_TILE_N + i + s]);
+            const int32_t hc = hb + (int32_t)(cv & 255u);
+            const int32_t dv = (int32_t)((cv >> 8) ^ 0x80u) - 0x80;
+            float w;
+            if (fine) w = bu[s + 1] * bw[r + 1];
+            else { const float wb = (s ? u : 1.f - u) * (r ? v : 1.f - v); w = wb * wb + 1e-4f; }
+            if ((unsigned)r <= 1u && (unsigned)s <= 1u) dsum += (s ? u : 1.f - u) * (r ? v : 1.f - v) * (float)dv * (1.f / GME_DEV_UNIT);
+            const float Tc = (float)(256 * (hc + 1) + 2 * dv) * (1.f / 256.f);
+            if (Tc < yabs - 0.25f) continue;
+            const int32_t iy = min(hc, (int32_t)floorf(yabs - (float)dv * (1.f / GME_DEV_UNIT)));
+            const int m = sm_voxel(ax0 + s, iy, az0 + r, hc);
+            if (m == MAT_AIR) continue;
+            // the class of the border: the ground the tissue sits on
+            const int c = m == MAT_GRASS ? P.surface_mat : (m == MAT_MAT ? gme_ground_mat(hc, &P) : m);
+            if (m == MAT_GRASS) wgr += w;
+            if (m == MAT_MAT) wmt += w;
+            if (s == ru && r == rv) { mnear = m; cnear = c; }
+            wsum += w;
+            bsum += w * vox_bright(ax0 + s, iy, az0 + r);
+            int k = 0;
+            while (k < nid && ids[k] != c) ++k;
+            if (k == nid && nid < 6) { ids[nid] = c; ws[nid] = 0.f; ++nid; }
+            if (k < nid) ws[k] += w;
+        }
+    // the nearest column's own material within ~0.35 m of its centre
+    const float du = u - (float)ru, dvv = v - (float)rv, dn = sqrtf(du * du + dvv * dvv);
+    const float guard = fine ? 0.78f * smooth01(0.46f, 0.22f, dn) : 0.f;
+    if (fine && cnear >= 0)
+        for (int k = 0; k < nid; ++k) if (ids[k] == cnear) ws[k] = fmaxf(ws[k], guard * wsum);
     int a0 = 0;
-    for (int s = 1; s < nid; ++s) if (ws[s] > ws[a0]) a0 = s;
+    for (int k = 1; k < nid; ++k) if (ws[k] > ws[a0]) a0 = k;
     int a1 = a0;
-    for (int s = 0; s < nid; ++s) if (s != a0 && (a1 == a0 || ws[s] > ws[a1])) a1 = s;
-    si.m0 = nid ? ids[a0] : MAT_STONE;
-    si.m1 = nid ? ids[a1] : MAT_STONE;
-    si.w1 = (nid && a1 != a0) ? ws[a1] / (ws[a0] + ws[a1]) : 0.f;
+    for (int k = 0; k < nid; ++k) if (k != a0 && (a1 == a0 || ws[k] > ws[a1])) a1 = k;
+    int m0 = nid ? ids[a0] : MAT_STONE, m1 = nid ? ids[a1] : MAT_STONE;
+    float w1 = 0.f;
+    if (nid && a1 != a0) {
+        if (fine) {                                     // the 0.5 contour, moved by a 1.3 m noise (+-0.3 m), soft edges
+            const float axw = pos.x + 32.f * (float)(g_tc.cx & 1023), azw = pos.z + 32.f * (float)(g_tc.cz & 1023);
+            const float nz = vnoise(axw * (1.f / 1.3f), azw * (1.f / 1.3f), (g_tc.cx >> 10) * 25206 + 31, (g_tc.cz >> 10) * 25206 + 3);
+            const float sd = (ws[a1] - ws[a0]) / (ws[a0] + ws[a1]);
+            const float e = 0.06f + 0.12f * fp;
+            w1 = smooth01(-e, e, sd + 0.24f * nz * (1.f - smooth01(0.4f, 1.2f, fp)));
+        } else {
+            w1 = ws[a1] / (ws[a0] + ws[a1]);
+        }
+    }
     si.bright = wsum > 0.f ? bsum / wsum : 1.f;
+    si.dev = dsum;
     si.pal = 0;
     si.cover = 0.f;
-    if (is_tissue(si.m0) || is_tissue(si.m1)) {        // M5: the pigment's hue bin and the cover of the dominant corner's cell
-        const uint32_t c = sm_slot_cell(sp.k, ax0 + (dk & 1), az0 + (dk >> 1));
-        si.pal = cell_pal(c);
-        si.cover = cell_cover(c);
+    // life on the ground: the cells (8 m slots) at two points warped by independent noises (+-6 m at 13 m and +-2 m at
+    // 4 m scale), so the biomap's 16 m cells (a checkerboard of covers on the evolved islands) meet along organic
+    // borders with a transition of half the coverage; the hue of the first
+    const float axw = pos.x + 32.f * (float)(g_tc.cx & 1023), azw = pos.z + 32.f * (float)(g_tc.cz & 1023);
+    const int32_t bwx = g_tc.cx >> 10, bwz = g_tc.cz >> 10;
+    uint32_t cells[2];
+    for (int q = 0; q < 2; ++q) {
+        const float o = 37.1f * (float)q;
+        const float wpx = 6.f * vnoise(axw * (1.f / 13.f) + o, azw * (1.f / 13.f), bwx * 2521 + 13, bwz * 2521 + 71) +
+                          2.f * vnoise(axw * 0.25f, azw * 0.25f + o, bwx * 8192 + 5, bwz * 8192 + 3);
+        const float wpz = 6.f * vnoise(axw * (1.f / 13.f) + 41.3f, azw * (1.f / 13.f) + 7.9f + o, bwx * 2521 + 59, bwz * 2521 + 23) +
+                          2.f * vnoise(axw * 0.25f + 11.7f + o, azw * 0.25f, bwx * 8192 + 9, bwz * 8192 + 1);
+        cells[q] = sm_slot_cell(sp.k, g_tc.cx * 32 + (int32_t)floorf(pos.x + wpx), g_tc.cz * 32 + (int32_t)floorf(pos.z + wpz));
     }
-    si.dev = dsum;
+    const uint32_t cell = cells[0];
+    // where each tissue grows, gated on the drawn (smooth) height of the hit, not on the nearest column's integer h
+    // (its 1 m staircase drew saw-tooth borders): ground cover above the waterline; mats and the kelp bed from under
+    // the water up to ~2 m above it (the voxels' h <= sea + 2, T ~ h + 1)
+    const float ywl = (float)(P.sea_level + 1);
+    const float gate_gr = smooth01(ywl, ywl + 0.3f, yabs), gate_mt = smooth01(ywl + 2.6f, ywl + 2.f, yabs);
+    int tis = 0;
+    float cvs = 0.f;
+    for (int q = 0; q < 2; ++q) {                       // the tissue (either lookup) and its mean coverage target
+        const uint32_t k = BIOCELL_KIND(cells[q]);
+        const int tq = (k >= BIO_KIND_COVER && k <= BIO_KIND_TREE && gate_gr > 0.f) ? MAT_GRASS
+                     : (((k == BIO_KIND_MAT || k == BIO_KIND_KELP) && gate_mt > 0.f) ? MAT_MAT : 0);
+        if (tq && !tis) tis = tq;
+        if (tq && tq == tis) cvs += 0.5f * vis_cover(cell_cover(cells[q]));
+    }
+    if (tis) {
+        // the tissue grows on: grass on the soil; mats on any ground (sand on the beach, soil on the deeper bed)
+        const int g = P.surface_mat;
+        const bool e0 = tis == MAT_GRASS ? m0 == g : (m0 == P.beach_mat || m0 == g || m0 == MAT_REGOLITH);
+        const bool e1 = tis == MAT_GRASS ? m1 == g : (m1 == P.beach_mat || m1 == g || m1 == MAT_REGOLITH);
+        if (e0 || (e1 && w1 > 0.f)) {
+            // its voxels' share of that ground (indicator, with the nearest column's spot), and the patch field
+            float wg = 0.f;
+            for (int k = 0; k < nid; ++k) {
+                const bool el = tis == MAT_GRASS ? ids[k] == g : (ids[k] == P.beach_mat || ids[k] == g || ids[k] == MAT_REGOLITH);
+                if (el) wg += ws[k];
+            }
+            float ind = wg > 0.f ? (tis == MAT_GRASS ? wgr : wmt) / wg : 0.f;
+            if (mnear == tis) ind = fmaxf(ind, guard);
+            if (fine) ind = smooth01(0.3f, 0.6f, ind);
+            // the tissue voxels show as tufts / spots of 0.6 coverage on top of the patch field (whole cells of
+            // voxels would otherwise draw the cells' straight borders)
+            si.cover = (tis == MAT_GRASS ? gate_gr : gate_mt) * fmaxf(0.6f * ind, fine ? patch_cover(pos, cvs, fp) : cvs);
+            const int tm0 = tis == MAT_MAT && m0 != P.beach_mat ? MATX_SOILMAT : tis;
+            const int tm1 = tis == MAT_MAT && m1 != P.beach_mat ? MATX_SOILMAT : tis;
+            if (e0) m0 = tm0;
+            if (e1) m1 = tm1;
+            si.pal = cell_pal(BIOCELL_KIND(cells[0]) ? cells[0] : cells[1]);
+        }
+    }
+    if (si.pal == 0 && (is_tissue(m0) || is_tissue(m1))) si.pal = cell_pal(cell);
+    si.m0 = m0;
+    si.m1 = m1;
+    si.w1 = w1;
 }
 
 // ---- M3: LOD and far-field surfaces ---------------------------------------------------
@@ -1056,9 +1199,9 @@ __device__ void far_material(const SParams& sp, int l, float w1, float x, float 
     si.m0 = P.soil_depth > 0 ? P.surface_mat : MAT_REGOLITH;
     si.wb = f.beach;
     si.m1 = f.grass >= f.mat ? MAT_GRASS : MAT_MAT;
-    si.w1 = fmaxf(f.grass, f.mat);
+    si.w1 = vis_cover(fmaxf(f.grass, f.mat));          // the visual coverage, as the near field's patch field (mean)
     si.pal = f.pal;
-    si.cover = si.w1;                                  // M5: a grass voxel's cover ~ the coverage (expected leafiness 0.8 w1^2)
+    si.cover = 1.f;                                    // the covered part is all tissue
     si.bright = 0.94f;                                 // the mean of the classic per-voxel brightness
     si.dev = 0.f;
 }
@@ -1067,7 +1210,7 @@ __device__ void far_material(const SParams& sp, int l, float w1, float x, float 
 // (across tiles), the fine surface's depth-anchored materials and AO under the
 // hit; near the ring the normal, materials and AO move to the far model with
 // the geometry's morph weight.
-__device__ void sm_lod(const SParams& sp, const THit& h, float3 pos, int px, int py, SurfInfo& si, bool want_ao = true) {
+__device__ void sm_lod(const SParams& sp, const THit& h, float3 pos, int px, int py, SurfInfo& si, bool want_ao = true, float fp = 1e3f) {
     const GmeColTile* t = g_tc.tiles + gme_page_index(g_tc.cx + h.rcx, 0, g_tc.cz + h.rcz, g_tc.n, 1);
     float gxc[4], gzc[4];
 #pragma unroll
@@ -1103,7 +1246,7 @@ __device__ void sm_lod(const SParams& sp, const THit& h, float3 pos, int px, int
     if (w > 0.f && dith((float)px + 13.7f, (float)py + 5.9f) < w) {
         far_material(sp, 0, 0.f, pos.x, pos.z, si);
     } else {
-        sm_terrain_mat(sp, t, h.rcx, h.rcz, DX + 2, DZ + 2, uf, vf, pf, si);
+        sm_terrain_mat(sp, t, h.rcx, h.rcz, DX + 2, DZ + 2, uf, vf, pf, si, fp);
         // beyond the analytic flora (spec 3.1, 3.5): the block's shrub / tree as a canopy tint, its crown's share of the slot
         const GmeSlot* sl = &t->slot[min(max((int)(lz * 0.125f), 0), 3) * 4 + min(max((int)(lx * 0.125f), 0), 3)];
         const int32_t trad = __ldg(&sl->trad);
@@ -1168,7 +1311,7 @@ __device__ void sm_other(const SParams& sp, const THit& h, float3 d, float3 pos,
         const int32_t ax = g_tc.cx * 32 + h.vx, ay = g_tc.cy * 32 + h.vy, az = g_tc.cz * 32 + h.vz;
         si.m0 = si.m1 = h.mat;
         si.bright = vox_bright(ax, ay, az);
-        if (is_tissue(h.mat)) { const uint32_t c = sm_slot_cell(p, ax, az); si.pal = cell_pal(c); si.cover = cell_cover(c); }
+        if (is_tissue(h.mat)) { const uint32_t c = sm_slot_cell(p, ax, az); si.pal = cell_pal(c); si.cover = 1.f; }
         return;
     }
     if (h.kind == HK_ICE) {
@@ -1305,8 +1448,8 @@ __global__ void __launch_bounds__(128, 4) k_surface(const __grid_constant__ SPar
     si.wb = 0.f;
     si.cover = 0.f;
     si.tsun = 1.f;
-    if (h.kind == HK_TERRAIN) sm_terrain(sp, h, pos, si);
-    else if (h.kind == HK_LOD) sm_lod(sp, h, pos, x, y, si);
+    if (h.kind == HK_TERRAIN) sm_terrain(sp, h, pos, si, true, h.t * sp.pix);
+    else if (h.kind == HK_LOD) sm_lod(sp, h, pos, x, y, si, true, h.t * sp.pix);
     else if (h.kind == HK_FAR) sm_far(sp, pos, x, y, si);
     else if (h.kind == HK_DIST) {                      // shaded from the sky-view LUT (k_compose)
         si.n = si.ng = f3(0.f, 1.f, 0.f);
@@ -1375,7 +1518,7 @@ __device__ __forceinline__ float3 sun_jitter(const SParams& sp, float3 l, int x,
 // tracer, flora included). Under water the ray follows the refracted sun
 // direction up to the water plane, then the true one (spec 3.7). M3: 80
 // registers (launch bounds 128 x 6, spec 3.1) measured 3-9 % faster than 64
-// with the long-range walk; k_primary stays at 64 (faster there, as in M1).
+// with the long-range walk (k_primary uses the same bound since the review).
 // M5: crowns. A crown pixel's own crown is a leaf-area medium for its light (k_surface keeps its
 // transmittance toward the sun, k_compose its back-lit transmission), so its shadow ray starts where
 // the ray leaves the own crown, front- and back-lit alike. kLad (High): other crowns along the ray
@@ -1514,7 +1657,11 @@ __global__ void __launch_bounds__(128) k_sec_gen(const __grid_constant__ SParams
         const float3 pw = p.o + d * tw;
         const float3 nw = water_normal(sp, pw.x, pw.z, water_foot(sp, d, tw) * (G.half ? 2.f : 1.f), NULL);
         float3 r = d - nw * (2.f * dot3(d, nw));
-        r.y = fmaxf(r.y, 0.01f);
+        // a wave facet that sends the view ray downward sends it into the next wave: the ray meets the water plane
+        // within a metre (k_sec_trace: HKX_WATER, the sky reflected once more, with its Fresnel). Clamped up to the
+        // horizon instead, such facets reflected the far shore as brown dashes on open water (more of them with the
+        // stochastic wave spectrum, whose slopes are Gaussian)
+        r.y = r.y < 0.f ? fminf(r.y, -0.02f) : fmaxf(r.y, 0.01f);
         rd = norm3(r);
         ro = pw + f3(0.f, 0.02f, 0.f);
         rtmax = tfar;
@@ -1637,7 +1784,7 @@ __global__ void __launch_bounds__(128, 6) k_sec_trace(const __grid_constant__ SP
 // M5: r.y bits 13-15 the sun visibility as 0..7 (kLad, High: crowns along the shadow ray attenuate
 // by e^-(sigma chord); else 0 or 7), bits 24-28 the cell's cover (grass)
 template <int kLad>
-__global__ void __launch_bounds__(128, 4) k_sec_nee(const __grid_constant__ SParams sp, SecBuf sb, int n0, int n) {
+__global__ void __launch_bounds__(128, 6) k_sec_nee(const __grid_constant__ SParams sp, SecBuf sb, int n0, int n) {
     const int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= n) return;
     const int slot = n0 + k;
@@ -1769,26 +1916,29 @@ __device__ __forceinline__ float sky_g(const AtmoParams& P, const SkyTap& t, int
 __device__ __forceinline__ float3 tissue_rgb(int m) {
     switch (m) {
     case MAT_GRASS: return f3(0.28f, 0.52f, 0.20f);
-    case MAT_MAT:   return f3(0.30f, 0.22f, 0.30f);
+    case MAT_MAT: case MATX_SOILMAT: return f3(0.30f, 0.22f, 0.30f);
     case MAT_LEAF:  return f3(0.25f, 0.45f, 0.18f);
     default:        return f3(0.20f, 0.35f, 0.18f);   // kelp
     }
 }
 __device__ __forceinline__ int hue_bin(int pal) { return (pal & 15) ? (pal & 15) : SPEC_HUE_DEFAULT; }
 // spectral albedo of material m in band b. M5 pigmented tissue (spec 5.1) by its hue bin: leaves and kelp
-// rho_L, mats 0.03 + rho_sand (1 - A)^2, the grass ground voxel mix(soil, rho_L, 0.8 cover); grass and
-// mats on steep ground show the soil as before
+// rho_L, mats 0.03 + rho_sand (1 - A)^2; cover: the tissue's coverage of its ground at the point (the coverage
+// field of sm_terrain_mat; 1 for a voxel / far tissue part): grass mix(soil, rho_L, LEAFY cover), mats
+// mix(ground, mat, cover) on sand (MAT_MAT) or soil (MATX_SOILMAT); grass and mats on steep ground show the soil
 __device__ __forceinline__ float mat_rho(const SParams& sp, int m, int pal, float cover, float steep, int b) {
     const ShadeTab* T = sp.tab;
     float r;
     if (is_tissue(m)) {
         const int hb = hue_bin(pal);
-        if (m == MAT_MAT) r = __ldg(&T->mat_tis[hb][b]);
-        else if (m == MAT_GRASS) {
+        if (m == MAT_MAT || m == MATX_SOILMAT) {
+            const float gr = __ldg(&T->rho[(m == MAT_MAT ? g_tc.planet.beach_mat : g_tc.planet.surface_mat) & 15][b]);
+            r = gr + (__ldg(&T->mat_tis[hb][b]) - gr) * cover;
+        } else if (m == MAT_GRASS) {
             const float soil = __ldg(&T->rho[g_tc.planet.surface_mat & 15][b]);
-            r = soil + (__ldg(&T->leaf_rho[hb][b]) - soil) * 0.8f * cover;
+            r = soil + (__ldg(&T->leaf_rho[hb][b]) - soil) * LEAFY * cover;
         } else r = __ldg(&T->leaf_rho[hb][b]);
-        if (m == MAT_GRASS || m == MAT_MAT) r += (__ldg(&T->rho[MAT_DIRT][b]) - r) * 0.55f * steep;
+        if (m == MAT_GRASS || m == MAT_MAT || m == MATX_SOILMAT) r += (__ldg(&T->rho[MAT_DIRT][b]) - r) * 0.55f * steep;
     } else {
         r = __ldg(&T->rho[m & 15][b]);
     }
@@ -1836,6 +1986,7 @@ struct Lit {
                                  // in vis), kelp blades sat(-n.l); 0 for other surfaces
     float  tamb;                 // kelp: the ambient from the other side through the blade (two-sided)
     float  sheen;                // grass: the Charlie sheen lobe (D V) x weight
+    int    tavg;                 // terrain: the ambient specular is the lobe's cosine-averaged albedo E_avg (lit_setup)
 };
 // GGX + energy-compensated diffuse terms of a lit point (spec 4.4)
 __device__ void lit_setup(const SParams& sp, Lit& L, float3 v, float3 l) {
@@ -1861,7 +2012,12 @@ __device__ void lit_setup(const SParams& sp, Lit& L, float3 v, float3 l) {
     L.spec = L.cond ? 0.f : L.dvis * spec_fresnel(vh, iorn);
     const float Eo = e_spec(T, ior, nv, alpha), Ei = e_spec(T, ior, nl, alpha), Ea = e_avg(T, ior, alpha);
     L.comp = (1.f - Ei) * (1.f - Eo) / fmaxf(1.f - Ea, 1e-3f) * 0.31830989f;
-    L.amb_spec = Eo;
+    // the ambient specular: the irradiance x the lobe's albedo. E(mu_o) grows toward grazing view (0.02 head-on,
+    // 0.1 at mu_o -> 0 for rock); on terrain the C0 shading normal turns sharply away from the camera along creases,
+    // so E(mu_o) drew a network of bright sky-blue veins on shadowed slopes at low sun and rim lines on ridges. The
+    // drawn heightfield is smoother than real ground, whose visible facets spread the view angle: terrain takes the
+    // cosine average E_avg (no view dependence, measured: the veins go, the mean level drops ~1 %)
+    L.amb_spec = L.tavg ? Ea : Eo;
     L.specw = L.wet > 0.f ? L.wet * spec_ggx_d(nh, 0.05f) * spec_ggx_vis(nl, nv, 0.05f) * spec_schlick(0.02f, vh) : 0.f;
     // M5 grass: the blades' sheen (Charlie distribution, alpha 0.5, Ashikhmin's visibility), its colour the albedo
     const float wg = (L.m0 == MAT_GRASS ? 1.f - L.w1 : 0.f) + (L.m1 == MAT_GRASS ? L.w1 : 0.f);
@@ -1913,6 +2069,93 @@ __device__ __forceinline__ void sky_bands(const AtmoParams& P, float3 d, float L
         L[b] = s;
     }
 }
+// The irradiance at a secondary hit (8 bands): the radiance cache's cell (statistics: one atomic pair per warp),
+// else half the sky SH irradiance
+__device__ void sec_cache_irr(const SParams& sp, float3 pos, float3 n, float ec[SPEC_NB]) {
+    const AtmoParams& P = sp.a;
+    bool have = false;
+    const float3 dc = pos - sp.k.o;
+    if (sp.cache.meta) {
+        uint32_t slot, key;
+        gi_cache_cell(g_tc.cx, g_tc.cy, g_tc.cz, pos.x, pos.y, pos.z, n.x, n.y, n.z, sqrtf(dot3(dc, dc)), &slot, &key);
+        have = gi_cache_get(sp.cache, slot, key, ec);
+        const unsigned m = __activemask(), nh = __popc(__ballot_sync(m, have));
+        if ((int)(threadIdx.x & 31u) == __ffs(m) - 1) {
+            atomicAdd(&sp.fs->cache_lookups, (unsigned long long)__popc(m));
+            atomicAdd(&sp.fs->cache_hits, (unsigned long long)nh);
+        }
+    }
+    if (!have) {
+        float Y[9];
+        sh_basis(n, Y);
+#pragma unroll
+        for (int b = 0; b < SPEC_NB; ++b) {
+            float s = 0.f;
+#pragma unroll
+            for (int j = 0; j < SPEC_GPB; ++j) s += sh_irr(P.sh + 9 * (b * SPEC_GPB + j), Y);
+            ec[b] = 0.5f * s;
+        }
+    }
+}
+// band radiances (band-integrated) -> XYZ (no 683) with the per-g colour weights of the global light's spectrum
+// at the ground (the reference transport's reflection paths carry bands)
+__device__ float3 bands_xyz_g(const SParams& sp, const float* L) {
+    const AtmoParams& P = sp.a;
+    float X = 0.f, Y = 0.f, Z = 0.f;
+    for (int g = 0; g < SPEC_NG; ++g) {
+        const float l = L[g / SPEC_GPB] * __ldg(&sp.fs->gglob[g]);
+        X += l * P.g_cmf[g][0]; Y += l * P.g_cmf[g][1]; Z += l * P.g_cmf[g][2];
+    }
+    return f3(X, Y, Z);
+}
+// The radiance a reflection ray brings back, as XYZ (no 683) summed per g-point with the direct path's colour
+// weights (the band-mean CMFs turned the CH4-shaped bands red: pink water), its hit shaded with the BRDF of the
+// surface on screen (lit_radiance: GGX + energy-compensated diffuse + ambient specular): the sun with the ray's
+// visibility, the radiance cache's band irradiance split over its g-points; the air path per g-point.
+__device__ float3 sec_reflect_xyz(const SParams& sp, float4 o4, uint4 r, float4 h4) {
+    const AtmoParams& P = sp.a;
+    const float3 d = oct_unpack(r.x);
+    const int kind = (int)((r.y >> 4) & 15u);
+    if (kind == HK_NONE) return spec_sky_xyz(P, d.x, d.y, d.z);
+    if (kind == HKX_WATER) return spec_sky_xyz(P, d.x, fmaxf(-d.y, 0.01f), d.z) * spec_fresnel(fmaxf(-d.y, 1e-3f), WATER_N);
+    const float3 pos = f3(o4.x, o4.y, o4.z) + d * h4.x;
+    Lit M;
+    M.n = oct_unpack(r.z);
+    const uint32_t mp = r.w;
+    M.m0 = mp & 15u; M.m1 = (mp >> 4) & 15u; M.w1 = ((mp >> 8) & 63u) / 63.f; M.pal = (mp >> 14) & 15u;
+    M.bright = 0.88f + 0.12f * ((mp >> 18) & 63u) / 63.f;
+    M.steep = sat((0.9f - M.n.y) * 5.f);
+    M.wet = 0.f;
+    M.wb = (float)((r.y >> 16) & 255u) * (1.f / 255.f);
+    M.cover = (float)((r.y >> 24) & 31u) * (1.f / 31.f);
+    M.under = false; M.gi = 1; M.caus = 1.f; M.tw = 0.f; M.tamb = 0.f; M.ao = 1.f; M.depth = 0.f;
+    M.tavg = kind == HK_TERRAIN || kind == HK_LOD || kind == HK_FAR;
+    const float vq = (r.y & SF_VIS) ? (float)((r.y >> 13) & 7u) * (1.f / 7.f) : 0.f;
+    M.vis = sp.furnace ? 0.f : vq * sat(0.5f + sp.sun.y / (2.f * P.sun_theta));
+    const float2 cs = spec_columns(P, fmaxf(pos.y - g_tc.yw, 0.f), sp.sun.y);
+    M.As = cs.x; M.Hs = cs.y;
+    sec_cache_irr(sp, pos, M.n, M.egi);
+    lit_setup(sp, M, f3(-d.x, -d.y, -d.z), sp.sun);
+    float A = 0.f, Hz = 0.f;
+    if (!sp.furnace) air_cols(P, fmaxf(o4.y - g_tc.yw, 0.f), d.y, h4.x, A, Hz);
+    const SkyTap tap = sky_tap(P, d);
+    float X = 0.f, Y = 0.f, Z = 0.f;
+    for (int b = 0; b < SPEC_NB; ++b) {
+        const float rho = lit_rho(sp, M, b);
+#pragma unroll 1
+        for (int j = 0; j < SPEC_GPB; ++j) {
+            const int g = b * SPEC_GPB + j;
+            float L = lit_radiance(sp, M, g, b, rho, 0.f, 1.f, 1.f);
+            if (!sp.furnace) {
+                const float T = __expf(-A * P.g_a[g] - Hz * P.g_b[g]);
+                L = L * T + sky_g(P, tap, g) * (1.f - T);           // in-scatter ~ the sky along the ray
+            }
+            X += L * P.g_cmf[g][0]; Y += L * P.g_cmf[g][1]; Z += L * P.g_cmf[g][2];
+        }
+    }
+    return f3(X, Y, Z);
+}
+
 // Radiance per band (band-integrated, W m^-2 sr^-1) arriving back along a secondary
 // ray: the sky on a miss; the water surface's Fresnel sky reflection; at a surface
 // rho / pi (sun NEE with the ray's visibility + the radiance cache's irradiance, or
@@ -1956,31 +2199,7 @@ __device__ void sec_radiance(const SParams& sp, float4 o4, uint4 r, float4 h4, b
         for (int g = 0; g < SPEC_NG; ++g) es[g / SPEC_GPB] += P.g_e[g] * __expf(-cs.x * P.g_a[g] - cs.y * P.g_b[g]) * f;
     }
     float ec[SPEC_NB];
-    bool have = false;
-    if (!nee_only) {
-        const float3 dc = pos - sp.k.o;
-        if (sp.cache.meta) {
-            uint32_t slot, key;
-            gi_cache_cell(g_tc.cx, g_tc.cy, g_tc.cz, pos.x, pos.y, pos.z, n.x, n.y, n.z, sqrtf(dot3(dc, dc)), &slot, &key);
-            have = gi_cache_get(sp.cache, slot, key, ec);
-            const unsigned m = __activemask(), nh = __popc(__ballot_sync(m, have));   // statistics, one atomic pair per warp
-            if ((int)(threadIdx.x & 31u) == __ffs(m) - 1) {
-                atomicAdd(&sp.fs->cache_lookups, (unsigned long long)__popc(m));
-                atomicAdd(&sp.fs->cache_hits, (unsigned long long)nh);
-            }
-        }
-        if (!have) {                                        // no cell yet: half the sky SH irradiance
-            float Y[9];
-            sh_basis(n, Y);
-#pragma unroll
-            for (int b = 0; b < SPEC_NB; ++b) {
-                float s = 0.f;
-#pragma unroll
-                for (int j = 0; j < SPEC_GPB; ++j) s += sh_irr(P.sh + 9 * (b * SPEC_GPB + j), Y);
-                ec[b] = 0.5f * s;
-            }
-        }
-    }
+    if (!nee_only) sec_cache_irr(sp, pos, n, ec);          // the radiance cache, else half the sky SH irradiance
 #pragma unroll
     for (int b = 0; b < SPEC_NB; ++b) L[b] = rho[b] * 0.31830989f * (es[b] + (nee_only ? 0.f : ec[b]));
     if (type != ST_GI && !sp.furnace) {                     // reflection rays: the air path (transmittance, in-scatter ~ the sky)
@@ -2026,6 +2245,12 @@ __global__ void __launch_bounds__(128) k_sec_shade(const __grid_constant__ SPara
         bool surf;
         if (!sp.ref) {
             if (!(r.y & SF_ACTIVE)) continue;
+            if (!is_gi) {                                   // the reflection: XYZ per g-point, the surface's own BRDF
+                const float3 xr = sec_reflect_xyz(sp, sb.o[slot], r, sb.h[slot]);
+                R[0] = xr.x; R[1] = xr.y; R[2] = xr.z;
+                has_r = true;
+                continue;
+            }
             sec_radiance(sp, sb.o[slot], r, sb.h[slot], false, L, rho, n, pos, surf);
         } else {
             if (!(r.y & SF_PATH)) continue;
@@ -2059,9 +2284,9 @@ __global__ void __launch_bounds__(128) k_sec_shade(const __grid_constant__ SPara
 #pragma unroll
             for (int b = 0; b < SPEC_NB; ++b) E[b] += L[b];
             ++ngi;
-        } else {
-#pragma unroll
-            for (int b = 0; b < SPEC_NB; ++b) R[b] = L[b];
+        } else {                                            // reference reflection paths (bands) -> XYZ
+            const float3 xr = bands_xyz_g(sp, L);
+            R[0] = xr.x; R[1] = xr.y; R[2] = xr.z;
             has_r = true;
         }
     }
@@ -2093,7 +2318,7 @@ __global__ void k_white(const __grid_constant__ SParams sp) {
     FrameState* fs = sp.fs;
     const int g = threadIdx.x;
     __shared__ float sw[3][SPEC_NG];
-    __shared__ float seup[SPEC_NG];
+    __shared__ float seup[SPEC_NG], sglob[SPEC_NG];
     if (g < SPEC_NG) {
         float Y[9];
         sh_basis(f3(0.f, 1.f, 0.f), Y);
@@ -2104,14 +2329,16 @@ __global__ void k_white(const __grid_constant__ SParams sp) {
         fs->esun0[g] = P.g_e[g] * __expf(-c0.x * P.g_a[g] - c0.y * P.g_b[g]);
         const float2 cc = spec_columns(P, sp.cam_h, sp.sun.y);
         const float e = P.g_e[g] * __expf(-cc.x * P.g_a[g] - cc.y * P.g_b[g]) * fmaxf(sp.sun.y, 0.f) + eup;
+        sglob[g] = e;
         for (int c = 0; c < 3; ++c) sw[c][g] = e * P.g_cmf[g][c];
     }
     __syncthreads();
     if (g < SPEC_NG) {                                  // M4: the band's sky irradiance split over its g-points (GI is 8 bands)
         const int b0 = (g / SPEC_GPB) * SPEC_GPB;
-        float s = 0.f;
-        for (int j = 0; j < SPEC_GPB; ++j) s += seup[b0 + j];
+        float s = 0.f, sg = 0.f;
+        for (int j = 0; j < SPEC_GPB; ++j) { s += seup[b0 + j]; sg += sglob[b0 + j]; }
         fs->gsplit[g] = s > 1e-20f ? seup[g] / s : 1.f / (float)SPEC_GPB;
+        fs->gglob[g] = sg > 1e-20f ? sglob[g] / sg : 1.f / (float)SPEC_GPB;
     }
     if (g != 0) return;
     float w[3] = { 0.f, 0.f, 0.f };
@@ -2191,7 +2418,8 @@ __device__ float3 sky_xyz_full(const SParams& sp, float3 d) {
 }
 
 // M4: the traced reflection at internal pixel (x, y) (surface class cls) as XYZ
-// (no 683): full res, or the half-res samples of the same class, bilinear
+// (no 683; k_sec_shade stores XYZ in channels 0-2): full res, or the half-res
+// samples of the same class, bilinear
 __device__ bool refl_xyz(const SParams& sp, int x, int y, int cls, float3& xyz) {
     if (!sp.refl || !sp.refl_buf) return false;
     float R[SPEC_NB];
@@ -2223,14 +2451,7 @@ __device__ bool refl_xyz(const SParams& sp, int x, int y, int cls, float3& xyz) 
 #pragma unroll
         for (int b = 0; b < SPEC_NB; ++b) R[b] /= ws;
     }
-    const ShadeTab* T = sp.tab;
-    float X = 0.f, Y = 0.f, Z = 0.f;
-#pragma unroll
-    for (int b = 0; b < SPEC_NB; ++b) {
-        const float l = R[b] * (1.f / (float)SPEC_BW);
-        X += l * __ldg(&T->cmf_band[b][0]); Y += l * __ldg(&T->cmf_band[b][1]); Z += l * __ldg(&T->cmf_band[b][2]);
-    }
-    xyz = f3(X, Y, Z);
+    xyz = f3(R[0], R[1], R[2]);
     return true;
 }
 // band irradiances (8 bands) -> XYZ (no 683) of a white Lambertian surface lit by them (debug view)
@@ -2260,12 +2481,14 @@ __device__ float caustic(const SParams& sp, float3 pos, float depth, float foot)
     const int32_t bx = g_tc.cx >> 10, bz = g_tc.cz >> 10;
     const float pn = 2.6f * vnoise(ax * (1.f / 64.f), az * (1.f / 64.f), bx * 512, bz * 512) +
                      1.3f * vnoise(ax * (1.f / 16.f), az * (1.f / 16.f), bx * 2048 + 7919, bz * 2048);
-    const float pm[WAVES] = { 0.7f, -1.1f, 1.5f, -0.9f, 1.3f, -1.6f, 1.0f, -1.4f };
     float hxx = 0.f, hzz = 0.f, hxz = 0.f;               // eta = sum A sin(phase), A = s / k
-#pragma unroll
+#pragma unroll 4
     for (int i = 0; i < WAVES; ++i) {
         const float f = sat(1.5f - 0.02f * D * sp.w.k[i]) * sat(2.f - 1.2732395f * foot * sp.w.k[i]);
-        const float a = sp.w.s[i] * f / sp.w.k[i] * __sinf(sp.w.kx[i] * ps.x + sp.w.kz[i] * ps.z + sp.w.off[i] + pn * pm[i]);
+        if (f <= 0.f) break;                             // sorted by k: the shorter ones are blurred out too
+        float ph = sp.w.kx[i] * ps.x + sp.w.kz[i] * ps.z + sp.w.off[i] + pn * sp.w.pm[i];
+        ph -= 6.2831853f * rintf(ph * 0.15915494f);
+        const float a = sp.w.s[i] * f / sp.w.k[i] * __sinf(ph);
         hxx -= a * sp.w.kx[i] * sp.w.kx[i];
         hzz -= a * sp.w.kz[i] * sp.w.kz[i];
         hxz -= a * sp.w.kx[i] * sp.w.kz[i];
@@ -2276,7 +2499,7 @@ __device__ float caustic(const SParams& sp, float3 pos, float depth, float foot)
 }
 
 // k_compose: spectral shading of the G-buffer -> linear sRGB (white-balanced, unexposed)
-__global__ void __launch_bounds__(128) k_compose(const __grid_constant__ SParams sp, GBuf gb) {
+__global__ void __launch_bounds__(128, 4) k_compose(const __grid_constant__ SParams sp, GBuf gb) {
     const KParams& p = sp.k;
     const AtmoParams& P = sp.a;
     const ShadeTab* T = sp.tab;
@@ -2387,7 +2610,7 @@ __global__ void __launch_bounds__(128) k_compose(const __grid_constant__ SParams
         X = s.x; Y = s.y; Z = s.z;
     } else {
         Lit L;
-        L.under = false; L.wet = 0.f; L.wb = 0.f; L.gi = 0; L.caus = 1.f;
+        L.under = false; L.wet = 0.f; L.wb = 0.f; L.gi = 0; L.caus = 1.f; L.tavg = 0;
         L.cover = 0.f; L.tw = 0.f; L.tamb = 0.f; L.sheen = 0.f;
         float3 vdir = d2;
         float rfl_w = 0.f;                                 // weight of the traced reflection (wet film, ice)
@@ -2429,6 +2652,7 @@ __global__ void __launch_bounds__(128) k_compose(const __grid_constant__ SParams
                 gi_unpack8(sp.efull[i], L.egi);
                 if (L.egi[0] >= 0.f) { L.gi = 1; if (kind != HK_CROWN) L.ao = 1.f; }
             }
+            L.tavg = (b.y & GF_TERRAIN) ? 1 : 0;           // terrain: a view-independent ambient specular (lit_setup)
             // M5 leaves: a crown is a leaf-area medium for its light: the sun reaches a crown point through the own
             // crown (k_surface: e^-(sigma chord)), reflected on the sunny side, transmitted (tau / pi, spec 4.6) where
             // the sun is behind; kelp blades transmit (two-sided, cosine) under water
@@ -2467,6 +2691,18 @@ __global__ void __launch_bounds__(128) k_compose(const __grid_constant__ SParams
         SkyTap tap;
         const bool sky_below = !hit && wm == WM_UNDER_OUT;   // the sky through the Snell window
         if (sky_below) tap = sky_tap(P, d2);
+        // ... and the stellar disc in it (limb darkened, through the atmosphere from the surface up), like a primary
+        // sky ray above the water; the waves' normals break it into glints
+        float disc_f = 0.f;
+        float2 dcol = make_float2(0.f, 0.f);
+        if (sky_below && !sp.furnace && sp.sun.y > 0.f) {
+            const float cd = dot3(d2, sp.sun);
+            if (cd > cosf(P.sun_theta)) {
+                const float rr = acosf(fminf(cd, 1.f)) / P.sun_theta, mu = sqrtf(fmaxf(0.f, 1.f - rr * rr));
+                disc_f = (0.4f + 0.6f * mu) / (0.8f * 3.14159265f * P.sun_theta * P.sun_theta);
+                dcol = spec_columns(P, 0.f, d2.y);
+            }
+        }
         float tx = 0.f, ty = 0.f, tz = 0.f, wx = 0.f, wy = 0.f, wz = 0.f;
         const int dbg_band = (dbg >= RD_BAND0 && dbg < RD_BAND0 + SPEC_NB) ? dbg - RD_BAND0 : -1;
         float band_l = 0.f;
@@ -2487,12 +2723,15 @@ __global__ void __launch_bounds__(128) k_compose(const __grid_constant__ SParams
             else if (wm == WM_UNDER) s1 = water_seg_band(sp, bd, zc, d, hit ? a.x : -1.f);
             else if (wm == WM_UNDER_OUT) s1 = water_seg_band(sp, bd, zc, d, tw);
             if (wm == WM_UNDER_TIR) s2 = water_seg_band(sp, bd, zc, d, tw);
-#pragma unroll
-            for (int j = 0; j < SPEC_GPB; ++j) {
+#pragma unroll 1
+            for (int j = 0; j < SPEC_GPB; ++j) {          // not unrolled: ~19 % faster (smaller code, fewer live values)
                 const int g = bd * SPEC_GPB + j;
                 float Lg = 0.f;
                 if (hit) Lg = lit_radiance(sp, L, g, bd, rho, tau, twd, twa);
-                else if (sky_below) Lg = sky_g(P, tap, g);
+                else if (sky_below) {
+                    Lg = sky_g(P, tap, g);
+                    if (disc_f > 0.f) Lg += P.g_e[g] * __expf(-dcol.x * P.g_a[g] - dcol.y * P.g_b[g]) * disc_f;
+                }
                 const float ew0 = __ldg(&sp.fs->esun0[g]) * sp.sun_t, ed0 = 0.934f * __ldg(&sp.fs->eup[g]);
                 switch (wm) {
                 case WM_STRAIGHT:
@@ -2529,9 +2768,10 @@ __global__ void __launch_bounds__(128) k_compose(const __grid_constant__ SParams
                 float3 s;
                 if (!refl_xyz(sp, x, y, GC_WATER, s)) {
                     float3 r = d - nw * (2.f * dot3(d, nw));
-                    r.y = fmaxf(r.y, 0.01f);
+                    const float dn = r.y < 0.f ? spec_fresnel(fminf(-r.y, 1.f), WATER_N) : 1.f;   // into the next wave:
+                    r.y = fmaxf(fabsf(r.y), 0.01f);                // reflected once more (as k_sec_trace's HKX_WATER)
                     r = norm3(r);
-                    s = spec_sky_xyz(P, r.x, r.y, r.z);
+                    s = spec_sky_xyz(P, r.x, r.y, r.z) * dn;
                 }
                 xadd = xadd + s * fv;
             }
@@ -2635,7 +2875,7 @@ __global__ void __launch_bounds__(128) k_tonemap(const __grid_constant__ SParams
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= sp.ow || y >= sp.oh) return;
-    const float4 c = sp.taa[(size_t)y * sp.ow + x];
+    const float4 c = taa_ld(sp.taa, (size_t)y * sp.ow + x);
     float r = c.x, g = c.y, b = c.z;
     if (c.w >= 0.f) spec_agx(&r, &g, &b);
     if (sp.debug == RD_AGE && c.w >= 0.f) {             // red 1 frame, yellow 2, green 3-7, blue >= 8 (on the image's grey)
@@ -2917,14 +3157,25 @@ __global__ void k_furnace_sky(float* sv, float* sh, const float* L) {
 }
 
 #define RB_SLOTS 2                       // frames in flight: the asynchronous readback (spec 6.1)
+// One frame in flight. The kernels of frame N write the slot's own device frame
+// (d_px) and a snapshot of the frame state (d_fs) on the render stream; the copy
+// stream then reads both back into pinned host memory while frame N + 1's
+// kernels run (the copy engine overlaps the SMs). The slot is reused two frames
+// later, after harvest() has waited for its copy.
 struct FrameSlot {
     uint32_t*   h_px;                    // pinned output frame
+    uint32_t*   d_px;                    // device output frame (k_tonemap / k_render write it)
     FrameState* h_fs;                    // pinned FrameState readback
+    FrameState* d_fs;                    // device snapshot of the frame state (the next frame's kernels write r->d_fs)
+    TCtx*       h_tc;                    // pinned tracer context staging (an async copy from pageable memory may sync)
     uint8_t*    h_stage;                 // pinned scatter staging (page + tile entries)
     size_t      px_cap, stage_cap;
-    cudaEvent_t ev[RENDER_PERF_STAGES];  // stage boundaries (ev[RS_TOTAL] = the end)
-    cudaEvent_t done;                    // after the frame's last command (the world's fence)
-    int         pending, ow, oh, smooth;
+    cudaEvent_t ev[RENDER_PERF_STAGES];  // stage boundaries (ev[RS_TOTAL] = the end of the readback, copy stream)
+    cudaEvent_t kdone;                   // after the frame's last kernel (the world's fence; the copy waits for it)
+    cudaEvent_t done;                    // after the frame's readback (copy stream)
+    int         pending;                 // queued, not yet harvested
+    int         has_frame;               // h_px holds (or will hold, once harvested) a frame of ow x oh
+    int         ow, oh, smooth;
 };
 
 // preset of a frame (spec 6.2, M4)
@@ -2942,8 +3193,7 @@ struct Preset {
 };
 
 struct Renderer {
-    size_t        cap, ocap, hcap;       // internal, output, half-res pixels allocated
-    uint32_t*     d_px;                  // output BGRA (ocap)
+    size_t        cap, ocap, hcap, tcap; // internal, output, half-res, TAA history pixels allocated
     GmePageEntry* d_page;
     size_t        page_bytes;
     uint32_t*     d_tile_tag;
@@ -2951,6 +3201,7 @@ struct Renderer {
     uint8_t*      d_scatter;
     size_t        scatter_cap;
     cudaStream_t  stream;
+    cudaStream_t  cstream;               // readback copies (overlap the next frame's kernels)
     FrameSlot     slot[RB_SLOTS];
     uint32_t      nq;                    // frames queued
     int           sync;                  // renderer_set_sync
@@ -2962,6 +3213,7 @@ struct Renderer {
     short2*       d_farB[GME_FAR_LEVELS];
     int*          d_farmax;                 // [0], [1] level max (q4, absolute), [2] near-walk ceiling (m, absolute)
     int           far_ok;                   // allocated
+    int           far_tried;                // alloc_far ran (renderer_create for a smooth start, else the first smooth frame)
     int           far_built[GME_FAR_LEVELS];
     int32_t       far_c[GME_FAR_LEVELS][2]; // camera sample of the built window
     uint32_t      far_seed;
@@ -2996,9 +3248,9 @@ struct Renderer {
     SecBuf        sb;                       // secondary ray slots
     size_t        sb_cap;
     int           sb_ref;                   // throughput / radiance allocated
-    float4*       d_taa[2];                 // resolved output history (ocap)
+    TaaPx*        d_taa[2];                 // resolved output history, RGBA16F (tcap)
     float4*       d_accum;                  // reference accumulation (ocap)
-    GiPipe*       gi;
+    GiPipe*       gi;                       // allocated with the first smooth frame when the session starts in classic
     unsigned long long* d_dacc;             // renderer_disocc counters
     // temporal state
     int           hpar;                     // buffer parity of the last frame
@@ -3017,9 +3269,10 @@ struct Renderer {
     float*        d_fsky;                   // [SV_H][SV_W][NG]
     float*        d_fsh;                    // [NG][9]
     float*        d_fL;                     // [NG]
-    // --perf samples: RENDER_PERF_STAGES floats per frame
+    // --perf samples: a ring of the last RENDER_PERF_RING frames, RENDER_PERF_STAGES floats each (bounded:
+    // an interactive session runs for hours)
     float*        perf;
-    uint32_t      perf_n, perf_cap;
+    uint32_t      perf_n, perf_head;
     float         last[RENDER_PERF_STAGES];
     // the last frame, for --metrics and the probe
     SParams       lastp;
@@ -3055,15 +3308,18 @@ static void free_sec(Renderer* r) {
     r->sb_ref = 0;
 }
 
-// Buffers of frames with internal size iw x ih and output size ow x oh: grown
-// when needed (the stream is drained first); the temporal histories restart.
-// sec_slots / refl_px: secondary ray slots and reflection samples this preset needs.
-static int ensure_buffers(Renderer* r, int iw, int ih, int ow, int oh, size_t sec_slots, int sec_ref, size_t refl_px) {
+// Buffers of frames with internal size iw x ih (0 x 0: classic, which needs only
+// the output frames) and output size ow x oh, taa: the output-resolution TAA
+// history (smooth path): grown when needed (the streams are drained first); the
+// temporal histories restart. sec_slots / refl_px: secondary ray slots and
+// reflection samples this preset needs.
+static int ensure_buffers(Renderer* r, int iw, int ih, int ow, int oh, int taa, size_t sec_slots, int sec_ref, size_t refl_px) {
     const size_t px = (size_t)iw * ih, opx = (size_t)ow * oh, hpx = (size_t)((iw + 1) / 2) * ((ih + 1) / 2);
-    const bool grow_i = px > r->cap, grow_o = opx > r->ocap, grow_h = hpx > r->hcap;
+    const bool grow_i = px > r->cap, grow_o = opx > r->ocap, grow_h = hpx > r->hcap, grow_t = taa && opx > r->tcap;
     const bool grow_s = sec_slots > r->sb_cap || (sec_ref && !r->sb_ref), grow_r = refl_px > r->refl_cap;
-    if (!grow_i && !grow_o && !grow_h && !grow_s && !grow_r) return 0;
-    if (rck(cudaStreamSynchronize(r->stream), "sync before allocation")) return -1;
+    if (!grow_i && !grow_o && !grow_h && !grow_t && !grow_s && !grow_r) return 0;
+    if (rck(cudaStreamSynchronize(r->stream), "sync before allocation") || rck(cudaStreamSynchronize(r->cstream), "sync before allocation"))
+        return -1;
     r->hist_valid = 0;
     if (grow_i) {
         const size_t n = px > r->cap ? px : r->cap;
@@ -3083,18 +3339,23 @@ static int ensure_buffers(Renderer* r, int iw, int ih, int ow, int oh, size_t se
         for (int k = 0; k < RB_SLOTS; ++k) {
             FrameSlot& S = r->slot[k];
             if (S.pending) { cudaEventSynchronize(S.done); S.pending = 0; }
+            S.has_frame = 0;                            // its frame is gone with the buffer
             cudaFreeHost(S.h_px);
             S.h_px = NULL;
-            if (rck(cudaHostAlloc(&S.h_px, n * 4, cudaHostAllocDefault), "alloc frame")) { r->ocap = 0; return -1; }
+            S.px_cap = 0;
+            if (rck(cudaHostAlloc(&S.h_px, n * 4, cudaHostAllocDefault), "alloc frame") || dalloc(&S.d_px, n, "alloc frame")) {
+                r->ocap = 0;
+                return -1;
+            }
             S.px_cap = n;
-        }
-        if (dalloc(&r->d_px, n, "alloc frame") || dalloc(&r->d_taa[0], n, "alloc TAA history") || dalloc(&r->d_taa[1], n, "alloc TAA history")) {
-            r->ocap = 0;
-            return -1;
         }
         cudaFree(r->d_accum);                           // the reference accumulation: allocated with its first frame
         r->d_accum = NULL;
         r->ocap = n;
+    }
+    if (grow_t) {                                       // RGBA16F history (spec 6.3), smooth frames only
+        if (dalloc(&r->d_taa[0], opx, "alloc TAA history") || dalloc(&r->d_taa[1], opx, "alloc TAA history")) { r->tcap = 0; return -1; }
+        r->tcap = opx;
     }
     if (grow_h) {
         const size_t n = hpx;
@@ -3178,12 +3439,32 @@ static void preset_needs(const Preset& p, int iw, int ih, size_t* slots, int* re
     *refl = p.refl == 2 ? px : (p.refl == 1 ? hp : 0);
 }
 
+// internal render size of the smooth path for output w x h at render scale s (renderer_draw)
+static void internal_size(int w, int h, float s, int* iw, int* ih) {
+    *iw = w; *ih = h;
+    if (s >= 1.f) return;
+    int x = (int)((float)w * s + 0.5f), y = (int)((float)h * s + 0.5f);
+    const int mx = w < 64 ? w : 64, my = h < 36 ? h : 36;
+    x = x < mx ? mx : (x > w ? w : x);
+    y = y < my ? my : (y > h ? h : y);
+    *iw = x; *ih = y;
+}
+
+// the smooth path's fixed parts: the radiance cache (gi.cu) and the far-field clipmap. Allocated by
+// renderer_create for a smooth start, else with the first smooth frame (after world_create: a classic session
+// keeps the pre-upgrade renderer's footprint, spec 6.4)
+static void alloc_smooth_fixed(Renderer* r) {
+    if (!r->gi) r->gi = gi_create();
+    if (!r->far_tried) { r->far_tried = 1; alloc_far(r); }
+}
+
 extern "C" Renderer* renderer_create(const RendererConfig* cfg) {
     Renderer* r = (Renderer*)calloc(1, sizeof(Renderer));
     if (!r) return NULL;
     int prio_least = 0, prio_greatest = 0;          // the render stream gets the greatest priority (spec 6.1)
     if (rck(cudaDeviceGetStreamPriorityRange(&prio_least, &prio_greatest), "stream priorities") ||
         rck(cudaStreamCreateWithPriority(&r->stream, cudaStreamNonBlocking, prio_greatest), "stream") ||
+        rck(cudaStreamCreateWithPriority(&r->cstream, cudaStreamNonBlocking, prio_greatest), "copy stream") ||
         rck(cudaMalloc(&r->d_acc, sizeof(unsigned long long) * MT_COUNT), "alloc metrics") ||
         rck(cudaMalloc(&r->d_dacc, sizeof(unsigned long long) * GI_DISOCC_N), "alloc metrics")) {
         renderer_destroy(r);
@@ -3193,42 +3474,50 @@ extern "C" Renderer* renderer_create(const RendererConfig* cfg) {
         for (int i = 0; i < RENDER_PERF_STAGES; ++i)
             if (rck(cudaEventCreate(&r->slot[k].ev[i]), "event")) { renderer_destroy(r); return NULL; }
         if (rck(cudaEventCreateWithFlags(&r->slot[k].done, cudaEventDisableTiming), "event") ||
-            rck(cudaHostAlloc(&r->slot[k].h_fs, sizeof(FrameState), cudaHostAllocDefault), "alloc frame state")) {
+            rck(cudaEventCreateWithFlags(&r->slot[k].kdone, cudaEventDisableTiming), "event") ||
+            rck(cudaHostAlloc(&r->slot[k].h_fs, sizeof(FrameState), cudaHostAllocDefault), "alloc frame state") ||
+            rck(cudaHostAlloc(&r->slot[k].h_tc, sizeof(TCtx), cudaHostAllocDefault), "alloc tracer context")) {
             renderer_destroy(r);
             return NULL;
         }
     }
     r->last_slot = -1;
-    // every fixed buffer of the starting preset now (spec 6.3: before world_create)
-    if (cfg && cfg->max_w > 0 && cfg->max_h > 0) {
+    // every fixed buffer of the starting preset now (spec 6.3: before world_create), sized from its internal
+    // resolution (Low and --scale < 1 render smaller; Ref, High's extra buffers and a larger scale grow
+    // lazily). A classic start allocates nothing here: its pool is sized as before the upgrade (spec 6.4), and
+    // the first smooth frame (key V / K) allocates what it needs.
+    if (cfg && cfg->max_w > 0 && cfg->max_h > 0 && cfg->quality != RQ_CLASSIC) {
         RenderCamera c;
         memset(&c, 0, sizeof c);
-        c.quality = cfg->quality == RQ_CLASSIC ? RQ_MEDIUM : cfg->quality;
+        c.quality = cfg->quality;
+        c.scale = cfg->scale;
         const Preset p = preset_of(&c);
-        const int iw = (int)(cfg->max_w * p.scale), ih = (int)(cfg->max_h * p.scale);
+        int iw, ih;
+        internal_size(cfg->max_w, cfg->max_h, p.scale, &iw, &ih);
         size_t slots, refl;
         int ref;
-        preset_needs(p, cfg->max_w, cfg->max_h, &slots, &ref, &refl);
-        if (ensure_buffers(r, cfg->max_w > iw ? cfg->max_w : iw, cfg->max_h > ih ? cfg->max_h : ih, cfg->max_w, cfg->max_h, slots, ref, refl)) {
+        preset_needs(p, iw, ih, &slots, &ref, &refl);
+        if (ensure_buffers(r, iw, ih, cfg->max_w, cfg->max_h, 1, slots, ref, refl)) {
             renderer_destroy(r);
             return NULL;
         }
+        alloc_smooth_fixed(r);
     }
-    r->gi = gi_create();
-    alloc_far(r);
     return r;
 }
 
 extern "C" void renderer_destroy(Renderer* r) {
     if (!r) return;
     if (r->stream) cudaStreamSynchronize(r->stream);
+    if (r->cstream) cudaStreamSynchronize(r->cstream);
     for (int k = 0; k < RB_SLOTS; ++k) {
         FrameSlot& S = r->slot[k];
-        cudaFreeHost(S.h_px); cudaFreeHost(S.h_fs); cudaFreeHost(S.h_stage);
+        cudaFreeHost(S.h_px); cudaFreeHost(S.h_fs); cudaFreeHost(S.h_stage); cudaFreeHost(S.h_tc);
+        cudaFree(S.d_px); cudaFree(S.d_fs);
         for (int i = 0; i < RENDER_PERF_STAGES; ++i) if (S.ev[i]) cudaEventDestroy(S.ev[i]);
         if (S.done) cudaEventDestroy(S.done);
+        if (S.kdone) cudaEventDestroy(S.kdone);
     }
-    cudaFree(r->d_px);
     cudaFree(r->d_page);
     cudaFree(r->d_tile_tag);
     cudaFree(r->d_scatter);
@@ -3258,6 +3547,7 @@ extern "C" void renderer_destroy(Renderer* r) {
     cudaFree(r->d_probe);
     atmo_destroy(r->atmo);
     if (r->stream) cudaStreamDestroy(r->stream);
+    if (r->cstream) cudaStreamDestroy(r->cstream);
     free(r->perf);
     free(r);
 }
@@ -3296,6 +3586,8 @@ static void host_cat_ee(const SpectralAtmo* a, float out[9]) {
 }
 
 extern "C" int renderer_set_atmo(Renderer* r, const SpectralAtmo* a) {
+    if (r->stream) cudaStreamSynchronize(r->stream);   // (a lazy build after classic frames: nothing in flight reads these)
+    if (r->cstream) cudaStreamSynchronize(r->cstream);
     atmo_destroy(r->atmo);
     r->atmo = atmo_create(a);
     if (!r->atmo) return -1;
@@ -3304,6 +3596,8 @@ extern "C" int renderer_set_atmo(Renderer* r, const SpectralAtmo* a) {
     memcpy(t->rho, a->mat_rho, sizeof t->rho);
     memcpy(t->alpha, a->mat_alpha, sizeof t->alpha);
     memcpy(t->ior, a->mat_ior, sizeof t->ior);
+    t->alpha[MATX_SOILMAT] = t->alpha[MAT_MAT];         // a mat on soil: the mat's optics (mat_rho blends its ground)
+    t->ior[MATX_SOILMAT] = t->ior[MAT_MAT];
     memcpy(t->pyrite_f0, a->pyrite_f0, sizeof t->pyrite_f0);
     memcpy(t->e_lut, a->e_lut, sizeof t->e_lut);
     memcpy(t->e_avg, a->e_avg, sizeof t->e_avg);
@@ -3328,28 +3622,60 @@ extern "C" int renderer_set_atmo(Renderer* r, const SpectralAtmo* a) {
               rck(cudaMalloc(&r->d_hist, sizeof(unsigned int) * HIST_BINS), "histogram") ||
               rck(cudaMemset(r->d_hist, 0, sizeof(unsigned int) * HIST_BINS), "histogram") ||
               rck(cudaMalloc(&r->d_probe, sizeof(ProbeOut)), "probe");
+    for (int k = 0; k < RB_SLOTS && !bad; ++k)          // per-slot snapshots of the frame state (asynchronous readback)
+        bad = rck(cudaMalloc(&r->slot[k].d_fs, sizeof(FrameState)), "frame state") ||
+              rck(cudaMemset(r->slot[k].d_fs, 0, sizeof(FrameState)), "frame state");
     free(t);
     if (bad) return -1;
-    // Gerstner waves (spec 3.6): 8 waves of 20 m .. 0.3 m, spread about a 5 m/s wind,
-    // deep-water dispersion with the planet's gravity; slope variance of the resolved
-    // waves ~60 % of Cox & Munk's 0.003 + 0.00512 U, the rest is the capillary roughness
-    // irregular wavelengths and a wide, alternating spread (8 parallel waves read
-    // as a woven pattern); the longest waves are gentler (fetch-limited sea)
-    static const float lfac[WAVES]   = { 1.0f, 0.93f, 1.08f, 0.95f, 1.06f, 0.92f, 1.05f, 1.0f };
-    static const float spread[WAVES] = { 0.0f, 0.85f, -0.65f, 1.35f, -1.15f, 0.35f, -1.45f, 1.05f };
-    static const float slope[WAVES]  = { 0.035f, 0.05f, 0.06f, 0.065f, 0.065f, 0.06f, 0.055f, 0.05f };
-    static const float phase0[WAVES] = { 0.0f, 1.7f, 3.1f, 4.6f, 2.2f, 5.5f, 0.9f, 3.8f };
-    const double grav = a->g > 0 ? a->g : 9.81;
+    // Gerstner waves (spec 3.6): 8 bands of 20 m .. 0.3 m about a 5 m/s wind, deep-water dispersion with the
+    // planet's gravity; slope variance of the resolved waves ~60 % of Cox & Munk's 0.003 + 0.00512 U, the rest
+    // is the capillary roughness; the longest waves are gentler (fetch-limited sea). Each band is WAVE_PER
+    // components (a stochastic directional spectrum): wavelengths spread over the band (log-uniform, jittered),
+    // directions stratified over +-100 deg about the wind and weighted by cos^2s((theta - wind) / 2) (s 6 for the
+    // longest band down to 1.5: short waves are more isotropic), random phases; the weights sum to the band's
+    // slope variance. A fixed seed: the sea is the same in every run.
+    static const float slope[WAVE_BANDS] = { 0.035f, 0.05f, 0.06f, 0.065f, 0.065f, 0.06f, 0.055f, 0.05f };
+    const double grav = a->g > 0 ? a->g : 9.81, PI2 = 6.283185307179586;
+    const double oct = log2(20.0 / 0.3) / (WAVE_BANDS - 1);             // band spacing in octaves
+    uint32_t rs = 0x9E3779B9u;
+    struct WaveC { double k, th, s, ph, pm; } wc[WAVES];
+    for (int b = 0; b < WAVE_BANDS; ++b) {
+        const double lam_b = 20.0 * pow(0.3 / 20.0, b / (double)(WAVE_BANDS - 1));
+        const double sexp = 6.0 - 4.5 * b / (double)(WAVE_BANDS - 1);  // spreading exponent s
+        double wsum = 0, wt[WAVE_PER];
+        int perm[WAVE_PER];                                               // directions in a shuffled order vs wavelengths
+        for (int j = 0; j < WAVE_PER; ++j) perm[j] = j;
+        for (int j = WAVE_PER - 1; j > 0; --j) { rs = rs * 1664525u + 1013904223u; const int q = (int)((rs >> 8) % (uint32_t)(j + 1)); const int t = perm[j]; perm[j] = perm[q]; perm[q] = t; }
+        for (int j = 0; j < WAVE_PER; ++j) {
+            double u5[5];
+            for (int q = 0; q < 5; ++q) { rs = rs * 1664525u + 1013904223u; u5[q] = (double)(rs >> 8) * (1.0 / 16777216.0); }
+            const double u = ((j + 0.5) / WAVE_PER - 0.5) + 0.8 / WAVE_PER * (u5[0] - 0.5);
+            const double lam = lam_b * pow(2.0, -u * oct);
+            const double dth = 1.75 * (((perm[j] + 0.5) / WAVE_PER - 0.5) * 2.0 + 1.6 / WAVE_PER * (u5[1] - 0.5));
+            WaveC& c = wc[b * WAVE_PER + j];
+            c.k = PI2 / lam;
+            c.th = 0.7 + dth;
+            c.ph = PI2 * u5[2];
+            c.pm = (u5[3] < 0.5 ? -1.0 : 1.0) * (0.6 + 2.0 * fabs(u5[3] - 0.5));
+            wt[j] = pow(fmax(cos(0.5 * dth), 0.0), 2.0 * sexp) * (0.6 + 0.8 * u5[4]);
+            wsum += wt[j];
+        }
+        for (int j = 0; j < WAVE_PER; ++j) wc[b * WAVE_PER + j].s = slope[b] * sqrt(wt[j] / wsum);
+    }
+    for (int i = 1; i < WAVES; ++i)                       // ascending wave number: the shaders stop at the first faded one
+        for (int j = i; j > 0 && wc[j].k < wc[j - 1].k; --j) { const WaveC t = wc[j]; wc[j] = wc[j - 1]; wc[j - 1] = t; }
+    double tail = 0;
+    for (int i = WAVES - 1; i >= 0; --i) { tail += 0.5 * wc[i].s * wc[i].s; r->waves.tail[i] = (float)tail; }
     for (int i = 0; i < WAVES; ++i) {
-        const double lam = 20.0 * pow(0.3 / 20.0, i / (double)(WAVES - 1)) * lfac[i];
-        const double k = 2.0 * 3.14159265358979 / lam, th = 0.7 + spread[i];
+        const double k = wc[i].k, th = wc[i].th;
         r->waves.k[i] = (float)k;
         r->waves.dx[i] = (float)cos(th); r->waves.dz[i] = (float)sin(th);
         r->waves.kx[i] = (float)(k * cos(th)); r->waves.kz[i] = (float)(k * sin(th));
-        r->waves.s[i] = slope[i];
+        r->waves.s[i] = (float)wc[i].s;
         r->waves.q[i] = 0.35f;
+        r->waves.pm[i] = (float)wc[i].pm;
         r->w_omega[i] = sqrt(grav * k);
-        r->w_phi[i] = phase0[i];
+        r->w_phi[i] = wc[i].ph;
     }
     r->waves.alpha0 = 0.1f;
     memset(&r->h_fs, 0, sizeof r->h_fs);
@@ -3434,8 +3760,10 @@ static int far_frame(Renderer* r, const RenderScene* s, const RenderCamera* c, T
     return rck(cudaGetLastError(), "far field");
 }
 
-// A finished (or finishing) frame slot: waits for it, records its stage times
-// (--perf) and keeps its frame state (exposure, NaN count). 0 ok.
+// A finished (or finishing) frame slot: waits for its readback, records its
+// stage times (--perf; a bounded ring) and keeps its frame state (exposure, NaN
+// count). 0 ok.
+#define RENDER_PERF_RING 65536u
 static int harvest(Renderer* r, FrameSlot& S) {
     if (!S.pending) return 0;
     S.pending = 0;
@@ -3445,13 +3773,20 @@ static int harvest(Renderer* r, FrameSlot& S) {
     cudaEventElapsedTime(&st[RS_TOTAL], S.ev[0], S.ev[RS_TOTAL]);
     cudaEventElapsedTime(&r->ms, S.ev[RS_FAR], S.ev[RS_READBACK]);
     memcpy(r->last, st, sizeof st);
-    if (r->perf_n == r->perf_cap) {
-        const uint32_t nc = r->perf_cap ? r->perf_cap * 2 : 4096;
-        float* np = (float*)realloc(r->perf, sizeof(float) * RENDER_PERF_STAGES * nc);
-        if (np) { r->perf = np; r->perf_cap = nc; }
+    if (!r->perf) r->perf = (float*)malloc(sizeof(float) * RENDER_PERF_STAGES * RENDER_PERF_RING);
+    if (r->perf) {
+        memcpy(r->perf + (size_t)RENDER_PERF_STAGES * r->perf_head, r->last, sizeof r->last);
+        r->perf_head = (r->perf_head + 1u) % RENDER_PERF_RING;
+        if (r->perf_n < RENDER_PERF_RING) ++r->perf_n;
     }
-    if (r->perf_n < r->perf_cap) memcpy(r->perf + (size_t)RENDER_PERF_STAGES * r->perf_n++, r->last, sizeof r->last);
     if (S.smooth) r->h_fs = *S.h_fs;
+    return 0;
+}
+// waits for every frame in flight (in queue order) and records them
+static int drain(Renderer* r) {
+    if (r->last_slot < 0) return 0;
+    for (int k = 1; k <= RB_SLOTS; ++k)
+        if (harvest(r, r->slot[(r->last_slot + k) % RB_SLOTS])) return -1;
     return 0;
 }
 
@@ -3543,18 +3878,20 @@ extern "C" int renderer_draw(Renderer* r, const RenderScene* s, const RenderCame
     const int classic = c->quality == RQ_CLASSIC || !smooth_ok || !r->atmo;
     const Preset pr = preset_of(c);
     int iw = w, ih = h;
-    if (!classic && pr.scale < 1.f) {
-        iw = (int)((float)w * pr.scale + 0.5f); iw = iw < (w < 64 ? w : 64) ? (w < 64 ? w : 64) : (iw > w ? w : iw);
-        ih = (int)((float)h * pr.scale + 0.5f); ih = ih < (h < 36 ? h : 36) ? (h < 36 ? h : 36) : (ih > h ? h : ih);
-    }
+    if (!classic) internal_size(w, h, pr.scale, &iw, &ih);
     size_t slots = 0, refl = 0;
     int ref = 0;
     if (!classic) preset_needs(pr, iw, ih, &slots, &ref, &refl);
     const int si = (int)(r->nq % RB_SLOTS);
     FrameSlot& S = r->slot[si];
-    if (S.pending && harvest(r, S)) return -1;              // the frame queued two calls ago (long finished)
-    if (ensure_buffers(r, iw, ih, w, h, slots, ref, refl)) return -1;
+    if (S.pending && harvest(r, S)) return -1;              // the frame queued two calls ago (its readback is long done)
+    // classic needs only the output frames (no internal buffers, no TAA history)
+    if (ensure_buffers(r, classic ? 0 : iw, classic ? 0 : ih, w, h, !classic, slots, ref, refl)) return -1;
     if (S.px_cap < (size_t)w * h) return -1;
+    if (!classic) {
+        alloc_smooth_fixed(r);                               // a classic start allocates these with its first smooth frame
+        if (!r->gi) return -1;
+    }
     if (upload_tables(r, s, S)) return -1;                   // records S.ev[RS_UPLOAD] before its first GPU command
 
     KParams p;
@@ -3589,7 +3926,7 @@ extern "C" int renderer_draw(Renderer* r, const RenderScene* s, const RenderCame
     p.shadows = c->shadows;
     p.max_dist = s->max_dist;
     p.w = iw; p.h = ih;
-    p.out = r->d_px;
+    p.out = S.d_px;
     p.bio_cells = s->bio_cells;
     p.bio_nreg = s->bio_cells ? (s->bio_nreg < BIOMAP_MAX_REGIONS ? s->bio_nreg : BIOMAP_MAX_REGIONS) : 0;
     p.bio_shift = s->bio_shift;
@@ -3641,10 +3978,15 @@ extern "C" int renderer_draw(Renderer* r, const RenderScene* s, const RenderCame
         t.ybase_m = -(float)(GME_CHUNK_DIM * c->cy);
         t.camx = c->lx;
         t.camz = c->lz;
-        t.ring = c->far_ring > 0.f ? c->far_ring : s->max_dist;
+        // L1 holds the samples [c - 512, c + 511] of its 16 m grid around the camera's sample c, so it is valid to
+        // 8160 m in every direction: the L1 / L2 boundary r1 stays inside that window (minus a sample), and so does
+        // the ring, whose LOD -> L1 morph and band bounds read L1 up to the ring (a loaded radius beyond ~6.6 km,
+        // i.e. 40+ GB GPUs or --far-ring, hands over to the far field at the cap)
+        const float r1_max = (float)((GME_FAR_N / 2 - 2) * gme_far_spacing(0)) - (float)gme_far_spacing(0);   // 8144 m
+        t.ring = fminf(c->far_ring > 0.f ? c->far_ring : s->max_dist, r1_max - 1500.f);
         t.ring_m0 = 0.85f * t.ring;
         t.ring_iw = 1.f / fmaxf(t.ring - 6.f - t.ring_m0, 1.f);
-        t.r1 = fmaxf(8000.f, t.ring + 1500.f);
+        t.r1 = fminf(fmaxf(8000.f, t.ring + 1500.f), r1_max);
         t.r1_m0 = t.r1 - 1000.f;
         t.r1_iw = 1.f / (t.r1 - 23.f - t.r1_m0);
         t.r2 = 32000.f;
@@ -3695,7 +4037,7 @@ extern "C" int renderer_draw(Renderer* r, const RenderScene* s, const RenderCame
         }
         q.ow = w;
         q.oh = h;
-        q.outp = r->d_px;
+        q.outp = S.d_px;
         q.pix = 2.f * p.th / (float)p.h;
         q.tab = r->d_tab;
         q.fs = r->d_fs;
@@ -3766,8 +4108,9 @@ extern "C" int renderer_draw(Renderer* r, const RenderScene* s, const RenderCame
             q.a.sv_spec = r->d_fsky;
             q.a.sh = r->d_fsh;
         }
-        if (rck(cudaMemcpyToSymbolAsync(g_tc, &q.t, sizeof(TCtx), 0, cudaMemcpyHostToDevice, r->stream), "tracer context"))
-            return -1;
+        *S.h_tc = q.t;                                    // pinned staging: a truly asynchronous copy (the slot is reused after
+        if (rck(cudaMemcpyToSymbolAsync(g_tc, S.h_tc, sizeof(TCtx), 0, cudaMemcpyHostToDevice, r->stream), "tracer context"))
+            return -1;                                    // harvest() waited for it)
         cudaEventRecord(S.ev[RS_PRIMARY], r->stream);
         k_primary<<<grid, block, 0, r->stream>>>(q, r->g);
         cudaEventRecord(S.ev[RS_SURFACE], r->stream);
@@ -3879,22 +4222,31 @@ extern "C" int renderer_draw(Renderer* r, const RenderScene* s, const RenderCame
     r->prev_pos[0] = pos_abs[0]; r->prev_pos[1] = pos_abs[1]; r->prev_pos[2] = pos_abs[2];
     r->prev_yaw = c->yaw;
     r->prev_pitch = c->pitch;
-    cudaEventRecord(S.ev[RS_READBACK], r->stream);
-    if (rck(cudaGetLastError(), classic ? "k_render" : "smooth path kernels") ||
-        rck(cudaMemcpyAsync(S.h_px, r->d_px, (size_t)w * h * 4, cudaMemcpyDeviceToHost, r->stream), "readback") ||
-        (!classic && rck(cudaMemcpyAsync(S.h_fs, r->d_fs, sizeof(FrameState), cudaMemcpyDeviceToHost, r->stream), "frame state")))
+    // the frame state of this frame: a snapshot on the render stream (the next frame's kernels write d_fs)
+    if (!classic && rck(cudaMemcpyAsync(S.d_fs, r->d_fs, sizeof(FrameState), cudaMemcpyDeviceToDevice, r->stream), "frame state"))
         return -1;
-    cudaEventRecord(S.ev[RS_TOTAL], r->stream);
-    cudaEventRecord(S.done, r->stream);
+    cudaEventRecord(S.ev[RS_READBACK], r->stream);
+    cudaEventRecord(S.kdone, r->stream);
+    // the readback on the copy stream (spec 6.1): it overlaps the next frame's kernels, which write the other
+    // slot's frame
+    if (rck(cudaGetLastError(), classic ? "k_render" : "smooth path kernels") ||
+        rck(cudaStreamWaitEvent(r->cstream, S.kdone, 0), "readback") ||
+        rck(cudaMemcpyAsync(S.h_px, S.d_px, (size_t)w * h * 4, cudaMemcpyDeviceToHost, r->cstream), "readback") ||
+        (!classic && rck(cudaMemcpyAsync(S.h_fs, S.d_fs, sizeof(FrameState), cudaMemcpyDeviceToHost, r->cstream), "frame state")))
+        return -1;
+    cudaEventRecord(S.ev[RS_TOTAL], r->cstream);
+    cudaEventRecord(S.done, r->cstream);
     S.pending = 1;
+    S.has_frame = 1;
     S.ow = w;
     S.oh = h;
     S.smooth = !classic;
     r->last_slot = si;
     r->nq++;
-    // return the frame before this one (finished while this one was queued), else wait for this one
+    // Return the frame queued by the call before this one (it finished while this one was queued; its slot is
+    // harvested here if it was not yet). Only the first frame, a size change or the sync mode wait for this one.
     FrameSlot& Pv = r->slot[(si + RB_SLOTS - 1) % RB_SLOTS];
-    if (r->sync || r->nq == 1 || !Pv.pending || Pv.ow != w || Pv.oh != h) {
+    if (r->sync || !Pv.has_frame || Pv.ow != w || Pv.oh != h) {
         if (harvest(r, Pv) || harvest(r, S)) return -1;
         *pixels = S.h_px;
     } else {
@@ -3906,14 +4258,12 @@ extern "C" int renderer_draw(Renderer* r, const RenderScene* s, const RenderCame
 
 extern "C" int renderer_finish(Renderer* r, const uint32_t** pixels) {
     if (r->last_slot < 0) return -1;
-    FrameSlot& S = r->slot[r->last_slot];
-    for (int k = 0; k < RB_SLOTS; ++k)                     // in queue order: the older slot first
-        if (k != r->last_slot && harvest(r, r->slot[k])) return -1;
-    if (harvest(r, S)) return -1;
-    if (pixels) *pixels = S.h_px;
+    if (drain(r)) return -1;                               // in queue order: the older slot first
+    if (pixels) *pixels = r->slot[r->last_slot].h_px;
     return 0;
 }
-extern "C" void* renderer_fence(const Renderer* r) { return r->last_slot < 0 ? NULL : (void*)r->slot[r->last_slot].done; }
+// the world's generation waits for the last frame's kernels (they read chunk slots and tiles), not its readback
+extern "C" void* renderer_fence(const Renderer* r) { return r->last_slot < 0 ? NULL : (void*)r->slot[r->last_slot].kdone; }
 extern "C" void renderer_reset_history(Renderer* r) { r->hist_valid = 0; r->acc_n = 0; }
 extern "C" uint64_t renderer_nan_count(const Renderer* r) { return r->h_fs.nan; }
 extern "C" void renderer_cache_stats(const Renderer* r, uint64_t* lookups, uint64_t* hits) {
@@ -3943,7 +4293,7 @@ __global__ void __launch_bounds__(128) k_shadow_img(const __grid_constant__ SPar
 
 extern "C" int renderer_metrics(Renderer* r, RenderMetrics* out) {
     memset(out, 0, sizeof *out);
-    if (!r->have_last) return -1;
+    if (!r->have_last || drain(r)) return -1;             // the frames in flight first: k_metrics reuses the last one's buffer
     SParams q = r->lastp;
     const dim3 block(16, 8);
     const dim3 grid((q.k.w + block.x - 1) / block.x, (q.k.h + block.y - 1) / block.y);
@@ -3954,7 +4304,7 @@ extern "C" int renderer_metrics(Renderer* r, RenderMetrics* out) {
         return -1;
     if (!r->h_metrics && !(r->h_metrics = (uint32_t*)malloc(r->cap * sizeof(uint32_t)))) return -1;
     k_metrics<<<grid, block, 0, r->stream>>>(q, r->d_acc);
-    if (rck(cudaMemcpyAsync(r->h_metrics, r->d_px, px * 4, cudaMemcpyDeviceToHost, r->stream), "metrics image")) return -1;
+    if (rck(cudaMemcpyAsync(r->h_metrics, q.k.out, px * 4, cudaMemcpyDeviceToHost, r->stream), "metrics image")) return -1;
     q.dbg = r->d_acc + MT_NAN;          // NaN in the shaded colour (re-renders into the device buffers only)
     q.sacc = r->d_acc + MT_SH_LIT;      // k_sun: occluder distances (lit, < 512 m, < 2 km, beyond)
     if (!r->d_sdist && rck(cudaMalloc(&r->d_sdist, r->cap * sizeof(float)), "alloc shadow distances")) return -1;
@@ -3967,8 +4317,8 @@ extern "C" int renderer_metrics(Renderer* r, RenderMetrics* out) {
     if (q.k.shadows) { if (q.lad) k_sun<1><<<grid, block, 0, r->stream>>>(q, r->g); else k_sun<0><<<grid, block, 0, r->stream>>>(q, r->g); }
     k_white<<<1, SPEC_NG, 0, r->stream>>>(q);
     k_compose<<<grid, block, 0, r->stream>>>(q, r->g);
-    k_shadow_img<<<grid, block, 0, r->stream>>>(q, r->d_sdist, r->d_px);
-    if (rck(cudaMemcpyAsync(r->h_shadow, r->d_px, px * 4, cudaMemcpyDeviceToHost, r->stream), "shadow image")) return -1;
+    k_shadow_img<<<grid, block, 0, r->stream>>>(q, r->d_sdist, q.k.out);
+    if (rck(cudaMemcpyAsync(r->h_shadow, q.k.out, px * 4, cudaMemcpyDeviceToHost, r->stream), "shadow image")) return -1;
     if (rck(cudaGetLastError(), "k_metrics") ||
         rck(cudaMemcpyAsync(acc, r->d_acc, sizeof acc, cudaMemcpyDeviceToHost, r->stream), "metrics") ||
         rck(cudaStreamSynchronize(r->stream), "metrics")) return -1;
@@ -4014,7 +4364,7 @@ __global__ void __launch_bounds__(128) k_read_lin(const __grid_constant__ SParam
     const float4 a = g.a[i];
     const uint2 b = g.b[i];
     const int ox = min(x * sp.ow / p.w, sp.ow - 1), oy = min(y * sp.oh / p.h, sp.oh - 1);
-    const float4 c = sp.taa[(size_t)oy * sp.ow + ox];
+    const float4 c = taa_ld(sp.taa, (size_t)oy * sp.ow + ox);
     const float k = c.w >= 0.f ? __ldg(&sp.fs->k) : 1.f;
     const bool hit = (b.y & GF_HIT) != 0;
     const int wm = (int)(((hit ? b.y : b.x) >> 24) & 7u), kind = hit ? (int)((b.y >> 16) & 15u) : 0;
@@ -4325,5 +4675,5 @@ extern "C" void renderer_perf(const Renderer* r, RenderPerf* out) {
     free(v);
 }
 
-extern "C" void renderer_perf_reset(Renderer* r) { r->perf_n = 0; }
+extern "C" void renderer_perf_reset(Renderer* r) { r->perf_n = 0; r->perf_head = 0; }
 extern "C" const float* renderer_perf_last(const Renderer* r) { return r->last; }

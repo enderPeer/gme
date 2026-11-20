@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 
 #define PI       3.14159265358979323846
 #define HPL      6.62607015e-34
@@ -1107,6 +1108,108 @@ int spectral_build_atmo_ex(const HomePlanet* hp, const SpectralOpts* opt, Spectr
 void spectral_free(SpectralAtmo* a) {
     if (a && a->host_owned == 0x5EC7) free(a->host);
     if (a) { a->host = NULL; a->host_owned = 0; }
+}
+
+/* ---- a disk cache of the build (the viewer's startup; the build takes 5-18 s) ------------------------------------
+ * The key covers the planet hash, the options, this binary's build stamp (spectral.c's compile date and time: every
+ * change of the code that fills SpectralAtmo recompiles this file), the struct sizes and the CH4 table if present.
+ * The file holds the SpectralAtmo (its host pointer cleared) and the host tables, with an FNV-1a checksum; a
+ * mismatch of any of these falls back to the build. Directory: $GME_CACHE, else the temp directory; GME_CACHE=0
+ * disables it. */
+typedef struct SpecCacheHead { char magic[8]; uint64_t key, size, sum; } SpecCacheHead;
+static uint64_t spec_fnv(uint64_t h, const void* p, size_t n) {
+    const unsigned char* b = (const unsigned char*)p;
+    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 0x100000001B3ull; }
+    return h;
+}
+static uint64_t spec_cache_key(const SpectralOpts* o, uint64_t phash) {
+    static const char stamp[] = "GMESPC1 " __DATE__ " " __TIME__;
+    uint64_t h = spec_fnv(0xCBF29CE484222325ull, stamp, sizeof stamp);
+    const uint64_t sz[3] = { sizeof(SpectralAtmo), sizeof(HostTabs), sizeof(void*) };
+    const double od[3] = { o->p_bar, o->h2o, o->sun_disc };
+    const int32_t oi[5] = { o->ms_method, o->quiet, o->earth, o->haze_q12, o->ms_j0 };
+    h = spec_fnv(h, sz, sizeof sz);
+    h = spec_fnv(h, &phash, sizeof phash);
+    h = spec_fnv(h, od, sizeof od);
+    h = spec_fnv(h, oi, sizeof oi);
+    FILE* f = fopen("data/ch4_k98.txt", "rb");
+    if (f) {
+        unsigned char buf[4096];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof buf, f)) > 0) h = spec_fnv(h, buf, n);
+        fclose(f);
+    }
+    return h;
+}
+static int spec_cache_path(uint64_t key, char* out, size_t n) {
+    const char* d = getenv("GME_CACHE");
+    if (d && !strcmp(d, "0")) return 0;
+#ifdef _WIN32
+    if (!d || !*d) d = getenv("TEMP");
+    if (!d || !*d) d = getenv("TMP");
+#else
+    if (!d || !*d) d = getenv("TMPDIR");
+    if (!d || !*d) d = "/tmp";
+#endif
+    if (!d || !*d) return 0;
+    snprintf(out, n, "%s/gme_spectral_%016llx.bin", d, (unsigned long long)key);
+    return 1;
+}
+
+int spectral_build_atmo_cached(const HomePlanet* hp, const SpectralOpts* o, uint64_t planet_hash, SpectralAtmo* a, int* cached) {
+    SpectralOpts oo;
+    memset(&oo, 0, sizeof oo);
+    if (o) oo = *o;
+    *cached = 0;
+    char path[1024];
+    const uint64_t key = spec_cache_key(&oo, planet_hash);
+    const int use = spec_cache_path(key, path, sizeof path);
+    const size_t na = sizeof(SpectralAtmo), nh = sizeof(HostTabs), hoff = offsetof(SpectralAtmo, host), ooff = offsetof(SpectralAtmo, host_owned);
+    unsigned char* buf = (unsigned char*)malloc(na + nh);
+    if (use && buf) {
+        FILE* f = fopen(path, "rb");
+        if (f) {
+            SpecCacheHead hd;
+            const int ok = fread(&hd, sizeof hd, 1, f) == 1 && !memcmp(hd.magic, "GMESPC1", 8) && hd.key == key && hd.size == na + nh &&
+                           fread(buf, 1, na + nh, f) == na + nh && spec_fnv(0xCBF29CE484222325ull, buf, na + nh) == hd.sum;
+            fclose(f);
+            if (ok) {
+                void* host = a->host_owned == 0x5EC7 ? a->host : NULL;
+                memcpy(a, buf, na);
+                a->host = host ? host : malloc(nh);
+                if (a->host) {
+                    memcpy(a->host, buf + na, nh);
+                    a->host_owned = 0x5EC7;
+                    *cached = 1;
+                    free(buf);
+                    return 0;
+                }
+                a->host_owned = 0;
+            }
+        }
+    }
+    if (spectral_build_atmo_ex(hp, &oo, a)) { free(buf); return -1; }
+    if (use && buf) {                                   /* write a temporary file, then rename it into place */
+        memcpy(buf, a, na);
+        memset(buf + hoff, 0, sizeof(void*));
+        memset(buf + ooff, 0, sizeof(int));
+        memcpy(buf + na, a->host, nh);
+        SpecCacheHead hd;
+        memcpy(hd.magic, "GMESPC1", 8);
+        hd.key = key;
+        hd.size = na + nh;
+        hd.sum = spec_fnv(0xCBF29CE484222325ull, buf, na + nh);
+        char tmp[1100];
+        snprintf(tmp, sizeof tmp, "%s.%08x.tmp", path, (unsigned)((uint64_t)(time_now() * 1e6) ^ (uint64_t)(uintptr_t)a));
+        FILE* f = fopen(tmp, "wb");
+        if (f) {
+            const int ok = fwrite(&hd, sizeof hd, 1, f) == 1 && fwrite(buf, 1, na + nh, f) == na + nh;
+            if (fclose(f) || !ok) remove(tmp);
+            else if (rename(tmp, path)) { remove(path); if (rename(tmp, path)) remove(tmp); }
+        }
+    }
+    free(buf);
+    return 0;
 }
 
 void spectral_print(const SpectralAtmo* a) {

@@ -20,6 +20,8 @@ typedef struct WorldConfig {
     double   vram_fraction;    /* share of free VRAM for the chunk pool */
     double   ram_fraction;     /* share of available RAM for the host mirror */
     uint32_t max_batch;        /* chunks per GPU batch */
+    uint32_t stream_batch;     /* chunks per batch while only the view's edge streams (0 = max_batch; viewer: 512,
+                                * spec 6.1: short batches between frames; filling a new view uses max_batch) */
     int      force_cpu;        /* generate on CPU even if a GPU exists */
     int      radius_override;  /* fixed view radius in chunks, 0 = adaptive */
     /* vegetation (biomap_view of a loaded biomap; all zero = no life). The host
@@ -65,7 +67,9 @@ typedef struct ValidateReport {
      * against gme_height and wet/dry against the voxel truth at every column.
      * In CPU mode the CPU tiles of the same columns are checked (tiles_checked
      * then counts 0 device tiles). dev_* / clamp_share: stored deviation
-     * T - (h+1) over the tiles' own 32 x 32 columns. */
+     * T - (h+1) over the tiles' own 32 x 32 columns; clamp_share: the share of
+     * columns whose stored T differs from the rounded unclamped t (the band
+     * and its smoothed corrections, density.h). */
     uint32_t tiles_checked;                /* published tiles compared GPU vs CPU */
     uint32_t tiles_cpu;                    /* CPU tiles checked (both modes) */
     uint64_t tile_mismatch;                /* differing bytes */

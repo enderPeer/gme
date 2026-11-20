@@ -23,7 +23,7 @@ static const char* QUALITY_NAME[RQ_COUNT] = { "classic", "low", "medium", "high"
 
 typedef struct Options {
     double   seconds, speed, vram, ram, scale;
-    int      cpu, radius, bench, width, height, fps, frames, seed_set;
+    int      cpu, radius, bench, width, height, fps, frames, seed_set, batch_set;
     uint32_t seed, batch;
     const char* screenshot;
     const char* planet;
@@ -90,7 +90,8 @@ static void usage(void) {
            "         [--debug gi|age|vis|refl] [--disocc-test] (camera moves: disoccluded pixels must have history <= 2)\n"
            "         --scale s: the smooth path renders at s and TAAU upsamples (classic: StretchDIBits as before)\n"
            "  bench: [--seconds N] [--speed m/s] [--cpu]\n"
-           "  both : [--vram 0..1] [--ram 0..1] [--batch chunks] [--radius chunks] [--seed N]\n"
+           "  both : [--vram 0..1] [--ram 0..1] [--batch chunks] (default 2048; the viewer streams the edge of\n"
+           "         its view in batches of 512 unless --batch is given) [--radius chunks] [--seed N]\n"
            "         [--planet file] (default genesis/home.planet if present)\n"
            "         [--spawn X Z [EYE]] (start column, eye EYE m above ground, default 50)\n"
            "         [--look YAW PITCH] (start view direction, degrees) [--eye-y Y] (absolute eye height)\n"
@@ -192,7 +193,7 @@ static int parse(int argc, char** argv, Options* o) {
         else if (!strcmp(a, "--speed"))   o->speed = atof(v);
         else if (!strcmp(a, "--vram"))    o->vram = atof(v);
         else if (!strcmp(a, "--ram"))     o->ram = atof(v);
-        else if (!strcmp(a, "--batch"))   o->batch = (uint32_t)atoi(v);
+        else if (!strcmp(a, "--batch"))   { o->batch = (uint32_t)atoi(v); o->batch_set = 1; }
         else if (!strcmp(a, "--radius"))  o->radius = atoi(v);
         else if (!strcmp(a, "--seed"))    { o->seed = (uint32_t)strtoul(v, NULL, 10); o->seed_set = 1; }
         else if (!strcmp(a, "--view"))    o->view = v;
@@ -652,6 +653,36 @@ static void print_sun(const RenderSky* s, double hour) {
 
 /* Probe (key L, --probe): the light at the crosshair hit, per band, and the
  * ratio of its PAR to the bio's scalar i0 at the same sun elevation */
+/* The planet's spectral light for the smooth path, built on first need: at startup for a smooth session, when the
+ * smooth path is first selected (key V / K) for a classic one, which therefore never pays for it on the cluster
+ * (headless runs cannot switch). Built through spectral.c's disk cache. */
+typedef struct LazyAtmo {
+    SpectralAtmo* a;
+    const HomePlanet* hp;
+    SpectralOpts opt;
+    uint64_t phash;
+    int failed;
+} LazyAtmo;
+static SpectralAtmo* atmo_get(LazyAtmo* L, Renderer* rd) {
+    if (L->a || L->failed) return L->a;
+    const double t0 = time_now();
+    SpectralAtmo* a = (SpectralAtmo*)calloc(1, sizeof(SpectralAtmo));
+    int cached = 0;
+    if (!a || spectral_build_atmo_cached(L->hp, &L->opt, L->phash, a, &cached)) {
+        fprintf(stderr, "spectral light: setup failed, the smooth path is not available\n");
+        if (a) spectral_free(a);
+        free(a);
+        L->failed = 1;
+        return NULL;
+    }
+    spectral_print(a);
+    if (cached) printf("       (LUTs loaded from the spectral cache in %.2f s: the bytes of an earlier build by this binary)\n", time_now() - t0);
+    fflush(stdout);
+    if (rd && renderer_set_atmo(rd, a)) fprintf(stderr, "renderer: the spectral LUTs could not be uploaded\n");
+    L->a = a;
+    return a;
+}
+
 static void print_probe(Renderer* rd, const SpectralAtmo* a) {
     RenderProbe pr;
     if (!a || renderer_probe(rd, &pr)) { printf("probe: not available (classic path or no frame yet)\n"); fflush(stdout); return; }
@@ -1041,7 +1072,7 @@ static const char* preset_desc(int q) {
 }
 
 static int run_viewer(World* w, const Options* o, WorldPos cam, const HomePlanet* hp, float yaw, float pitch, Renderer* rd,
-                      const SpectralAtmo* atmo) {
+                      LazyAtmo* la) {
     RenderSky sky_base, sky;
     build_sky(hp, &sky_base);
     double hour = o->time_set ? o->time_h : sky_base_hour(&sky_base);
@@ -1073,6 +1104,10 @@ static int run_viewer(World* w, const Options* o, WorldPos cam, const HomePlanet
     int settled = !o->settle;
     double fly_t = 0;
     double next_present = 0, last_present = 0;   /* --fps: deadline of the next present; the last one */
+    /* animation clock of waves and kelp: real time in the interactive viewer; frame / 60 for --frames and the test
+     * modes, whose images must not depend on the frame rate (the cluster tests compare them run to run) */
+    const int frame_clock = o->frames > 0 || o->accum > 0 || o->lumstat > 0 || o->disocc_test || o->ring_test;
+    double anim_t = 0.0;
     /* --perf host samples */
     const uint32_t cap = (o->frames > 0 ? (uint32_t)o->frames : 0) + (o->accum > 0 ? (uint32_t)o->accum : 0) + (uint32_t)o->lumstat +
                          (uint32_t)o->warmup + 1024u + (o->frames <= 0 && !o->accum ? (1u << 16) : 0u);
@@ -1132,7 +1167,13 @@ static int run_viewer(World* w, const Options* o, WorldPos cam, const HomePlanet
             sky_at_time(&sky_base, hour, &sky);
             print_sun(&sky, hour);
         }
-        if (window_key_pressed(win, 'L')) print_probe(rd, atmo);
+        if (window_key_pressed(win, 'L')) print_probe(rd, la->a);
+        if (quality != RQ_CLASSIC && !la->a && !la->failed) {   /* a classic session's first smooth frame: build the light */
+            printf("spectral light: the smooth path needs the planet's LUTs, building them now\n");
+            fflush(stdout);
+            atmo_get(la, rd);
+            last = time_now();                       /* the build is not a frame */
+        }
         const int wheel = window_wheel(win);
         if (wheel) { speed *= powf(1.25f, (float)wheel); if (speed < 1.f) speed = 1.f; if (speed > 5000.f) speed = 5000.f; }
         int mdx, mdy;
@@ -1209,7 +1250,8 @@ static int run_viewer(World* w, const Options* o, WorldPos cam, const HomePlanet
                 .quality = quality, .debug = o->debug, .frame = (uint32_t)drawn, .sun_dir = { 0.f, 0.f, 0.f },
                 .ev = o->ev_set ? o->ev : NAN, .dt = drawn ? (float)dt : 0.f, .wb = o->wb,
                 .far_off = o->far_off, .far_ring = o->far_ring, .lod_fine = o->lod_fine,
-                .scale = (float)o->scale, .gi_off = gi_off, .ref = o->accum > 0, .anim = o->still ? 0.f : (float)((double)drawn / 60.0),
+                .scale = (float)o->scale, .gi_off = gi_off, .ref = o->accum > 0,
+                .anim = o->still ? 0.f : (float)(frame_clock ? (double)drawn / 60.0 : anim_t),
                 .reset = reset,
             };
             last_rc = rc;
@@ -1283,6 +1325,7 @@ static int run_viewer(World* w, const Options* o, WorldPos cam, const HomePlanet
             last_present = tp;
             acc_gpu += renderer_gpu_ms(rd);
             ++drawn;
+            anim_t += dt;                                 /* real seconds (dt is clamped to 0.1 s per frame) */
             if (window_key_pressed(win, 'P')) {
                 char name[64];
                 snprintf(name, sizeof name, "screenshot_%03d.png", shot++);
@@ -1336,7 +1379,7 @@ static int run_viewer(World* w, const Options* o, WorldPos cam, const HomePlanet
         if (!write_png(o->screenshot, px, rw, rh)) printf("saved %s\n", o->screenshot);
         if (o->raw) write_raw(o->screenshot, px, rw, rh);
     }
-    if (quality != RQ_CLASSIC && atmo) {
+    if (quality != RQ_CLASSIC && la->a) {
         printf("exposure: EV100 %.2f (%s)\n", renderer_ev100(rd), o->ev_set ? "fixed by --ev" : "auto");
         printf("nan: %llu NaN pixels (shaded colour, GI, TAA) in %llu frames drawn\n", (unsigned long long)renderer_nan_count(rd),
                (unsigned long long)drawn);
@@ -1360,7 +1403,7 @@ static int run_viewer(World* w, const Options* o, WorldPos cam, const HomePlanet
     }
     if (o->lumstat) { lumstat_report(&ls); lumstat_image(&ls, o->screenshot); }
     free(ls.s1); free(ls.s2); free(ls.lin); free(ls.first);
-    if (o->probe && px) print_probe(rd, atmo);
+    if (o->probe && px) print_probe(rd, la->a);
     if (o->perf && ns) {
         RenderPerf rp;
         renderer_perf(rd, &rp);
@@ -1507,7 +1550,7 @@ static int run_viewer(World* w, const Options* o, WorldPos cam, const HomePlanet
  * 5-16 m deep, cover on soil, shrubs / trees with at least 4 plants in the block), preferring
  * the densest cover; the camera looks at the block from 16 m (kelp: from 1.5 m under the
  * water). Rows: mat, kelp, cover, shrub, tree; columns: hue bins 1..15. */
-typedef struct SheetPick { int found, score; int32_t x, z, h; double d2; } SheetPick;
+typedef struct SheetPick { int found, score, cov; int32_t x, z, h; double d2; } SheetPick;
 
 /* is (x, y, z) inside (or within ~3 m of) the crown of a shrub / tree of the 3 x 3 slots around it? */
 static int sheet_in_crown(double x, double y, double z, uint32_t seed, const GmePlanet* pl, const GmeBioView* bv) {
@@ -1527,15 +1570,19 @@ static int sheet_suits(int kind, int32_t xc, int32_t zc, int32_t hc, uint32_t se
     const int32_t sea = pl->sea_level;
     if (kind == BIO_KIND_MAT) return hc >= sea && hc <= sea + 2 ? 2 : (hc >= sea - 6 && hc < sea ? 1 : 0);
     if (kind == BIO_KIND_KELP) {
+        /* kelp: at least 4 sampled strands, preferably 3 whose tops reach within ~3.5 m of the camera (1.5 m under
+         * the water): strands ending 6 m or more below it show only as dark tips through 10-20 m of water */
         if (hc > sea - 5 || hc < sea - 16) return 0;
-        int strands = 0;
+        int strands = 0, high = 0;
         for (int k = 0; k < 16; ++k) {
             const int32_t x = xc - 8 + (k & 3) * 4, z = zc - 8 + (k >> 2) * 4;
             GmeSlot s;
             gme_slot(x >> GME_FLORA_SLOT_SHIFT, z >> GME_FLORA_SLOT_SHIFT, seed, pl, bv, &s);
-            strands += gme_kelp_len(x, z, gme_height(x, z, seed, pl), s.cell, seed, pl) > 2;
+            const int32_t h = gme_height(x, z, seed, pl), len = gme_kelp_len(x, z, h, s.cell, seed, pl);
+            strands += len > 2;
+            high += len > 2 && h + len + 1 >= sea - 4;
         }
-        return strands >= 4;
+        return strands < 4 ? 0 : (high >= 3 ? 2 : 1);
     }
     if (hc <= sea + 3 || gme_ground_mat(hc, pl) != pl->surface_mat) return 0;
     const int32_t dx = gme_height(xc + 12, zc, seed, pl) - gme_height(xc - 12, zc, seed, pl);
@@ -1571,13 +1618,15 @@ static int run_sheet(World* w, const Options* o, const HomePlanet* hp, Renderer*
             SheetPick* p = &pick[kind - 1][hue - 1];
             const int cov = (int)BIOCELL_COVER(cell);
             const double d2 = (double)(bi - nb / 2) * (bi - nb / 2) + (double)(bj - nb / 2) * (bj - nb / 2);
-            if (p->found && (cov * 4 + 3 < p->score || (cov * 4 + 3 == p->score && d2 >= p->d2))) continue;   /* cannot win */
+            const int top = kind == BIO_KIND_KELP ? 2 * 1024 : 0;   /* the best suitability term this kind can add */
+            if (p->found && (top + cov * 4 + 3 < p->score || (top + cov * 4 + 3 == p->score && d2 >= p->d2))) continue;   /* cannot win */
             const int32_t xc = x0 + 32 * bi + 16, zc = z0 + 32 * bj + 16, hc = gme_height(xc, zc, seed, pl);
             const int su = sheet_suits(kind, xc, zc, hc, seed, pl, &bv);
             if (!su) continue;
-            const int score = cov * 4 + su;                 /* the densest cover first, then the better terrain */
+            /* the densest cover first, then the better terrain; kelp: strands that reach up to the camera first */
+            const int score = (kind == BIO_KIND_KELP ? su * 1024 : 0) + cov * 4 + su;
             if (p->found && (score < p->score || (score == p->score && d2 >= p->d2))) continue;
-            p->found = 1; p->score = score; p->x = xc; p->z = zc; p->h = hc; p->d2 = d2;
+            p->found = 1; p->score = score; p->cov = cov; p->x = xc; p->z = zc; p->h = hc; p->d2 = d2;
         }
     printf("sheet: blocks chosen in %.1f s\n", time_now() - t0);
     uint32_t* sheet = (uint32_t*)calloc((size_t)SW * SHT, sizeof(uint32_t));
@@ -1596,7 +1645,23 @@ static int run_sheet(World* w, const Options* o, const HomePlanet* hp, Renderer*
             const double az = 0.785398;                     /* the camera looks north-east at the block */
             double dist = 16, eye = 0;
             float cy;
-            if (kind == BIO_KIND_KELP) { dist = 14; cy = (float)sea + 1 - 1.5f; }
+            float kelp_top = (float)sea - 6.f;
+            if (kind == BIO_KIND_KELP) {
+                /* the camera at the strands' tops (+2 m, under the water): from 1.5 m under the surface, strands ending
+                 * 6 m or more below it showed only as dark tips through 10-20 m of water */
+                for (int q = 0; q < 16; ++q) {
+                    const int32_t x = p->x - 8 + (q & 3) * 4, z = p->z - 8 + (q >> 2) * 4;
+                    GmeSlot s;
+                    gme_slot(x >> GME_FLORA_SLOT_SHIFT, z >> GME_FLORA_SLOT_SHIFT, seed, pl, &bv, &s);
+                    const int32_t hh = gme_height(x, z, seed, pl), len = gme_kelp_len(x, z, hh, s.cell, seed, pl);
+                    if (len > 2 && (float)(hh + len + 1) > kelp_top) kelp_top = (float)(hh + len + 1);
+                }
+                dist = 12;
+                cy = fminf((float)sea + 1 - 1.5f, kelp_top + 2.f);
+                /* deep strands (tops 5 m or more below the surface) get little but blue-green light: the camera goes
+                 * into the forest below their tops and looks up, so they stand against the bright surface */
+                if (kelp_top <= (float)sea - 4.f) cy = fmaxf((float)p->h + 2.f, kelp_top - 2.5f);
+            }
             else if (kind == BIO_KIND_MAT && p->h < sea) { dist = 12; cy = (float)sea + 1 + 9; }
             else {
                 eye = kind == BIO_KIND_MAT || kind == BIO_KIND_COVER ? 7 : (kind == BIO_KIND_SHRUB ? 6 : 16);
@@ -1609,7 +1674,7 @@ static int run_sheet(World* w, const Options* o, const HomePlanet* hp, Renderer*
                 if (cy < hg) cy = hg;
                 for (int up = 0; up < 24 && sheet_in_crown(cxw, cy, czw, seed, pl, &bv); ++up) cy += 1.5f;
             }
-            const float ty = kind == BIO_KIND_KELP ? (float)p->h + 1 + 0.5f * (float)(sea - p->h)
+            const float ty = kind == BIO_KIND_KELP ? (kelp_top <= (float)sea - 4.f ? kelp_top + 2.5f : 0.5f * ((float)p->h + 1 + kelp_top))
                            : (kind >= BIO_KIND_SHRUB ? (float)p->h + 2.5f : (float)p->h + 1);
             WorldPos cam;
             memset(&cam, 0, sizeof cam);
@@ -1643,7 +1708,7 @@ static int run_sheet(World* w, const Options* o, const HomePlanet* hp, Renderer*
                 }
             ++shots;
             printf("sheet: %-5s hue %2d: block centre (%d, %d), ground %d (sea %d), cover %d, camera (%.0f, %.1f, %.0f)%s\n", kn[k], h + 1,
-                   p->x, p->z, p->h, sea, p->score / 4, cxw, cy, czw, loaded ? "" : " (not fully loaded)");
+                   p->x, p->z, p->h, sea, p->cov, cxw, cy, czw, loaded ? "" : " (not fully loaded)");
             fflush(stdout);
         }
     const int rc = write_png(o->sheet, sheet, SW, SHT);
@@ -1658,15 +1723,40 @@ typedef struct D1Window { int32_t x0, z0; } D1Window;
 
 typedef struct D1Ctx {
     int32_t x0, z0, N;              /* window origin incl. a 4-column margin; N = W + 8 */
+    int32_t NR;                     /* the smoothing region: N + 2 GME_SMOOTH_HALO (density.h) */
     uint32_t seed;
     const GmePlanet* pl;
-    int32_t* H;                     /* gme_surface_pair's h */
-    int32_t* T;                     /* stored T, q8 */
+    int32_t* RH;                    /* region: gme_surface_pair's h */
+    int32_t* RT;                    /* region: its unclamped t (q8) */
+    int32_t* C[2];                  /* region: the band's corrections (ping-pong) */
+    int      cur;                   /* C[cur] holds the current corrections */
+    int32_t* H;                     /* window: h */
+    int32_t* T;                     /* window: stored T, q8 */
     double*  raw_row;               /* per row: sum of the unclamped deviation */
     double*  dev_row;               /* per row: sum of the stored deviation */
     uint32_t* hbad_row;             /* per row: h != gme_height */
 } D1Ctx;
 
+/* the region's h, t and initial corrections (rows of NR) */
+static void d1_region_fn(void* p, uint32_t b, uint32_t e, uint32_t wk) {
+    (void)wk;
+    D1Ctx* c = (D1Ctx*)p;
+    for (uint32_t j = b; j < e; ++j)
+        for (int32_t i = 0; i < c->NR; ++i) {
+            const size_t k = (size_t)j * c->NR + i;
+            gme_surface_pair(c->x0 - GME_SMOOTH_HALO + i, c->z0 - GME_SMOOTH_HALO + (int32_t)j, c->seed, c->pl, &c->RH[k], &c->RT[k]);
+            c->C[0][k] = gme_t_band_q8(c->RT[k], c->RH[k], c->pl) - c->RT[k];
+        }
+}
+/* one smoothing step of the corrections (rows of NR), C[cur] -> C[cur ^ 1] */
+static void d1_smooth_fn(void* p, uint32_t b, uint32_t e, uint32_t wk) {
+    (void)wk;
+    D1Ctx* c = (D1Ctx*)p;
+    for (uint32_t j = b; j < e; ++j)
+        for (int32_t i = 0; i < c->NR; ++i)
+            c->C[c->cur ^ 1][(size_t)j * c->NR + i] = gme_corr_step(c->RH, c->RT, c->C[c->cur], c->NR, i, (int)j, c->pl);
+}
+/* the window's stored T (rows of N) and the row statistics */
 static void d1_row_fn(void* p, uint32_t b, uint32_t e, uint32_t wk) {
     (void)wk;
     D1Ctx* c = (D1Ctx*)p;
@@ -1675,9 +1765,9 @@ static void d1_row_fn(void* p, uint32_t b, uint32_t e, uint32_t wk) {
         uint32_t hb = 0;
         for (int32_t i = 0; i < c->N; ++i) {
             const int32_t x = c->x0 + i, z = c->z0 + (int32_t)j;
-            int32_t h, t;
-            gme_surface_pair(x, z, c->seed, c->pl, &h, &t);
-            const int32_t dev = gme_tile_dev_q7(t, h, c->pl);
+            const size_t r = ((size_t)j + GME_SMOOTH_HALO) * c->NR + i + GME_SMOOTH_HALO;
+            const int32_t h = c->RH[r], t = c->RT[r];
+            const int32_t dev = gme_tile_dev_q7(t + c->C[c->cur][r], h, c->pl);
             const size_t k = (size_t)j * c->N + i;
             c->H[k] = h;
             c->T[k] = 256 * (h + 1) + 2 * dev;
@@ -1766,16 +1856,24 @@ static int selftest_d1(uint32_t seed, const GmePlanet* pl, uint64_t phash, const
     D1Ctx c;
     memset(&c, 0, sizeof c);
     c.N = N; c.seed = seed; c.pl = pl;
+    c.NR = N + 2 * GME_SMOOTH_HALO;
+    const size_t nr2 = (size_t)c.NR * c.NR;
+    c.RH = (int32_t*)malloc(sizeof(int32_t) * nr2);
+    c.RT = (int32_t*)malloc(sizeof(int32_t) * nr2);
+    c.C[0] = (int32_t*)malloc(sizeof(int32_t) * nr2);
+    c.C[1] = (int32_t*)malloc(sizeof(int32_t) * nr2);
     c.H = (int32_t*)malloc(sizeof(int32_t) * (size_t)N * N);
     c.T = (int32_t*)malloc(sizeof(int32_t) * (size_t)N * N);
     c.raw_row = (double*)malloc(sizeof(double) * N);
     c.dev_row = (double*)malloc(sizeof(double) * N);
     c.hbad_row = (uint32_t*)malloc(sizeof(uint32_t) * N);
-    if (!c.H || !c.T || !c.raw_row || !c.dev_row || !c.hbad_row) {
+    if (!c.RH || !c.RT || !c.C[0] || !c.C[1] || !c.H || !c.T || !c.raw_row || !c.dev_row || !c.hbad_row) {
         fprintf(stderr, "D1: out of memory\n");
+        free(c.RH); free(c.RT); free(c.C[0]); free(c.C[1]);
         free(c.H); free(c.T); free(c.raw_row); free(c.dev_row); free(c.hbad_row);
         return 1;
     }
+    uint64_t kland = 0, k50 = 0;                       /* slope kinks: land columns with |d2T| >= 0.5 m */
     uint64_t cols = 0, hbad = 0, devbad = 0, coast_bad = 0, coast_cols = 0, pairs = 0, ledges = 0, n4 = 0, flat4 = 0, d2n = 0;
     uint64_t tiles = 0, sat = 0, nlevel = 0, nexact = 0, nlevel_dry = 0, ndry = 0;
     double d2sum = 0, wmin = 1e9, wmax = -1e9, rmin = 1e9, rmax = -1e9;
@@ -1783,6 +1881,9 @@ static int selftest_d1(uint32_t seed, const GmePlanet* pl, uint64_t phash, const
     const int32_t sea_q8 = 256 * (pl->sea_level + 1);
     for (int wi = 0; wi < nw; ++wi) {
         c.x0 = win[wi].x0 - 4; c.z0 = win[wi].z0 - 4;
+        jobs_parallel_for((uint32_t)c.NR, 8, d1_region_fn, &c);       /* T as the tiles compute it (density.h) */
+        c.cur = 0;
+        for (int it = 0; it < GME_SMOOTH_ITERS; ++it) { jobs_parallel_for((uint32_t)c.NR, 8, d1_smooth_fn, &c); c.cur ^= 1; }
         jobs_parallel_for((uint32_t)N, 8, d1_row_fn, &c);
         double rs = 0, ds = 0;
         for (int32_t j = 0; j < N; ++j) { rs += c.raw_row[j]; ds += c.dev_row[j]; hbad += c.hbad_row[j]; }
@@ -1801,6 +1902,11 @@ static int selftest_d1(uint32_t seed, const GmePlanet* pl, uint64_t phash, const
                 devbad += dv < -256 || dv > 256;               /* |T - (h+1)| <= 1 m */
                 coast_cols++;
                 coast_bad += (T[k] < sea_q8) != (H[k] < pl->sea_level);
+                if (H[k] >= pl->sea_level) {                   /* slope kinks of the drawn surface */
+                    const double kx = (T[k + 1] - 2.0 * T[k] + T[k - 1]) / 256.0, kz = (T[k + N] - 2.0 * T[k] + T[k - N]) / 256.0;
+                    ++kland;
+                    k50 += fabs(kx) >= 0.5 || fabs(kz) >= 0.5;
+                }
                 const double gx = (H[k + 4] - H[k - 4]) / 8.0, gz = (H[k + 4 * (size_t)N] - H[k - 4 * (size_t)N]) / 8.0;
                 if (sqrt(gx * gx + gz * gz) < 0.3) {           /* gentle: RMS second difference */
                     const double ddx = (T[k + 1] - 2.0 * T[k] + T[k - 1]) / 256.0;
@@ -1844,9 +1950,11 @@ static int selftest_d1(uint32_t seed, const GmePlanet* pl, uint64_t phash, const
                 if (mx - mn > hrange_max) hrange_max = mx - mn;
             }
     }
+    free(c.RH); free(c.RT); free(c.C[0]); free(c.C[1]);
     free(c.H); free(c.T); free(c.raw_row); free(c.dev_row); free(c.hbad_row);
 
     const double d2 = d2n ? sqrt(d2sum / (double)d2n) : 0;
+    const double kink_share = kland ? (double)k50 / (double)kland : 0;
     const double ledge_share = pairs ? (double)ledges / (double)pairs : 0;
     const double flat_share = n4 ? (double)flat4 / (double)n4 : 0;
     const double wabs = fmax(fmax(fabs(wmin), fabs(wmax)), fmax(fabs(rmin), fabs(rmax)));
@@ -1855,6 +1963,8 @@ static int selftest_d1(uint32_t seed, const GmePlanet* pl, uint64_t phash, const
            (unsigned long long)coast_cols);
     printf("   gentle RMS 2nd difference %.4f m (gate 0.10), ledges >= 45 deg %.4f%% (gate 0.2%%), flat 4x4 %.3f%% (gate 2%%)\n",
            d2, 100.0 * ledge_share, 100.0 * flat_share);
+    printf("   slope kinks |d2T| >= 0.5 m: %.3f%% of land columns (gate 1%%; the band's corrections smoothed over %d steps)\n",
+           100.0 * kink_share, GME_SMOOTH_ITERS);
     printf("   window mean dev: stored %+.4f .. %+.4f m, unclamped %+.4f .. %+.4f m (gate |mean| <= 0.10)\n", wmin, wmax, rmin, rmax);
     printf("   tiles %llu: saturated %llu (max h range in a 36x36 tile %d m)\n", (unsigned long long)tiles,
            (unsigned long long)sat, hrange_max);
@@ -1909,7 +2019,7 @@ static int selftest_d1(uint32_t seed, const GmePlanet* pl, uint64_t phash, const
         printf("   GPU tiles: skipped (no CUDA device)\n");
     }
     const int ok = !hbad && !devbad && !coast_bad && d2 <= 0.10 && ledge_share <= 0.002 && flat_share <= 0.02 &&
-                   wabs <= 0.10 && !sat && (!gpu_ok || (gpu_done && !gpu_bad));
+                   kink_share <= 0.01 && wabs <= 0.10 && !sat && (!gpu_ok || (gpu_done && !gpu_bad));
     printf("D1 %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
@@ -2184,28 +2294,24 @@ int main(int argc, char** argv) {
     sopt.h2o = o.h2o;
     sopt.sun_disc = o.sun_disc;
     sopt.ms_method = o.ms_hillaire;
-    SpectralAtmo* atmo = NULL;
+    LazyAtmo lazy;
+    memset(&lazy, 0, sizeof lazy);
+    lazy.hp = &hp;
+    lazy.opt = sopt;
+    lazy.phash = phash;
     if (o.export_path) {                    /* M5: the bio's light file, then exit */
         const int rc = export_spectrum(&hp, &sopt, o.export_path);
         jobs_shutdown();
         platform_shutdown();
         return rc;
     }
-    if (!o.bench && !o.selftest) {
-        atmo = (SpectralAtmo*)calloc(1, sizeof(SpectralAtmo));
-        if (!atmo || spectral_build_atmo_ex(&hp, &sopt, atmo)) {
-            fprintf(stderr, "spectral light: setup failed, the smooth path is not available\n");
-            if (atmo) spectral_free(atmo);
-            free(atmo);
-            atmo = NULL;
-        } else {
-            spectral_print(atmo);
-        }
-    }
+    /* a classic session builds the light only when the smooth path is first selected (key V / K) */
+    if (!o.bench && !o.selftest && (o.quality != RQ_CLASSIC || o.pigment_table)) atmo_get(&lazy, NULL);
+    else if (!o.bench && !o.selftest) printf("Light: --quality classic: the spectral LUTs are built when the smooth path is first selected\n");
     if (o.pigment_table) {                  /* M5: spec 5.1's table, then exit */
-        const int rc = atmo ? print_pigment_table(atmo) : 1;
-        if (atmo) spectral_free(atmo);
-        free(atmo);
+        const int rc = lazy.a ? print_pigment_table(lazy.a) : 1;
+        if (lazy.a) spectral_free(lazy.a);
+        free(lazy.a);
         jobs_shutdown();
         platform_shutdown();
         return rc;
@@ -2344,9 +2450,9 @@ int main(int argc, char** argv) {
     if (!o.bench && gi.available) {
         /* the smooth path renders at the window size (TAAU from its internal --scale), classic at --scale */
         const double sc = o.scale > 1.0 ? o.scale : 1.0;
-        const RendererConfig rc = { (int)(o.width * sc) + 1, (int)(o.height * sc) + 1, o.quality };
+        const RendererConfig rc = { (int)(o.width * sc) + 1, (int)(o.height * sc) + 1, o.quality, (float)o.scale };
         rd = renderer_create(&rc);
-        if (rd && atmo && renderer_set_atmo(rd, atmo)) fprintf(stderr, "renderer: the spectral LUTs could not be uploaded\n");
+        if (rd && lazy.a && renderer_set_atmo(rd, lazy.a)) fprintf(stderr, "renderer: the spectral LUTs could not be uploaded\n");
         if (rd) gpu_query(&gi);
     }
 
@@ -2360,6 +2466,9 @@ int main(int argc, char** argv) {
     wc.vram_fraction = o.vram;
     wc.ram_fraction = o.ram;
     wc.max_batch = o.batch;
+    /* the viewer streams the edge of its view in short batches between frames (spec 6.1: 512 for the viewer, the
+     * bench keeps 2048); filling a new view still uses the full batch */
+    wc.stream_batch = (!o.bench && !o.batch_set && o.batch > 512) ? 512 : 0;
     wc.force_cpu = o.cpu;
     wc.radius_override = o.radius ? o.radius : (o.sheet ? 12 : 0);   /* --sheet: a small world around each close-up */
     if (have_life) {
@@ -2389,11 +2498,11 @@ int main(int argc, char** argv) {
 
     if (!o.bench) {
         if (!s.use_gpu) { fprintf(stderr, "the 3D view needs a CUDA GPU (use --bench --cpu for CPU-only)\n"); return 1; }
-        const int rc = o.sheet ? run_sheet(w, &o, &hp, rd, &bm, o.seed) : run_viewer(w, &o, cam, &hp, sp.yaw, sp.pitch, rd, atmo);
+        const int rc = o.sheet ? run_sheet(w, &o, &hp, rd, &bm, o.seed) : run_viewer(w, &o, cam, &hp, sp.yaw, sp.pitch, rd, &lazy);
         world_destroy(w);
         renderer_destroy(rd);
-        if (atmo) spectral_free(atmo);
-        free(atmo);
+        if (lazy.a) spectral_free(lazy.a);
+        free(lazy.a);
         biomap_free(&bm);
         jobs_shutdown();
         platform_shutdown();
@@ -2491,7 +2600,7 @@ int main(int argc, char** argv) {
            !have_life ? " (no life loaded)"
                       : (rep.flora_checked ? "" : "  <- FAIL: a biomap is loaded but no vegetated column was checked"));
     printf("Density: %u tiles (%u columns)%s: tile mismatches %llu, h %u, coast %u, saturated %u; "
-           "dev T-(h+1) mean %+.3f m rms %.2f m max %.2f m, clamp %.1f%%; dens_hash %016llx\n",
+           "dev T-(h+1) mean %+.3f m rms %.2f m max %.2f m, corrected %.1f%% (band + smoothing); dens_hash %016llx\n",
            s.use_gpu ? rep.tiles_checked : rep.tiles_cpu, rep.tiles_cpu * GME_TILE_COLS,
            s.use_gpu ? "" : " (CPU mode: CPU tiles only)", (unsigned long long)rep.tile_mismatch, rep.tile_h_bad,
            rep.tile_coast_bad, rep.tile_sat, rep.dev_mean, rep.dev_rms, rep.dev_max, 100.0 * rep.clamp_share,
