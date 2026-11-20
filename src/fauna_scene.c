@@ -21,8 +21,12 @@ static double ground_at(double x, double z, uint32_t seed, const GmePlanet* pl, 
     const double fx = floor(x - 0.5), fz = floor(z - 0.5);
     const int32_t DX = (int32_t)fx, DZ = (int32_t)fz;
     const double u = x - (fx + 0.5), v = z - (fz + 0.5);
-    const double T00 = gme_surface_q8(DX, DZ, seed, pl) / 256.0, T10 = gme_surface_q8(DX + 1, DZ, seed, pl) / 256.0;
-    const double T01 = gme_surface_q8(DX, DZ + 1, seed, pl) / 256.0, T11 = gme_surface_q8(DX + 1, DZ + 1, seed, pl) / 256.0;
+    /* the 4 columns as one 2 x 2 region: the T of gme_surface_q8 at each (a column's T depends only on the
+     * columns within GME_SMOOTH_HALO, and every region computes that halo), for a third of the noise lookups */
+    int32_t h4[4], d4[4], scratch[4 * (2 + 2 * GME_SMOOTH_HALO) * (2 + 2 * GME_SMOOTH_HALO)];
+    gme_surface_region(DX, DZ, 2, seed, pl, h4, d4, scratch);
+    const double T00 = (256 * (h4[0] + 1) + 2 * d4[0]) / 256.0, T10 = (256 * (h4[1] + 1) + 2 * d4[1]) / 256.0;
+    const double T01 = (256 * (h4[2] + 1) + 2 * d4[2]) / 256.0, T11 = (256 * (h4[3] + 1) + 2 * d4[3]) / 256.0;
     const double gx = (T10 - T00) * (1 - v) + (T11 - T01) * v, gz = (T01 - T00) * (1 - u) + (T11 - T10) * u;
     if (k) *k = sqrt(1.0 + gx * gx + gz * gz);
     return (T00 + (T10 - T00) * u) * (1 - v) + (T01 + (T11 - T01) * u) * v;

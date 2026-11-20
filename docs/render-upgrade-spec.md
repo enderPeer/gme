@@ -837,7 +837,7 @@ typedef struct SpectrumFile {
 - **Tracing.** The spheres are binned into a hash grid of 32 m cells (one per chunk column; a sphere reaching into a neighbour is listed in both, with the cell's height range). The kernels walk the grid along each ray up to 1024 m, and along the sun ray up to 128 m for shadows. Colour: the palette index (pigment hue bin) with a per-creature brightness.
 - **Classic view.** A walker stands on the top face of its column's ground voxel.
 
-**Gates, as run on the PC before render tests moved to the cluster:** `ref_hash` and `dens_hash` of `--bench` are unchanged against the first build for `--no-life` (GPU and `--cpu`), `--biomap-test` and the version 1 home biomap; `--biomap-test2` gives the same hashes on GPU and CPU; D2, D5 and D6 pass. **Not yet done:** the headless Linux build of these changes and a frame-time measurement on a quiet GPU (the timings taken so far ran beside other jobs and say nothing).
+**Gates, as run on the PC before render tests moved to the cluster and before the merge with the reviewed renderer (commit ba450fc on the pre-review engine):** `ref_hash` and `dens_hash` of `--bench` unchanged against the first build for `--no-life` (GPU and `--cpu`), `--biomap-test` and the version 1 home biomap; `--biomap-test2` with the same hashes on GPU and CPU; D2, D5 and D6 passed. **Not yet done on the merged engine:** any run of it on a GPU. Its reference is the reviewed renderer (7a3a819): `ref_hash` and `dens_hash` of `--bench` must equal that commit's for `--no-life`, `--biomap-test` and a version 1 biomap (`dens_hash` no longer equals the first build's: the review's smoothed surface changed the tiles), frames without creatures and with a version 1 biomap must equal its frames, and D1 to D6 must pass. Also open: the headless Linux build of these changes, and a frame-time measurement on a quiet GPU (the launch bounds of `k_surface` and `k_sec_gen` were tuned before the review enlarged those kernels). Checked without a GPU: the merged engine compiles on Windows, `--export-spectrum` writes the committed `life/spectrum.bin` byte for byte, the light of a planet sky and of a biomap sky builds and is cached apart, and the creature placement code places the creatures of an exported file.
 
 ---
 
@@ -878,7 +878,7 @@ typedef struct SpectrumFile {
 ### 6.2 Quality knobs
 
 - **Presets:** `--quality classic|low|medium|high|ref`; key K cycles them, key V toggles classic vs new for A/B.
-- **Other options:** `--scale` (render scale, with TAAU in the new path), `--gi 0|1` (key G), `--gi-bands 4|8`, `--lod-fine M`, `--far 0|1`, `--sun-disc k`, `--time H` (key T steps 1 h; the default is today's fixed `build_sky` direction), `--ev`, `--wb D`, `--pressure`, `--h2o`, `--accum N`, `--debug normals|albedo|gi|dev|band N`.
+- **Other options:** `--scale` (render scale, with TAAU in the new path), `--gi 0|1` (key G), `--lod-fine M`, `--far 0|1`, `--sun-disc k`, `--time H` (key T steps 1 h; the default is today's fixed `build_sky` direction), `--ev`, `--wb D`, `--pressure`, `--h2o`, `--accum N`, `--debug normals|albedo|gi|dev|band N`.
 - **Existing** `F` (shadows), `P` (screenshot), `--fps`, `--frames`, `--screenshot` and `--spawn`/`--look` are kept.
 
 ### 6.3 VRAM of the new renderer (Medium, 1280×720)
@@ -926,7 +926,7 @@ typedef struct SpectrumFile {
   - NaN count.
 - **`--perf`:** per-kernel cudaEvent pairs over N frames on the bench flight path (250 m/s, heading 0.6·sin(0.05t)). Prints p50/p95/max per kernel, GPU total, `world_update` and present; writes `perf_<view>.csv`.
   - Measured with the PC lab island paused (Ctrl+C checkpoints it) and again with it running, for the record.
-- **`--selftest`:** D1–D5 (below), exit code = number of failures.
+- **`--selftest`:** D1–D6 (below; a subset with `--selftest d2,d5`), exit code = number of failures.
 
 ### 7.2 Gates that apply to every milestone
 
@@ -945,6 +945,7 @@ typedef struct SpectrumFile {
 | D3 physics (M2) | Planck vs σT⁴ ±0.5%; Earth τ(550) 0.097 ± 0.005 with zenith bluer than horizon; equal-energy → x,y = 1/3 ± 0.002; BRDF directional albedo ≤ 1 (32 angles × materials); sky-view vs Monte Carlo ≤ 10%; haze residual ≤ 0.005; water T_b(10 m) vs 1 nm integration ±1%; Snell window 48.6 ± 0.5°; band-error ΔE2000 ≤ 3 | all |
 | D4 render (M4) | furnace scene (flat, uniform sky L, ρ = 0.5, no sun) gives 0.5L ± 1% after 256 frames; 0 NaN in an 1800-frame flight | all |
 | D5 export (M5) | spectrum.bin byte-identical ×2; Σ bands of `surf` at noon × S_top = LUT global irradiance ±1%; PAR transmission at the planet's haze bin = `haze_q12/4096` ± 0.005; pigment table = §5.1 ± 3 sRGB levels | all |
+| D6 far field (M3) | GPU far-field clipmap samples (2 levels, 2 builds and camera moves) vs the CPU `gme_far_sample`; update time per 16 m camera step | 0 mismatches; ≤ 0.3 ms |
 
 ### 7.4 Screenshots
 

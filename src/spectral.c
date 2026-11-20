@@ -729,7 +729,7 @@ double spectral_pigment_eps(double l, int bin) {
     const double ds = (l - 435) / 30.0, dq = (l - lq) / 25.0;
     return 1.2 * exp(-0.5 * ds * ds) + exp(-0.5 * dq * dq) + 0.15 * s;
 }
-/* version 2 (spec 5.3, gene BG_QWIDTH): the Q band's width is the cell's, 15 .. 60 nm */
+/* version 2 (spec 5.3, gene BG_QWIDTH): the Q band's width is the cell's, 25 .. 60 nm (SPEC_QW_NM) */
 double spectral_pigment_eps_w(double l, int bin, double wq) {
     if (bin <= 0 || bin >= SPEC_NHUE) bin = SPEC_HUE_DEFAULT;
     const double lq = 383.0 + 34.13 * bin;

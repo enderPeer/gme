@@ -52,7 +52,7 @@ echo "  island @K@: newest checkpoint ${ck:-none}, ${rb:-0} rollbacks"
 [ -f stages.log ] && tail -n 3 stages.log | sed 's/^/    /'
 '@
 $exportCmd = @'
-cd ~/gme && nice -n 10 ./build-bio/gme_genesis bioexport --run @RUN@ --out @RUN@/biopart_@K@.bin 2>&1 | tail -n 4
+cd ~/gme && nice -n 10 ./build-bio/gme_genesis bioexport --run @RUN@ --out @RUN@/biopart_@K@.bin 2>&1 | tail -n 7
 cd @RUN@/maps 2>/dev/null && ls kind_y*.png 2>/dev/null | sort | tail -n 1 | sed 's/^kind_\(y[0-9]*\)\.png$/\1/'
 '@
 

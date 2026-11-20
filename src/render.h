@@ -128,9 +128,10 @@ typedef struct RenderCamera {
 } RenderCamera;
 
 /* max_w x max_h: the largest output frame; quality: the starting preset (RQ_CLASSIC allocates nothing before
- * world_create: a classic session sizes its pool as before the upgrade, and the first smooth frame allocates
- * what it needs); scale: the starting --scale of the smooth path (0 = 1), whose internal buffers are sized
- * from it (they grow when Ref or a larger scale is selected) */
+ * world_create but the creature buffers of renderer_set_fauna, when a creature file is loaded: a classic
+ * session sizes its pool as before the upgrade, and the first smooth frame allocates what it needs);
+ * scale: the starting --scale of the smooth path (0 = 1), whose internal buffers are sized from it (they
+ * grow when Ref or a larger scale is selected) */
 typedef struct RendererConfig { int max_w, max_h, quality; float scale; } RendererConfig;
 
 /* --metrics: counters of one frame (renderer_metrics). The new path is
@@ -209,7 +210,7 @@ typedef struct RenderProbe {
     float  tsun;               /* crowns: transmittance of the own crown toward the sun (in e_sun); else 1 */
     /* version 2 (biomap morphology) */
     int    pig_level;          /* pigment level of the cell, 1..15 = PIG 17 x level; 0 = no morphology (PIG 200, Q band 25 nm) */
-    int    qw_bin;             /* Q band width bin 0..15 (15 + 3 bin nm), with pig_level > 0 */
+    int    qw_bin;             /* Q band width bin 0..15 (25 + 35 bin / 15 nm), with pig_level > 0 */
 } RenderProbe;
 
 typedef struct Renderer Renderer;

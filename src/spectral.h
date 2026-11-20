@@ -67,7 +67,7 @@ extern "C" {
 #define SPEC_HUE_DEFAULT 8
 #define SPEC_PIG_REF     200.0  /* PIG of a cell without morphology (a version 1 biomap) */
 /* version 2 (biomap morphology, spec 5.3): the cell's mean pigment amount in 15 levels (level L = 1..15
- * is PIG 17 L; SPEC_PIG_LEVEL) and its Q band width bin w = 0..15 (sigma = 15 + 3 w nm; version 1: 25 nm) */
+ * is PIG 17 L; SPEC_PIG_LEVEL) and its Q band width bin w = 0..15 (sigma = SPEC_QW_NM(w) = 25 + 35 w / 15 nm; version 1: 25 nm) */
 #define SPEC_NPIG        15
 #define SPEC_NQW         16
 #define SPEC_PIG_LEVEL(pig) (((int)(pig) + 8) / 17 < 1 ? 1 : (((int)(pig) + 8) / 17 > SPEC_NPIG ? SPEC_NPIG : ((int)(pig) + 8) / 17))
@@ -249,7 +249,7 @@ void spectral_rgb_of(const SpectralAtmo* a, const double* rho, double rgb[3]);
 /* pigment shape eps(lambda) of hue bin 1..15 (0 = SPEC_HUE_DEFAULT): Soret 435 nm, Q band at 383 + 34.13 i nm,
  * background below 690 nm (to 0 at 740) */
 double spectral_pigment_eps(double lam_nm, int bin);
-/* the same with a Q band of width (sigma) wq_nm (version 2: 15 .. 60 nm; 25 = the function above) */
+/* the same with a Q band of width (sigma) wq_nm (version 2: 25 .. 60 nm, SPEC_QW_NM; 25 = the function above) */
 double spectral_pigment_eps_w(double lam_nm, int bin, double wq_nm);
 /* leaf colour of every hue bin under an equal-energy white, von Kries (XYZ) to D65, 8-bit sRGB: ref_rgb at 1 nm
  * (the --pigment-table reference), band_rgb from the renderer's 8 band means; de: Delta E2000 between them.

@@ -25,7 +25,7 @@ The heavy stages run headless on a small GPU cluster over SSH. The rigs need onl
 
 ## Requirements
 
-- **Engine (`gme`):** Windows 10/11, an NVIDIA GPU (developed on an RTX 3060, sm_86), CUDA Toolkit 12+ (developed with 13.4), Visual Studio 2022 Build Tools (MSVC), CMake 3.24+ and Ninja.
+- **Engine (`gme`):** Windows 10/11, an NVIDIA GPU (developed on an RTX 3060, sm_86), CUDA Toolkit 12.1+ (the renderer's kernel parameters exceed the 4 KB limit of older toolkits; developed with 13.4), Visual Studio 2022 Build Tools (MSVC), CMake 3.24+ and Ninja.
 - **Simulation tools (`gme_genesis`, `gme_biotest`):** plain C. They build with MSVC or gcc (Linux) and need only the NVIDIA driver plus an NVRTC library at run time.
 
 ## Build & run (Windows)
@@ -84,6 +84,8 @@ A run folder holds `env.bin`, `ckpt_*.bin`, `metrics.csv` (daily: population, ca
 Compressions to know about: the island atmosphere is a box of 1e-4 of the real air column, tides are ±1 m, one agent is a clonal colony (super-individual) of up to 1e9 mmol C, and the population is held at 0.95 of `--cap` by a fair birth lottery. Each island has its own land-barrier multiplier (×0.7 … ×1.3) as a parameter study.
 
 ### Features: animals, sex, learning, light in bands, plant shapes, the hub
+
+**Quick start:** [docs/upgrades-quickstart.md](docs/upgrades-quickstart.md) shows the upgrades in the 3D view, takes a copy of an evolved island through all of them (`.\demo\upgrades.ps1`) and names the test for each.
 
 Six additions are **features** of a run ([docs/biosphere-spec.md](docs/biosphere-spec.md) section 10):
 
@@ -144,7 +146,7 @@ Render tests run headless on a Linux rig: `gme` builds there without a display (
 | `src/worldgen.h` | Space layout (1 voxel = 1 m, 32³ chunks) and the fixed-point terrain generator shared by C and CUDA (bit-identical CPU/GPU) |
 | `src/gpu.*`, `src/world.*` | CUDA chunk pool and batched generation; residency, streaming, eviction, adaptive view radius, validation |
 | `src/render.*`, `src/window_win32.c` | CUDA ray tracer and the native window |
-| `src/density.h`, `src/trace.cuh` | Render upgrade (in progress): smooth density surface and its column tracer |
+| `src/density.h`, `src/trace.cuh` | Render upgrade: smooth density surface and its column tracer |
 | `src/flora.h`, `src/biomap.*` | Vegetation voxels from the frozen biomap: the `GMEBMAP1` file, and `GMEBMAP2` with evolved crown shapes |
 | `src/fauna_scene.*` | Creatures in the 3D view: placement on the drawn ground or at depth, a hash grid of 32 m cells the renderer walks |
 | `src/planetfile.*` | `home.planet` load/save and the planet hash |
@@ -152,8 +154,9 @@ Render tests run headless on a Linux rig: `gme` builds there without a display (
 | `src/genesis/` | `gme_genesis`: cosmos (N-body), chem (bond Monte Carlo), planet derivation |
 | `src/bio/` | Life simulation: `bio_api.h` (contract), `bio_core.h` + `bio_kernels.cu` (integer math, NVRTC kernels), `bio_sim.c` / `bio_cpu.c` (GPU driver / CPU reference), `bio_io.c` (checkpoints, vegetation), `bio_bank.c` (seed bank, seeding, creatures), `bio_hub.c` (island hub), `bio_stats.c` (species), `bio_env.c`, `bio_main.c`, `bio_test.c` |
 | `src/fauna.h`, `src/spectrum_file.h` | File contracts between the life simulation and the engine: creatures (`GMEFAUN1`), light in bands (`GMESPEC1`) |
-| `cluster/` | Cluster scripts (search, life islands, timeline) |
-| `docs/` | Design specs: biosphere and render upgrade |
+| `cluster/` | Cluster scripts (search, life islands, hub, timeline, render tests) |
+| `demo/` | `upgrades.ps1`: a tour of the life upgrades on a copy of an evolved island |
+| `docs/` | Design specs: biosphere and render upgrade; quick start for the upgrades |
 
 ## Space model
 

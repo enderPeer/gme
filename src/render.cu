@@ -475,8 +475,8 @@ struct FaunaPal { float3 c[BIOMAP_PALETTE]; };   // classic tint per palette ind
 enum { WM_NONE = 0, WM_STRAIGHT, WM_REFR, WM_UNDER, WM_UNDER_OUT, WM_UNDER_TIR };
 
 // (The column tracer's context of the frame, TCtx, is not a kernel parameter: it is uploaded to constant
-// memory (g_tc) and kept next to these in the Renderer. That keeps this block under 4 KB, the kernel
-// parameter limit of CUDA toolkits before 12.1, with the version 2 biomap view and the creatures added.)
+// memory (g_tc) and kept next to these in the Renderer (lastt). SParams itself is above 4 KB, the kernel
+// parameter limit of CUDA toolkits before 12.1, since the 64-component wave table: see the assert below.)
 struct SParams {
     KParams k;                  // camera, classic sky, vegetation tint (shared with the classic kernel)
     int     debug;              // RD_*
@@ -3775,7 +3775,7 @@ static void internal_size(int w, int h, float s, int* iw, int* ih) {
 
 // the smooth path's fixed parts: the radiance cache (gi.cu) and the far-field clipmap. Allocated by
 // renderer_create for a smooth start, else with the first smooth frame (after world_create: a classic session
-// keeps the pre-upgrade renderer's footprint, spec 6.4)
+// keeps the pre-upgrade renderer's footprint, spec 6.4; the creature buffers of renderer_set_fauna come on top)
 static void alloc_smooth_fixed(Renderer* r) {
     if (!r->gi) r->gi = gi_create();
     if (!r->far_tried) { r->far_tried = 1; alloc_far(r); }
@@ -3807,8 +3807,9 @@ extern "C" Renderer* renderer_create(const RendererConfig* cfg) {
     r->last_slot = -1;
     // every fixed buffer of the starting preset now (spec 6.3: before world_create), sized from its internal
     // resolution (Low and --scale < 1 render smaller; Ref, High's extra buffers and a larger scale grow
-    // lazily). A classic start allocates nothing here: its pool is sized as before the upgrade (spec 6.4), and
-    // the first smooth frame (key V / K) allocates what it needs.
+    // lazily). A classic start allocates nothing here: its pool is sized as before the upgrade (spec 6.4; less
+    // the creature buffers when a creature file is loaded), and the first smooth frame (key V / K) allocates
+    // what it needs.
     if (cfg && cfg->max_w > 0 && cfg->max_h > 0 && cfg->quality != RQ_CLASSIC) {
         RenderCamera c;
         memset(&c, 0, sizeof c);

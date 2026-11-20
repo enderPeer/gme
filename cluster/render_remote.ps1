@@ -63,7 +63,7 @@ if [ "`$(cat ~/$Name/.stamp 2>/dev/null)" != "$stamp" ]; then
   mv -f $stage/CMakeLists.txt ~/$Name/
   mkdir -p ~/$Name/genesis ~/$Name/life
   [ -f $stage/genesis/home.planet ] && mv -f $stage/genesis/home.planet ~/$Name/genesis/
-  [ -f $stage/life/home.biomap ] && mv -f $stage/life/home.biomap ~/$Name/life/
+  if [ -f $stage/life/home.biomap ]; then mv -f $stage/life/home.biomap ~/$Name/life/; else rm -f ~/$Name/life/home.biomap; fi
   if [ -f $stage/life/home.fauna ]; then mv -f $stage/life/home.fauna ~/$Name/life/; else rm -f ~/$Name/life/home.fauna; fi
   T=~/gme/toolchain/nvidia/cu13
   cmake -S ~/$Name -B ~/$Name/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER=`$T/bin/nvcc -DCMAKE_CUDA_ARCHITECTURES=86 > ~/$Name/build.log 2>&1
