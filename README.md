@@ -110,7 +110,7 @@ A **new** run has all of them by default, light in bands only when `life/spectru
 .\build\gme_genesis.exe life-inoculate --from DIR_A --to DIR_B --guild land_plant --n 500
 ```
 
-- **Hub.** Each sim-year an island writes its gas uptake and its emigrants (its most successful genomes of each guild in each habitat) to `outbox/`. `life-hub` moves the planet's atmosphere by the islands' uptake per m² of ocean and of land, weighted by the planet's real ocean cover, and routes emigrants around the ring. One hub folder serves one planet. Islands move a quarter of the way to the planet's atmosphere and take in the migrants at their next sim-year. Without a hub an island runs closed.
+- **Hub.** Each sim-year an island writes its gas uptake and its emigrants (its most successful genomes of each guild in each habitat) to `outbox/`. `life-hub` moves the planet's atmosphere by the islands' uptake per m² of ocean and of land, weighted by the planet's real ocean cover, and routes emigrants around the ring. One hub folder serves one planet. Islands move a quarter of the way to the planet's atmosphere and take in the migrants at their next sim-year. An island takes part only with the `hub` feature (`--enable hub`); without it, or without a hub, it runs closed.
 - **Seed bank.** Genomes carry no planet state. A bank from one planet's islands founds runs on another (`life-rebase`), and `life-inoculate` moves one guild between islands. Both are logged.
 - **Export.** `bioexport` writes the vegetation with its evolved shapes (biomap version 2) and the creatures (`fauna_<K>.bin`: what moves or lives on prey and is not vegetation); `bioexport --merge` also writes `life/home.fauna` for the engine.
 

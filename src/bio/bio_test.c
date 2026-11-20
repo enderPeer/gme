@@ -1449,7 +1449,7 @@ static int t17_hub(int device) {
     BioEnv e[2];
     SynthOpts o = { 64, 64, 40, 40, 4, 6, 220, 0 };
     double gap[2] = { 0, 0 };
-    int ok_m = 0, ok_l = 0, ok_r = 0, migs = 0, atms = 0, fail = 1;
+    int ok_m = 0, ok_l = 0, ok_r = 0, migk[2] = { 0, 0 }, atmk[2] = { 0, 0 }, fail = 1;
     uint64_t h_straight = 0, h_replay = 0;
     for (int pass = 0; pass < 2; ++pass) {          /* pass 0: with the hub; pass 1: the same islands on their own */
         BioSim* s[2] = { NULL, NULL };
@@ -1470,13 +1470,13 @@ static int t17_hub(int device) {
             for (uint64_t ep = 1; ep <= 6 && !bad; ++ep) {
                 int mig[2] = { 0, 0 }, atm[2] = { 0, 0 };
                 bad = hub_epoch(s, run, hub, ep, pass == 0, mig, atm);
-                if (pass == 0) { migs += mig[0] + mig[1]; atms += atm[0] + atm[1]; }
+                if (pass == 0) { migk[0] += mig[0]; migk[1] += mig[1]; atmk[0] += atm[0]; atmk[1] += atm[1]; }
                 if (pass == 0 && ep == 2 && !bad) bad = bio_sim_save(s[0], ck);
             }
             if (bad) LOG("  T17: %s\n", bio_error());
             gap[pass] = fabs(o2_share(s[0]) - o2_share(s[1]));
             if (pass == 0 && !bad) {
-                ok_m = migs > 0 && atms > 0;
+                ok_m = migk[0] > 0 && migk[1] > 0 && atmk[0] > 0 && atmk[1] > 0;      /* both ways */
                 ok_l = residual_zero(s[0], "hub island 0") && residual_zero(s[1], "hub island 1");
                 h_straight = bio_sim_hash(s[0]);
                 /* (c) island 0 again from its epoch-2 checkpoint: epochs 3..6 replay from imported/ */
@@ -1501,9 +1501,11 @@ static int t17_hub(int device) {
     hub_dirs_clear(run[0]); hub_dirs_clear(run[1]); hub_dirs_clear(hub);
     const int ok_g = gap[0] < 0.5 * gap[1];
     fail = !(ok_m && ok_l && ok_r && ok_g);
-    LOG("T17 island hub (2 islands, 6 epochs of 240 steps): %d migrants imported and %d atmosphere updates applied (%s), ledgers exact %d; "
+    LOG("T17 island hub (2 islands, 6 epochs of 240 steps): %d + %d migrants imported and %d + %d atmosphere updates applied by island 0 + "
+        "island 1 (%s), ledgers exact %d; "
         "O2 share gap between the islands %.4f with the hub vs %.4f without (under half: %s); replay from the epoch-2 checkpoint "
-        "%016llx vs %016llx (%s): %s\n", migs, atms, ok_m ? "ok" : "none", ok_l, gap[0], gap[1], ok_g ? "yes" : "no",
+        "%016llx vs %016llx (%s): %s\n", migk[0], migk[1], atmk[0], atmk[1], ok_m ? "both ways" : "NOT both ways", ok_l, gap[0], gap[1],
+        ok_g ? "yes" : "no",
         (unsigned long long)h_replay, (unsigned long long)h_straight, ok_r ? "identical" : "DIFFERS", fail ? "FAIL" : "pass");
     return fail + t17b_hub_arithmetic();
 }

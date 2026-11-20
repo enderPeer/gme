@@ -40,21 +40,21 @@ A version 2 biomap also carries the atmosphere life has made, and the sky is com
 .\demo\upgrades.ps1
 ```
 
-It needs an evolved checkpoint. By default it takes `milestones\playable_v1\island_1` (sim year 2751, 2.85 M agents); another run is named with `-From <run folder> -Island <K>`. The source is only read: the tour works on a copy in `runs\demo_upgrades` (1.1 GB when it is done, 2 GB at its peak). On an RTX 3060 with nothing else on the GPU the whole tour takes about 9 minutes; `-Stages animals,export` is the short version (about 3 minutes).
+It needs an evolved checkpoint. By default it takes `milestones\playable_v1\island_1` (sim year 2751, 2.85 M agents); another run is named with `-From <run folder> -Island <K>` (and `-NewIsland <another island>` when K is 5, the island the seed bank founds by default). The source is only read: the tour works on a copy in `runs\demo_upgrades` (1.1 GB when it is done, 2 GB at its peak). On an RTX 3060 with nothing else on the GPU the whole tour takes about 9 minutes; `-Stages animals,export` is the short version (about 3 minutes).
 
 | Stage | What it runs | What to look for |
 |---|---|---|
 | `animals` | `life --resume --enable all` on the copy, to the next whole sim-year, then `biostat --species` | the `animals:` line: creatures, agents that live mostly on prey, kills and bites per day, sexual agents and births with two parents; `species:` clusters of similar genomes |
-| `bank` | `life-seedbank`, `life-rebase` onto island 5, one sim-year | the bank's table of genomes per guild and habitat; the new island passes its gates within a few sim-years instead of centuries |
-| `hub` | `life-hub` over both islands, twice, with a sim-year after each | `hub:` the planet's atmosphere and the titration; `life: hub at year N: M migrants imported` on each island |
+| `bank` | `life-seedbank`, `life-rebase` onto island 5, one sim-year | the bank's table of genomes per guild and habitat; the new island is oxygenic within days (gate G2 at year 0.03; island 1 took 8.9 sim-years from protocells) |
+| `hub` | `life-hub` over both islands, twice, with a sim-year after each | `hub:` the planet's atmosphere and the titration; `life: hub at year N: M migrants imported` on each island; the young island's oxidation gate G5 one sim-day after its first import of the planet's air (that is the hub's oxygen, not its own) |
 | `export` | `bioexport` of both islands and `bioexport --merge` | `shapes of N shrub and tree cells`, `version 2`, the atmosphere for the sky, the creature count; then the viewer commands, one per island placed where it has the most creatures |
 
-Every command is printed before it runs, so the tour doubles as a list of the command lines. The complete tool output is in `runs\demo_upgrades\demo.log`. Run it again and the islands go one step further; `-Fresh` starts over.
+Every command is printed before it runs, so the tour doubles as a list of the command lines. The complete tool output is in `runs\demo_upgrades\demo.log`. Run it again and the islands go one step further; `-Fresh` starts the whole tour over. The script works only in a folder it made itself and refuses any other folder that is not empty, so it cannot be pointed at a real run by mistake.
 
 The end of the reference run (RTX 3060, 2026-11-20, from `milestones\playable_v1\island_1`; the simulation is deterministic, so the same checkpoint gives the same numbers):
 
 ```
-== done in 8.5 min; the complete output is in runs\demo_upgrades\demo.log
+== done in 8.6 min; the complete output is in runs\demo_upgrades\demo.log
   island 1, the evolved one, at the end of the animals stage (features all): isl1 y=2752.00 live=2.85M (motile 161.8k, sessile photo 2.74M)
     animals: 74 creatures, 0 land animals; 132 agents live mostly on prey (trophic level 2.77); per day 20 kills, 832 bites, 2.01e+03 mol C eaten | sexual 144.6k, 6.5 births/d with two parents
     species: 154 clusters in a sample of 4096 genomes (88 with 2+ members), Shannon H 0.91, Simpson 0.228, largest 88%
@@ -78,7 +78,7 @@ The end of the reference run (RTX 3060, 2026-11-20, from `milestones\playable_v1
 
 Look at it (the 3D view needs the engine build and a CUDA GPU):
   .\build\gme.exe --biomap runs\demo_upgrades\home.biomap --fauna runs\demo_upgrades\home.fauna      # island 1 (region 0): evolved crown shapes, the sky of the air life has made
-  .\build\gme.exe --biomap runs\demo_upgrades\home.biomap --fauna runs\demo_upgrades\home.fauna --region 1      # island 5, founded from the seed bank
+  .\build\gme.exe --biomap runs\demo_upgrades\home.biomap --fauna runs\demo_upgrades\home.fauna --region 1      # island 5 (region 1), founded from the seed bank
   .\build\gme.exe --biomap runs\demo_upgrades\home.biomap --fauna runs\demo_upgrades\home.fauna --spawn 88415 -14336 6 --look 35 -30      # where island 1 has the most creatures
   .\build\gme.exe --biomap runs\demo_upgrades\home.biomap --fauna runs\demo_upgrades\home.fauna --spawn -98302 -94213 6 --look 35 -30      # where island 5 has the most creatures
   .\build\gme.exe --biomap-test2 --fauna-test      # built-in patterns: every crown shape, a test herd
@@ -107,7 +107,7 @@ $env:GME_BIOTEST = 'T10'; .\build\gme_biotest.exe; Remove-Item Env:GME_BIOTEST
 | Learning | `T9` | on a moving food patch, learning foragers take in more than non-learners and more than exploration with frozen weights |
 | Light in bands | `T13` | calibration against the scalar light, the water profile per band, pigments adapt to depth, CPU equals GPU, resume refuses another light file |
 | Crown shapes | `T16`, `T19` | a crown never catches more light than falls on its top, weak-light parity with the old model; a shape word on every vegetated cell of the export |
-| Island hub | `T17` | migrants both ways with exact ledgers, the islands' air pulled together, exact replay from an older checkpoint; T17b: the hub's arithmetic on hand-written files |
+| Island hub | `T17` | migrants imported by both islands with exact ledgers, the islands' air pulled together, exact replay from an older checkpoint; T17b: the hub's arithmetic on hand-written files |
 | Seed bank | `T18` | bank round trip, a new run founded on another planet, inoculation of one guild |
 | Species and creatures | `T19` | cluster counts of known populations; the creature file is sorted, inside the island, and holds no anchored plant |
 | Running worlds are safe | `T14` | with every feature off the simulation is the first release: the recorded state hashes are reproduced |
@@ -124,13 +124,14 @@ pwsh cluster/render_remote.ps1 -Run "--biomap-test2 --fauna-test --frames 300 --
 ## 5. On the real islands
 
 ```
-pwsh cluster/bio_launch.ps1 -Deploy -Restart -Enable animals,sex,learn,spectral   # new build, features on in the running islands
-pwsh cluster/bio_hub.ps1                                                          # the hub: every 10 min
-pwsh cluster/bio_status.ps1 -Fetch                                                # export and merge into life/home.biomap and life/home.fauna
+pwsh cluster/bio_launch.ps1 -Deploy -Restart -Enable animals,sex,learn,spectral,hub   # new build, features on in the running islands
+pwsh cluster/bio_hub.ps1                                                              # the hub: every 10 min
+pwsh cluster/bio_status.ps1 -Fetch                                                    # export and merge into life/home.biomap and life/home.fauna
 ```
 
 - A resumed island keeps the features of its checkpoint, so deploying the new build alone changes nothing. `-Enable` is the intervention, and it is logged in each island's `stages.log`.
 - Switching a feature on cannot be undone except from an older checkpoint. `milestones\playable_v1` is that checkpoint for both islands.
 - `spectral` needs `life/spectrum.bin` on the rigs; `-Deploy` copies it.
+- `bio_hub.ps1` exchanges nothing until an island has the `hub` feature: only then does it write an outbox and read its inbox. Like the others it is an intervention. Leave it out of `-Enable` (and do not start the hub loop) to keep the islands closed.
 - Leave `morph` for one island first (see above).
 - The new options of these three scripts (`-Enable`, the hub loop, the creature files in `-Fetch`) have been checked for syntax only. They have not been run against the rigs yet: watch the first run.
