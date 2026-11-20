@@ -782,6 +782,7 @@ typedef struct SpectrumFile {
 > - **Gene value 0 is the plant as it was.** The shape genes sat unused through every evolved world's history and are still near 0, so `BG_ASPECT` and `BG_LEAFANG` wrap around their range: gene 0 is height : width 1 and the mid leaf angle (`BIOMORPH_ASPECT_OF`, `BIOMORPH_LEAFCLASS_OF` in `biomap.h`). Aspect has 8 steps: 0.5, 0.75, 1, 1.4, 1.8, 2.2, 2.6, 3.
 > - **Selection** is a crown model, not only "light caught against a cost": the crown's top area (width² × class factor), interception `1 − e^(−κ·L)` with Goudriaan's projection per leaf-angle class and hour (never more than falls on the top), saturation of the lit leaves of every land plant, shading by what a plant intercepts, overtopping through height, and a structure cost per class. In weak light a thin all-zero shape gains what the plant gained before; an evolved vegetation is nevertheless re-sorted when the feature is switched on (biosphere-spec 10.6).
 > - **Biomap v2** as planned; the shape word also carries a valid bit (`BIOMORPH_VALID`), and the header's atmosphere is `atm_ppm[7]` with a flag saying whether it is known.
+> - **The Q band width is 25–60 nm**, not 15–60: gene 0 is the 25 nm band of the pigment table and of version 1. Bin w of the shape word is 25 + 35 w / 15 nm (`SPEC_QW_NM` in `spectral.h`, the same mapping in `biomap.h`).
 
 **Genes in reserved body slots** (`BG_STORE` = 36, so 37–47 are free; `BG_NEUTRAL0` = 48):
 

@@ -3808,8 +3808,8 @@ extern "C" Renderer* renderer_create(const RendererConfig* cfg) {
     // every fixed buffer of the starting preset now (spec 6.3: before world_create), sized from its internal
     // resolution (Low and --scale < 1 render smaller; Ref, High's extra buffers and a larger scale grow
     // lazily). A classic start allocates nothing here: its pool is sized as before the upgrade (spec 6.4; less
-    // the creature buffers when a creature file is loaded), and the first smooth frame (key V / K) allocates
-    // what it needs.
+    // the creature buffers when creatures are loaded), and the first smooth frame (key V / K) allocates what
+    // it needs.
     if (cfg && cfg->max_w > 0 && cfg->max_h > 0 && cfg->quality != RQ_CLASSIC) {
         RenderCamera c;
         memset(&c, 0, sizeof c);

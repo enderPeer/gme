@@ -128,7 +128,7 @@ typedef struct RenderCamera {
 } RenderCamera;
 
 /* max_w x max_h: the largest output frame; quality: the starting preset (RQ_CLASSIC allocates nothing before
- * world_create but the creature buffers of renderer_set_fauna, when a creature file is loaded: a classic
+ * world_create but the creature buffers of renderer_set_fauna, when creatures are loaded: a classic
  * session sizes its pool as before the upgrade, and the first smooth frame allocates what it needs);
  * scale: the starting --scale of the smooth path (0 = 1), whose internal buffers are sized from it (they
  * grow when Ref or a larger scale is selected) */
